@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>正在进入消息协同</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #f1f5f9;
+      color: #334155;
+    }
+    .box {
+      background: white;
+      border: 1px solid #e2e8f0;
+      border-radius: 16px;
+      padding: 28px;
+      box-shadow: 0 18px 38px rgba(15, 23, 42, .08);
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="box">正在进入消息协同...</div>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const openid = params.get('openid') || localStorage.getItem('user_openid') || localStorage.getItem('userOpenId') || '';
+    const role = params.get('role') || localStorage.getItem('userRole') || 'collector';
+    if (openid) {
+      localStorage.setItem('user_openid', openid);
+      localStorage.setItem('userOpenId', openid);
+    }
+    localStorage.setItem('userRole', role);
+    const target = new URL('/portal.html', location.origin);
+    if (openid) target.searchParams.set('openid', openid);
+    target.searchParams.set('role', role);
+    target.searchParams.set('tab', 'messages');
+    location.replace(target.toString());
+  </script>
+</body>
+</html>

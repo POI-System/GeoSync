@@ -1,0 +1,29 @@
+{
+  "name": "geosync",
+  "version": "0.1.0",
+  "description": "智游GeoSync — 景区动态行程规划引擎（POI 平台增量模块）",
+  "main": "index.js",
+  "scripts": {
+    "start": "node standalone.js",
+    "dev": "node standalone.js",
+    "init-indexes": "node scripts/init-indexes.js",
+    "migrate": "node scripts/migrate-poi-geo.js",
+    "clean-sim": "node scripts/clean-sim.js",
+    "sim": "node sim/crowd-sim.js",
+    "test": "node --test test/unit/*.test.js",
+    "check:syntax": "node --check index.js && node --check standalone.js && node --check jobs/index.js && node --check sim/crowd-sim.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.7",
+    "dotenv": "^16.4.5",
+    "express": "^4.18.2",
+    "mongoose": "^7.6.3",
+    "multer": "^2.0.2",
+    "node-cron": "^3.0.3",
+    "socket.io": "^4.7.4",
+    "suncalc": "^1.9.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

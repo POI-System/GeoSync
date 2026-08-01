@@ -1,0 +1,2675 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>POI GeoSync Platform</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script src="https://cdn.jsdelivr.net/npm/qrcodejs/qrcode.min.js"></script>
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    if (window.Babel && Babel.availablePresets && Babel.availablePresets.env && Babel.availablePresets.react) {
+      Babel.registerPreset('poi-react-classic', {
+        presets: [
+          [Babel.availablePresets.env, { modules: false }],
+          [Babel.availablePresets.react, { runtime: 'classic' }]
+        ]
+      });
+    }
+  </script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Poppins:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&family=Source+Serif+4:ital,wght@0,400;0,600;1,400;1,600&display=swap');
+
+    :root { --radius: 1rem; }
+    html, body, #root { height: 100%; }
+    body {
+      font-family: 'Poppins', -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background-color: #020617;
+      color: #f8fafc;
+      margin: 0;
+      overflow: hidden;
+    }
+    .font-serif { font-family: 'Source Serif 4', serif; }
+    @keyframes silkyEnter {
+      0% { opacity: 0; transform: translateY(15px) scale(0.98); }
+      100% { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    @keyframes radarSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    .animate-silky { animation: silkyEnter 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+    .liquid-glass {
+      background: rgba(255,255,255,0.01);
+      background-blend-mode: luminosity;
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+      border: none;
+      box-shadow: inset 0 1px 1px rgba(255,255,255,0.1);
+      position: relative;
+      overflow: hidden;
+    }
+    .liquid-glass::before {
+      content: ''; position: absolute; inset: 0; padding: 1.4px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.45) 0%, rgba(255,255,255,0.15) 20%, transparent 40%, transparent 60%, rgba(255,255,255,0.15) 80%, rgba(255,255,255,0.45) 100%);
+      -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+      -webkit-mask-composite: xor;
+      mask-composite: exclude;
+      pointer-events: none; border-radius: inherit;
+    }
+    .liquid-glass-strong {
+      background: rgba(255,255,255,0.01);
+      background-blend-mode: luminosity;
+      backdrop-filter: blur(50px);
+      -webkit-backdrop-filter: blur(50px);
+      border: none;
+      box-shadow: 4px 4px 4px rgba(0,0,0,0.05), inset 0 1px 1px rgba(255,255,255,0.15);
+      position: relative;
+      overflow: hidden;
+    }
+    .liquid-glass-strong::before {
+      content: ''; position: absolute; inset: 0; padding: 1.4px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.5) 0%, rgba(255,255,255,0.2) 20%, transparent 40%, transparent 60%, rgba(255,255,255,0.2) 80%, rgba(255,255,255,0.5) 100%);
+      -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+      -webkit-mask-composite: xor;
+      mask-composite: exclude;
+      pointer-events: none; border-radius: inherit;
+    }
+    .glass-content { position: relative; z-index: 10; }
+    .hide-scrollbar::-webkit-scrollbar { display: none; }
+    .hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+    .radar-sweep {
+      background: conic-gradient(from 0deg, transparent 70%, rgba(56, 189, 248, 0.4) 100%);
+      animation: radarSpin 4s linear infinite;
+      border-radius: 50%;
+    }
+    input:-webkit-autofill {
+      -webkit-box-shadow: 0 0 0 30px transparent inset !important;
+      -webkit-text-fill-color: white !important;
+      transition: background-color 5000s ease-in-out 0s;
+    }
+    .pb-safe { padding-bottom: env(safe-area-inset-bottom); }
+    .rounded-inherit { border-radius: inherit; }
+    @media (max-width: 1023px) {
+      body { overflow: hidden; }
+      .mobile-scroll { overflow-y: auto; -webkit-overflow-scrolling: touch; }
+      .mobile-panel-height { min-height: calc(100dvh - 7.5rem); }
+      .mobile-app-frame { padding: 0.75rem 0.75rem 0; }
+      .mobile-main-safe {
+        padding-top: max(0.35rem, env(safe-area-inset-top));
+        padding-bottom: calc(6.75rem + env(safe-area-inset-bottom));
+      }
+      .mobile-bottom-nav { bottom: max(1rem, env(safe-area-inset-bottom)); }
+      .mobile-shell-flat {
+        background: transparent !important;
+        box-shadow: none !important;
+        border-radius: 0 !important;
+        backdrop-filter: none !important;
+        -webkit-backdrop-filter: none !important;
+      }
+      .mobile-shell-flat::before { display: none !important; }
+      .mobile-settings-shell {
+        padding: 0.25rem 0.25rem 0 !important;
+        align-items: stretch !important;
+      }
+      .mobile-settings-shell > .glass-content {
+        max-width: none !important;
+        margin-top: 0.25rem !important;
+      }
+      .collect-mobile-shell {
+        padding-bottom: calc(8rem + env(safe-area-inset-bottom));
+        scroll-padding-bottom: calc(8rem + env(safe-area-inset-bottom));
+      }
+      .collect-camera-panel {
+        height: 31dvh;
+        min-height: 250px;
+        max-height: 340px;
+      }
+      .collect-form-panel { min-height: auto; }
+      .map-mobile-shell {
+        padding-top: 0.25rem;
+        padding-bottom: calc(8rem + env(safe-area-inset-bottom));
+        scroll-padding-bottom: calc(8rem + env(safe-area-inset-bottom));
+      }
+      .map-list-panel {
+        min-height: 0;
+        margin-top: 0.75rem;
+        background: transparent !important;
+        box-shadow: none !important;
+        border-top: 0 !important;
+        backdrop-filter: none !important;
+        -webkit-backdrop-filter: none !important;
+        overflow: visible !important;
+      }
+      .map-list-panel::before { display: none !important; }
+      .map-list-panel > .glass-content { overflow: visible !important; }
+      .map-list-scroll {
+        overflow: visible !important;
+        padding-bottom: calc(8rem + env(safe-area-inset-bottom));
+      }
+      .map-detail-scroll { padding-bottom: calc(7.5rem + env(safe-area-inset-bottom)); }
+      .map-detail-actions { padding-bottom: calc(6.75rem + env(safe-area-inset-bottom)); }
+      .auth-scroll {
+        height: 100dvh;
+        min-height: 100dvh;
+        overflow-y: auto;
+        overflow-x: hidden;
+        -webkit-overflow-scrolling: touch;
+        align-items: flex-start;
+        justify-content: flex-start;
+        padding-top: max(1rem, env(safe-area-inset-top));
+        padding-bottom: max(2rem, env(safe-area-inset-bottom));
+      }
+    }
+    @media (max-width: 420px) {
+      .mobile-tight-title { font-size: 2rem; line-height: 1.05; }
+      .mobile-card-pad { padding: 1.25rem; }
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel" data-presets="poi-react-classic">
+    const { createContext, useContext, useEffect, useMemo, useRef, useState } = React;
+
+    const ROLE_API = { collector: 'collector', verifier: 'reviewer' };
+    const ROLE_UI = { collector: 'collector', reviewer: 'verifier' };
+    const CATEGORY_OPTIONS = [
+      { value: '餐饮', zh: '餐饮', en: 'Dining' },
+      { value: '购物零售', zh: '购物零售', en: 'Retail' },
+      { value: '交通出行', zh: '交通出行', en: 'Transport' },
+      { value: '金融服务', zh: '金融服务', en: 'Finance' },
+      { value: '医疗健康', zh: '医疗健康', en: 'Healthcare' },
+      { value: '教育培训', zh: '教育培训', en: 'Education' },
+      { value: '生活服务', zh: '生活服务', en: 'Local Services' },
+      { value: '文体娱乐', zh: '文体娱乐', en: 'Leisure' },
+      { value: '旅游景点', zh: '旅游景点', en: 'Tourism' },
+      { value: '酒店住宿', zh: '酒店住宿', en: 'Lodging' },
+      { value: '商务办公', zh: '商务办公', en: 'Business' },
+      { value: '住宅房产', zh: '住宅房产', en: 'Housing' },
+      { value: '政务公共', zh: '政务公共', en: 'Public Service' },
+      { value: '农贸生鲜', zh: '农贸生鲜', en: 'Fresh Market' },
+      { value: '宗教场所', zh: '宗教场所', en: 'Religion' },
+      { value: '零售门店', zh: '零售门店', en: 'Store' },
+      { value: '其他', zh: '其他', en: 'Other' }
+    ];
+    const CATEGORY_VALUE_SET = new Set(CATEGORY_OPTIONS.map(item => item.value));
+
+    const TEXT = {
+      zh: {
+        pageError: '页面渲染出错',
+        reload: '重新加载',
+        languageZh: '中文',
+        languageEn: 'EN',
+        wechatAuthRequired: '请先完成微信授权。',
+        loginFailed: '登录失败。',
+        deviceAuthenticated: '设备已授权',
+        initializingWechat: '正在初始化微信登录',
+        redirectingWechat: '正在跳转微信授权',
+        generatingQr: '正在生成登录二维码',
+        scanToAuth: '请用微信扫码授权',
+        authComplete: '授权完成',
+        qrExpired: '二维码已过期，请刷新',
+        networkWaiting: '网络波动，正在等待',
+        qrInitFailed: '二维码初始化失败',
+        refreshQr: '刷新二维码',
+        systemLogin: '系统登录',
+        selectNode: '请选择你的操作身份',
+        collectorNode: '采集端',
+        collectorSubtitle: '现场数据采集',
+        verifierNode: '审核端',
+        verifierSubtitle: '质量核验与审核',
+        authorizeBeforeRole: '请先完成微信授权再选择身份',
+        secureConnection: '安全连接',
+        navCore: '首页',
+        navCollect: '采集',
+        navRadar: '地图',
+        navComms: '消息',
+        navConfig: '设置',
+        nodeActive: '节点在线',
+        awaitingDirective: '等待任务',
+        pending: '待审核',
+        verified: '已通过',
+        alert: '异常',
+        recollect: '重新采集',
+        collection: '采集任务',
+        verification: '审核任务',
+        communications: '消息中心',
+        spatialRadar: '空间地图',
+        preferences: '偏好设置',
+        unnamedPoi: '未命名 POI',
+        pendingCategory: '待分类',
+        noCoordinate: '暂无坐标',
+        previousCoordinate: '原坐标',
+        captureImageRequired: '请拍照或选择图片。',
+        entityNameRequired: '请输入点位名称。',
+        coordinateMissing: '缺少空间坐标。',
+        transmitFailed: '提交失败。',
+        gpsRequiresHttps: '定位需要 HTTPS 安全环境。',
+        geoUnsupported: '当前浏览器不支持定位。',
+        gpsFailed: '定位失败。',
+        locationDenied: '定位权限被拒绝。',
+        locationUnavailable: '定位不可用。',
+        locationTimeout: '定位超时。',
+        coordinateInvalid: '请输入有效经纬度。',
+        manualCoordinate: '手动坐标',
+        accuracy: '精度 {value}m',
+        manualCategoryPrefix: '人工分类',
+        recapture: '重新拍摄',
+        opticalSync: '拍照采集',
+        replaceImage: '可替换图片，也可沿用原图',
+        tapToCapture: '点击开始空间采集',
+        capturedAlt: '已采集图片',
+        parsingMatrix: '正在解析图片',
+        ocrClassifying: '正在 OCR 识别并推荐分类',
+        ocrCategoryReady: 'OCR 推荐分类：{category}',
+        ocrCategoryFallback: 'OCR 未识别到有效文字，请手动选择分类',
+        connectingGps: '正在连接 GPS',
+        recalibrate: '重拍',
+        syncComplete: '提交完成',
+        resubmitted: '已重新提交审核',
+        transmitted: '已提交至审核端',
+        dataMatrix: '采集表单',
+        cancelEdit: '取消修改',
+        verificationAlert: '审核意见',
+        entityName: '点位名称',
+        opticalMatch: '已识别',
+        awaitingSensor: '等待输入...',
+        classification: '分类',
+        selectCategory: '请选择分类...',
+        coordinates: '坐标',
+        uplinking: '正在定位...',
+        awaitingSync: '等待定位...',
+        useCoordinate: '使用坐标',
+        retryGps: '重试定位',
+        logData: '备注',
+        optionalNotes: '可填写现场备注...',
+        transmitUpdated: '提交更新',
+        transmitArray: '提交点位',
+        noSpatialNodes: '暂无点位数据',
+        allCategories: '全部分类',
+        categoryFilter: '类别筛选',
+        archive: '我的点位',
+        queue: '待审核队列',
+        searchArray: '搜索点位...',
+        nodeDetail: '点位详情',
+        noLogData: '暂无备注',
+        noDetail: '无详细说明',
+        flagError: '驳回',
+        verify: '通过',
+        update: '修改更新',
+        comms: '私聊',
+        submitDispute: '提交异议',
+        disputePrompt: '请输入异议说明，系统会发送给第三方工作人员。',
+        disputeReasonRequired: '异议说明不能为空。',
+        disputeSubmitted: '异议已提交，第三方工作人员将重新采集并核验。',
+        disputeSubmitFailed: '异议提交失败。',
+        noActionRequired: '暂无可操作项',
+        rejectPrompt: '请输入驳回原因，采集者会收到该意见。',
+        rejectReasonRequired: '驳回原因不能为空。',
+        verificationFailed: '审核失败。',
+        messagesTitle: '消息中心',
+        socketOnline: '实时在线',
+        connecting: '连接中',
+        systemNotice: '系统通知',
+        unreadNotifications: '{count} 条未读通知',
+        noticeFallback: '审核结果和管理员公告会显示在这里。',
+        taskReminder: '任务提醒',
+        verifierTaskContent: '当前有 {count} 条 POI 待审核。',
+        collectorTaskContent: '当前有 {count} 条 POI 正在等待审核。',
+        privateChat: '审核私聊',
+        privateChatContent: '共有 {count} 个审核会话',
+        groupChat: '工作交流群',
+        collectorGroupChat: '\u91c7\u96c6\u8005\u7fa4\u804a',
+        reviewerGroupChat: '\u5ba1\u6838\u8005\u7fa4\u804a',
+        groupFallback: '分享定位、采集和审核经验。',
+        encrypted: '已加密',
+        online: '在线',
+        admin: '管理员',
+        broadcastNotice: '输入公告内容...',
+        send: '发送',
+        adminAuth: '管理员登录',
+        adminUsername: '管理员账号',
+        adminPassword: '管理员密码',
+        adminEmpty: '请输入管理员账号和密码。',
+        adminLoginFailed: '管理员登录失败。',
+        cancel: '取消',
+        login: '登录',
+        transmitMessage: '输入消息...',
+        awaitingConnection: '请选择左侧消息',
+        noNotifications: '暂无通知。',
+        noPendingTasks: '暂无待处理任务。',
+        selectPrivateRoom: '请选择一个审核私聊。',
+        noPrivateRoom: '暂无审核私聊。审核完成后会自动生成会话。',
+        roomList: '会话列表',
+        backToRooms: '返回会话',
+        reviewer: '审核者',
+        collector: '采集者',
+        unknownPoi: '未命名 POI',
+        noChatHistory: '暂无聊天记录。',
+        anonymous: '匿名',
+        settingsTitle: '系统设置',
+        interface: '界面',
+        environmentAudio: '环境音效',
+        audioLevel: '音量 75%',
+        visualMode: '视觉模式',
+        glassMode: '透明玻璃',
+        system: '系统',
+        identity: '当前身份',
+        noId: '无 ID',
+        hardwareLink: '设备连接',
+        hardwareSynced: '微信 WebView 已同步',
+        adminEntry: '\u7ba1\u7406\u5458\u5165\u53e3',
+        adminEntryHint: '\u767b\u5f55\u540e\u7ba1\u7406\u70b9\u4f4d\u548c\u91c7\u96c6\u72b6\u6001',
+        adminLoggedIn: '\u5df2\u767b\u5f55\uff0c\u70b9\u51fb\u8fdb\u5165\u7ba1\u7406\u9762\u677f',
+        adminPanel: '\u7ba1\u7406\u5458\u9762\u677f',
+        adminLoadFailed: '\u7ba1\u7406\u5458\u6570\u636e\u52a0\u8f7d\u5931\u8d25',
+        adminActionFailed: '\u7ba1\u7406\u5458\u64cd\u4f5c\u5931\u8d25',
+        collectionSwitch: '\u91c7\u96c6\u5f00\u5173',
+        pauseCollection: '\u6682\u505c\u91c7\u96c6',
+        resumeCollection: '\u5f00\u653e\u91c7\u96c6',
+        collectionPaused: '\u5f53\u524d\u5df2\u6682\u505c\u91c7\u96c6\uff0c\u91c7\u96c6\u8005\u65e0\u6cd5\u63d0\u4ea4\u6216\u66f4\u65b0\u70b9\u4f4d\u3002',
+        collectionOpen: '\u5f53\u524d\u5141\u8bb8\u91c7\u96c6\u8005\u63d0\u4ea4\u548c\u66f4\u65b0\u70b9\u4f4d\u3002',
+        testEmail: '第三方邮箱',
+        emailPlaceholder: '输入第三方邮箱地址',
+        thirdPartyEmail: '第三方邮箱',
+        thirdPartyEmailPlaceholder: '输入第三方邮箱地址',
+        thirdPartyEmailSaved: '第三方邮箱已保存',
+        save: '保存',
+        reviewedPois: '\u5df2\u5ba1\u6838\u70b9\u4f4d',
+        emailPoi: '\u53d1\u9001\u90ae\u7bb1',
+        deletePoi: '\u5220\u9664\u70b9\u4f4d',
+        noReviewedPois: '\u6682\u65e0\u5df2\u5ba1\u6838\u70b9\u4f4d\u3002',
+        confirmDeletePoi: '\u786e\u8ba4\u5220\u9664\u8be5\u5df2\u5ba1\u6838\u70b9\u4f4d\u5417\uff1f',
+        emailSentTo: '\u70b9\u4f4d\u4fe1\u606f\u5df2\u53d1\u9001\u5230 {email}',
+        emailSendFailed: '\u90ae\u4ef6\u53d1\u9001\u5931\u8d25',
+        broadcastPanel: '\u7fa4\u53d1\u516c\u544a',
+        broadcastTitle: '\u516c\u544a\u6807\u9898',
+        broadcastTitlePlaceholder: '\u7cfb\u7edf\u516c\u544a',
+        broadcastContent: '\u516c\u544a\u5185\u5bb9',
+        broadcastContentPlaceholder: '\u8f93\u5165\u8981\u7fa4\u53d1\u7684\u901a\u77e5...',
+        broadcastAudience: '\u53d1\u9001\u5bf9\u8c61',
+        audienceAll: '\u5168\u90e8\u7528\u6237',
+        audienceCollector: '\u4ec5\u91c7\u96c6\u8005',
+        audienceReviewer: '\u4ec5\u6838\u9a8c\u8005',
+        broadcastEmpty: '\u8bf7\u8f93\u5165\u516c\u544a\u5185\u5bb9\u3002',
+        broadcastSent: '\u516c\u544a\u5df2\u53d1\u9001\u7ed9 {count} \u4eba',
+        broadcastFailed: '\u516c\u544a\u53d1\u9001\u5931\u8d25',
+        virtualMap: '虚拟地图',
+        amapMap: '高德地图',
+        zoomIn: '放大',
+        zoomOut: '缩小',
+        resetView: '重置视图',
+        mapLoading: '地图加载中',
+        mapLoadFailed: '地图加载失败',
+        amapKeyMissing: '未配置高德地图 Key',
+        navigationPanel: '路线导航',
+        navigationMode: '出行方式',
+        navigationHint: '选择 POI 后可打开高德路线规划',
+        locateMe: '定位当前位置',
+        refreshLocation: '刷新位置',
+        currentPositionReady: '当前位置已就绪',
+        currentPositionMissing: '未获取当前位置',
+        walking: '步行',
+        driving: '驾车',
+        transit: '公交',
+        straightDistance: '直线距离',
+        distancePending: '定位后显示距离',
+        openNavigation: '高德导航',
+        previewRoute: '路线预览',
+        routeCoordinateMissing: '该 POI 缺少有效坐标，无法导航。',
+        navigationOpened: '已打开高德路线规划',
+        disputeReviewTitle: '第三方异议处理',
+        disputeLoading: '正在加载异议信息',
+        disputeInvalid: '处理链接无效或已处理。',
+        finalApprove: '最终通过',
+        finalReject: '最终驳回',
+        finalOpinion: '最终意见',
+        finalOpinionPlaceholder: '填写最终核验意见...',
+        submitFinalResult: '提交最终结果',
+        disputeResolved: '异议处理结果已提交。',
+        originalRejectReason: '原审核意见',
+        disputeReason: '异议说明',
+        thirdPartyReminder: '该点存在问题，请重新采集并核验。',
+        loginToUpdatePoi: '登录后更新此点',
+        loginToUpdateHint: '将以采集者身份进入更新页面',
+        disconnectNode: '退出当前节点'
+      },
+      en: {
+        pageError: 'Page render failed',
+        reload: 'Reload',
+        languageZh: '中文',
+        languageEn: 'EN',
+        wechatAuthRequired: 'Please complete WeChat authorization first.',
+        loginFailed: 'Login failed.',
+        deviceAuthenticated: 'Device authenticated',
+        initializingWechat: 'Initializing WeChat gateway',
+        redirectingWechat: 'Redirecting to WeChat OAuth',
+        generatingQr: 'Generating login QR',
+        scanToAuth: 'Scan to authenticate device',
+        authComplete: 'Authorization complete',
+        qrExpired: 'QR expired. Refresh required',
+        networkWaiting: 'Network jitter. Waiting',
+        qrInitFailed: 'QR init failed',
+        refreshQr: 'Refresh QR',
+        systemLogin: 'System Login',
+        selectNode: 'Select your operational node to begin',
+        collectorNode: 'Collector Node',
+        collectorSubtitle: 'Field Data Acquisition',
+        verifierNode: 'Verifier Node',
+        verifierSubtitle: 'Quality Control & Audit',
+        authorizeBeforeRole: 'Authorize with WeChat before node selection',
+        secureConnection: 'Secure Connection',
+        navCore: 'Core',
+        navCollect: 'Collect',
+        navRadar: 'Radar',
+        navComms: 'Comms',
+        navConfig: 'Config',
+        nodeActive: 'Node Active',
+        awaitingDirective: 'Awaiting directive',
+        pending: 'Pending',
+        verified: 'Verified',
+        alert: 'Alert',
+        recollect: 'Recalibrate',
+        collection: 'Collection',
+        verification: 'Verification',
+        communications: 'Communications',
+        spatialRadar: 'Spatial Radar',
+        preferences: 'Preferences',
+        unnamedPoi: 'Unnamed POI',
+        pendingCategory: 'Pending',
+        noCoordinate: 'No coordinate',
+        previousCoordinate: 'Previous Coordinate',
+        captureImageRequired: 'Please capture or select an image.',
+        entityNameRequired: 'Please enter entity name.',
+        coordinateMissing: 'Spatial coordinates missing.',
+        transmitFailed: 'Transmit failed.',
+        gpsRequiresHttps: 'GPS requires HTTPS secure context.',
+        geoUnsupported: 'Geolocation not supported.',
+        gpsFailed: 'GPS sync failed.',
+        locationDenied: 'Location permission denied.',
+        locationUnavailable: 'Location unavailable.',
+        locationTimeout: 'Location request timeout.',
+        coordinateInvalid: 'Please enter valid coordinates.',
+        manualCoordinate: 'Manual Coordinate',
+        accuracy: 'Accuracy {value}m',
+        manualCategoryPrefix: 'Manual Category',
+        recapture: 'Re-Capture',
+        opticalSync: 'Optical Sync',
+        replaceImage: 'Replace image or keep previous visual',
+        tapToCapture: 'Tap to engage spatial capture',
+        capturedAlt: 'Captured image',
+        parsingMatrix: 'Parsing Matrix',
+        ocrClassifying: 'OCR scanning and recommending category',
+        ocrCategoryReady: 'OCR recommended: {category}',
+        ocrCategoryFallback: 'No useful text detected. Select category manually',
+        connectingGps: 'Connecting GPS satellite',
+        recalibrate: 'Recalibrate',
+        syncComplete: 'Sync Complete',
+        resubmitted: 'Resubmitted to Verification Node',
+        transmitted: 'Transmitted to Verification Node',
+        dataMatrix: 'Data Matrix',
+        cancelEdit: 'Cancel Edit',
+        verificationAlert: 'Verification Alert',
+        entityName: 'Entity Name',
+        opticalMatch: 'Optical Match',
+        awaitingSensor: 'Awaiting sensor input...',
+        classification: 'Classification',
+        selectCategory: 'Select stratum...',
+        coordinates: 'Coordinates',
+        uplinking: 'Uplinking...',
+        awaitingSync: 'Awaiting sync...',
+        useCoordinate: 'Use Coordinate',
+        retryGps: 'Retry GPS',
+        logData: 'Log Data',
+        optionalNotes: 'Optional field notes...',
+        transmitUpdated: 'Transmit Updated Array',
+        transmitArray: 'Transmit Array',
+        noSpatialNodes: 'No spatial nodes loaded',
+        allCategories: 'All Categories',
+        categoryFilter: 'Category Filter',
+        archive: 'Archive',
+        queue: 'Queue',
+        searchArray: 'Search array...',
+        nodeDetail: 'Node Detail',
+        noLogData: 'No log data',
+        noDetail: 'No detail',
+        flagError: 'Flag Error',
+        verify: 'Verify',
+        update: 'Update',
+        comms: 'Comms',
+        submitDispute: 'Submit Dispute',
+        disputePrompt: 'Enter the dispute reason. The system will send it to the third-party worker.',
+        disputeReasonRequired: 'Dispute reason cannot be empty.',
+        disputeSubmitted: 'Dispute submitted. The third-party worker will recollect and verify it.',
+        disputeSubmitFailed: 'Dispute submit failed.',
+        noActionRequired: 'No Action Required',
+        rejectPrompt: 'Please enter the rejection reason. The collector will receive it.',
+        rejectReasonRequired: 'Rejection reason cannot be empty.',
+        verificationFailed: 'Verification failed.',
+        messagesTitle: 'Comms',
+        socketOnline: 'Socket Online',
+        connecting: 'Connecting',
+        systemNotice: 'System Notice',
+        unreadNotifications: '{count} unread notifications',
+        noticeFallback: 'Audit results and admin broadcasts appear here.',
+        taskReminder: 'Task Alert',
+        verifierTaskContent: '{count} POI data points pending verification.',
+        collectorTaskContent: '{count} submitted nodes waiting verification.',
+        privateChat: 'Audit Private Chat',
+        privateChatContent: '{count} private audit channels',
+        groupChat: 'Field Collection Group',
+        collectorGroupChat: 'Collector Group',
+        reviewerGroupChat: 'Reviewer Group',
+        groupFallback: 'Share GPS and field collection tips.',
+        encrypted: 'ENCRYPTED',
+        online: 'ONLINE',
+        admin: 'Admin',
+        broadcastNotice: 'Broadcast notice...',
+        send: 'Send',
+        adminAuth: 'Admin Auth',
+        adminUsername: 'username',
+        adminPassword: 'password',
+        adminEmpty: 'Please enter admin username and password.',
+        adminLoginFailed: 'Admin login failed.',
+        cancel: 'Cancel',
+        login: 'Login',
+        transmitMessage: 'Transmit message...',
+        awaitingConnection: 'Awaiting Connection',
+        noNotifications: 'No notifications yet.',
+        noPendingTasks: 'No pending tasks.',
+        selectPrivateRoom: 'Select a private audit room.',
+        noPrivateRoom: 'No private audit channel yet. It will be created after audit completion.',
+        roomList: 'Room List',
+        backToRooms: 'Back to rooms',
+        reviewer: 'Reviewer',
+        collector: 'Collector',
+        unknownPoi: 'Unnamed POI',
+        noChatHistory: 'No chat history yet.',
+        anonymous: 'Anonymous',
+        settingsTitle: 'System Config',
+        interface: 'Interface',
+        environmentAudio: 'Environment Audio',
+        audioLevel: 'Level: 75%',
+        visualMode: 'Visual Mode',
+        glassMode: 'Transparent Glass',
+        system: 'System',
+        identity: 'Identity',
+        noId: 'No ID',
+        hardwareLink: 'Hardware Link',
+        hardwareSynced: 'WeChat WebView synced',
+        adminEntry: 'Admin Entry',
+        adminEntryHint: 'Manage POIs and collection state after login',
+        adminLoggedIn: 'Logged in. Tap to manage',
+        adminPanel: 'Admin Panel',
+        adminLoadFailed: 'Failed to load admin data',
+        adminActionFailed: 'Admin action failed',
+        collectionSwitch: 'Collection Switch',
+        pauseCollection: 'Pause Collection',
+        resumeCollection: 'Resume Collection',
+        collectionPaused: 'Collection is paused. Collectors cannot submit or update POIs.',
+        collectionOpen: 'Collection is open. Collectors can submit and update POIs.',
+        testEmail: 'Third-party Email',
+        emailPlaceholder: 'Enter third-party email',
+        thirdPartyEmail: 'Third-party Email',
+        thirdPartyEmailPlaceholder: 'Enter third-party email',
+        thirdPartyEmailSaved: 'Third-party email saved',
+        save: 'Save',
+        reviewedPois: 'Reviewed POIs',
+        emailPoi: 'Email',
+        deletePoi: 'Delete',
+        noReviewedPois: 'No reviewed POIs.',
+        confirmDeletePoi: 'Delete this reviewed POI?',
+        emailSentTo: 'POI info sent to {email}',
+        emailSendFailed: 'Email send failed',
+        broadcastPanel: 'Broadcast Notice',
+        broadcastTitle: 'Notice Title',
+        broadcastTitlePlaceholder: 'System Notice',
+        broadcastContent: 'Notice Content',
+        broadcastContentPlaceholder: 'Enter broadcast notice...',
+        broadcastAudience: 'Audience',
+        audienceAll: 'All Users',
+        audienceCollector: 'Collectors Only',
+        audienceReviewer: 'Reviewers Only',
+        broadcastEmpty: 'Please enter notice content.',
+        broadcastSent: 'Notice sent to {count} users',
+        broadcastFailed: 'Notice send failed',
+        virtualMap: 'Virtual Map',
+        amapMap: 'AMap',
+        zoomIn: 'Zoom In',
+        zoomOut: 'Zoom Out',
+        resetView: 'Reset View',
+        mapLoading: 'Loading map',
+        mapLoadFailed: 'Map failed to load',
+        amapKeyMissing: 'AMap key is missing',
+        navigationPanel: 'Route Navigation',
+        navigationMode: 'Travel Mode',
+        navigationHint: 'Select a POI to open AMap route planning',
+        locateMe: 'Locate Me',
+        refreshLocation: 'Refresh Location',
+        currentPositionReady: 'Current position ready',
+        currentPositionMissing: 'Current position unavailable',
+        walking: 'Walk',
+        driving: 'Drive',
+        transit: 'Transit',
+        straightDistance: 'Straight Distance',
+        distancePending: 'Locate to preview distance',
+        openNavigation: 'AMap Navigation',
+        previewRoute: 'Route Preview',
+        routeCoordinateMissing: 'This POI has no valid coordinate for navigation.',
+        navigationOpened: 'AMap route planning opened',
+        disputeReviewTitle: 'Third-party Dispute Review',
+        disputeLoading: 'Loading dispute',
+        disputeInvalid: 'This review link is invalid or already resolved.',
+        finalApprove: 'Final Approve',
+        finalReject: 'Final Reject',
+        finalOpinion: 'Final Opinion',
+        finalOpinionPlaceholder: 'Enter final verification opinion...',
+        submitFinalResult: 'Submit Final Result',
+        disputeResolved: 'Dispute result submitted.',
+        originalRejectReason: 'Original Review Opinion',
+        disputeReason: 'Dispute Reason',
+        thirdPartyReminder: 'This point has an issue. Please recollect and verify it.',
+        loginToUpdatePoi: 'Login to Update This POI',
+        loginToUpdateHint: 'Continue as collector and open the update form',
+        disconnectNode: 'Disconnect Node'
+      }
+    };
+
+    const LanguageContext = createContext(null);
+    function interpolate(template, params = {}) {
+      return Object.entries(params).reduce((text, [key, value]) => text.replaceAll(`{${key}}`, value), template);
+    }
+    function useLang() {
+      return useContext(LanguageContext);
+    }
+    function groupRoomIdForRole(role) {
+      return role === 'verifier' ? 'reviewer_group' : 'collector_group';
+    }
+    function LanguageToggle({ compact = false }) {
+      const { lang, setLang, t } = useLang();
+      return (
+        <div className={`liquid-glass rounded-full p-1 flex items-center ${compact ? 'text-[9px]' : 'text-[10px]'} uppercase tracking-widest`}>
+          {['zh', 'en'].map(item => (
+            <button
+              key={item}
+              onClick={() => setLang(item)}
+              className={`px-3 py-1.5 rounded-full transition-colors ${lang === item ? 'bg-white/20 text-white' : 'text-white/50 hover:text-white'}`}
+            >
+              {item === 'zh' ? t('languageZh') : t('languageEn')}
+            </button>
+          ))}
+        </div>
+      );
+    }
+
+    function toLucideKey(name) {
+      return name.replace(/(^\w|[-_]\w)/g, part => part.replace(/[-_]/, '').toUpperCase());
+    }
+
+    function Icon({ name, className = '' }) {
+      const iconNode = window.lucide?.icons?.[toLucideKey(name)];
+      if (!iconNode) return <span className={className}></span>;
+      const renderNode = ([tag, attrs, children], index) => {
+        const props = {};
+        Object.entries(attrs || {}).forEach(([key, value]) => {
+          props[key.replace(/-([a-z])/g, (_, char) => char.toUpperCase())] = value;
+        });
+        return React.createElement(tag, { ...props, key: index }, (children || []).map(renderNode));
+      };
+      return (
+        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+          fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+          className={`lucide ${className}`} aria-hidden="true">
+          {iconNode.map(renderNode)}
+        </svg>
+      );
+    }
+
+    class ErrorBoundary extends React.Component {
+      constructor(props) { super(props); this.state = { error: null }; }
+      static getDerivedStateFromError(error) { return { error }; }
+      componentDidCatch(error, info) { console.error('[ErrorBoundary]', error, info); }
+      render() {
+        if (!this.state.error) return this.props.children;
+        return (
+          <div className="min-h-screen bg-slate-950 text-white p-6 flex items-center justify-center">
+            <div className="max-w-lg liquid-glass-strong rounded-3xl p-6">
+              <div className="glass-content">
+                <h2 className="text-xl font-semibold mb-3">页面渲染出错</h2>
+                <pre className="whitespace-pre-wrap text-xs text-white/70">{String(this.state.error?.stack || this.state.error?.message || this.state.error)}</pre>
+                <button onClick={() => location.reload()} className="mt-5 liquid-glass px-5 py-3 rounded-2xl text-sm">Reload</button>
+              </div>
+            </div>
+          </div>
+        );
+      }
+    }
+
+    function getInitialParams() {
+      const params = new URLSearchParams(location.search);
+      const openId = params.get('openid') || localStorage.getItem('user_openid') || localStorage.getItem('userOpenId') || '';
+      const roleParam = params.get('role') || localStorage.getItem('userRole') || '';
+      return {
+        openId,
+        role: ROLE_UI[roleParam] || roleParam || null,
+        tab: params.get('tab') || '',
+        editPoi: params.get('editPoi') || ''
+      };
+    }
+
+    function saveOpenId(openId) {
+      if (!openId) return;
+      localStorage.setItem('user_openid', openId);
+      localStorage.setItem('userOpenId', openId);
+    }
+
+    function apiRole(role) { return ROLE_API[role] || 'collector'; }
+    function normalizeStatus(status) {
+      if (status === 'approved') return 'verified';
+      if (status === 'rejected') return 'error';
+      return status || 'pending';
+    }
+    function normalizePoi(raw, fallbackStatus = 'pending') {
+      const location = raw.location || {};
+      const lng = Number(location.lng ?? raw.lng ?? 0);
+      const lat = Number(location.lat ?? raw.lat ?? 0);
+      return {
+        id: raw._id || raw.id || String(Date.now()),
+        rawId: raw._id || raw.id || '',
+        name: raw.poiName || raw.name || '',
+        category: raw.category || '',
+        status: normalizeStatus(raw.status || fallbackStatus),
+        lat: Number.isFinite(lat) ? lat : 0,
+        lng: Number.isFinite(lng) ? lng : 0,
+        address: raw.address || (Number.isFinite(lat) && Number.isFinite(lng) ? `${lat.toFixed(6)}, ${lng.toFixed(6)}` : ''),
+        desc: raw.description ?? raw.desc ?? '',
+        errorMsg: raw.rejectReason || raw.errorMsg || '',
+        imageUrl: raw.imageUrl || '',
+        createTime: raw.createTime || ''
+      };
+    }
+    function mergePoiLists(...lists) {
+      const map = new Map();
+      lists.flat().filter(Boolean).forEach(poi => {
+        const key = poi.rawId || poi.id;
+        if (!key) return;
+        const existing = map.get(key);
+        if (!existing || existing.status === 'verified' || poi.status !== 'verified') {
+          map.set(key, poi);
+        }
+      });
+      return Array.from(map.values()).sort((a, b) => new Date(b.createTime || 0) - new Date(a.createTime || 0));
+    }
+    function splitDescriptionAndCategory(description, fallbackCategory = '') {
+      const lines = String(description || '').split(/\r?\n/);
+      let manualCategory = '';
+      const descLines = [];
+      lines.forEach(line => {
+        const match = line.match(/^人工分类[:：]\s*(.+)$/);
+        if (match) manualCategory = match[1].trim();
+        else descLines.push(line);
+      });
+      return { desc: descLines.join('\n').trim(), category: manualCategory || fallbackCategory || '' };
+    }
+    function formatDisplayTime(value) {
+      if (!value) return '';
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return String(value);
+      return date.toLocaleString('zh-CN', { hour12: false });
+    }
+    function isValidCoordinate(lat, lng) {
+      return Number.isFinite(lat) && Number.isFinite(lng) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180 && !(lat === 0 && lng === 0);
+    }
+    function getBrowserLocation(t) {
+      return new Promise((resolve, reject) => {
+        const isLocalHost = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
+        if (window.location.protocol !== 'https:' && !isLocalHost) return reject(new Error(t('gpsRequiresHttps')));
+        if (!navigator.geolocation) return reject(new Error(t('geoUnsupported')));
+        navigator.geolocation.getCurrentPosition(
+          pos => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude, accuracy: Math.round(pos.coords.accuracy || 0) }),
+          reject,
+          { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+        );
+      });
+    }
+    function getLocationErrorMessage(err, t) {
+      if (!err) return t('gpsFailed');
+      if (err.code === 1) return t('locationDenied');
+      if (err.code === 2) return t('locationUnavailable');
+      if (err.code === 3) return t('locationTimeout');
+      return err.message || t('gpsFailed');
+    }
+    function getDistanceMeters(a, b) {
+      if (!a || !b || !isValidCoordinate(a.lat, a.lng) || !isValidCoordinate(b.lat, b.lng)) return null;
+      const toRad = value => value * Math.PI / 180;
+      const radius = 6371000;
+      const dLat = toRad(b.lat - a.lat);
+      const dLng = toRad(b.lng - a.lng);
+      const lat1 = toRad(a.lat);
+      const lat2 = toRad(b.lat);
+      const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+      return 2 * radius * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+    }
+    function formatDistance(meters) {
+      if (!Number.isFinite(meters)) return '';
+      return meters >= 1000 ? `${(meters / 1000).toFixed(meters >= 10000 ? 0 : 1)} km` : `${Math.round(meters)} m`;
+    }
+    function buildAmapRouteUrl(poi, mode = 'walking', origin = null) {
+      if (!poi || !isValidCoordinate(poi.lat, poi.lng)) return '';
+      const routeMode = mode === 'driving' ? 'car' : mode === 'transit' ? 'bus' : 'walk';
+      const placeName = String(poi.name || poi.address || 'POI').replace(/,/g, ' ');
+      const params = new URLSearchParams({
+        to: `${poi.lng},${poi.lat},${placeName}`,
+        mode: routeMode,
+        policy: '0',
+        src: 'check_collect',
+        callnative: '1'
+      });
+      if (origin && isValidCoordinate(origin.lat, origin.lng)) {
+        params.set('from', `${origin.lng},${origin.lat},我的位置`);
+      }
+      return `https://uri.amap.com/navigation?${params.toString()}`;
+    }
+    function openAmapRoute(poi, mode, origin, t) {
+      const url = buildAmapRouteUrl(poi, mode, origin);
+      if (!url) {
+        alert(t('routeCoordinateMissing'));
+        return;
+      }
+      window.open(url, '_blank', 'noopener,noreferrer');
+    }
+    let amapLoaderPromise = null;
+    async function loadAmapSdk() {
+      if (window.AMap) return window.AMap;
+      if (amapLoaderPromise) return amapLoaderPromise;
+      amapLoaderPromise = (async () => {
+        const config = await fetchJson('/api/client-config?_t=' + Date.now());
+        const key = config?.amap?.key;
+        const securityCode = config?.amap?.securityCode;
+        if (!key) throw new Error('AMap key missing');
+        if (securityCode) {
+          window._AMapSecurityConfig = { securityJsCode: securityCode };
+        }
+        await new Promise((resolve, reject) => {
+          const script = document.createElement('script');
+          script.src = `https://webapi.amap.com/maps?v=2.0&key=${encodeURIComponent(key)}`;
+          script.async = true;
+          script.onload = resolve;
+          script.onerror = () => reject(new Error('AMap SDK load failed'));
+          document.head.appendChild(script);
+        });
+        return window.AMap;
+      })();
+      return amapLoaderPromise;
+    }
+    async function fetchJson(url, options = {}) {
+      const res = await fetch(url, options);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) throw new Error(data.message || `Request failed: ${res.status}`);
+      return data;
+    }
+    function revokePreview(url) {
+      if (url && url.startsWith('blob:')) {
+        try { URL.revokeObjectURL(url); } catch (_e) {}
+      }
+    }
+    function compressImage(imageFile) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error('Image read failed'));
+        reader.onload = () => {
+          const img = new Image();
+          img.onerror = () => reject(new Error('Image format not recognized'));
+          img.onload = () => {
+            const maxSide = 1200;
+            let width = img.width;
+            let height = img.height;
+            if (width > height && width > maxSide) {
+              height = Math.round(height * maxSide / width);
+              width = maxSide;
+            } else if (height > maxSide) {
+              width = Math.round(width * maxSide / height);
+              height = maxSide;
+            }
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+            canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('Image compression failed')), 'image/jpeg', 0.82);
+          };
+          img.src = reader.result;
+        };
+        reader.readAsDataURL(imageFile);
+      });
+    }
+
+    function StatusBadge({ status }) {
+      const { t } = useLang();
+      switch(status) {
+        case 'pending': return <span className="liquid-glass text-blue-200 px-2.5 py-0.5 rounded-full text-[10px] font-[500] uppercase tracking-widest z-10">{t('pending')}</span>;
+        case 'verified': return <span className="liquid-glass-strong text-emerald-300 px-2.5 py-0.5 rounded-full text-[10px] font-[500] uppercase tracking-widest flex items-center z-10"><Icon name="check" className="w-3 h-3 mr-1"/>{t('verified')}</span>;
+        case 'error': return <span className="liquid-glass text-rose-300 px-2.5 py-0.5 rounded-full text-[10px] font-[500] uppercase tracking-widest flex items-center z-10"><Icon name="alert-triangle" className="w-3 h-3 mr-1"/>{t('alert')}</span>;
+        case 'recollect': return <span className="liquid-glass text-amber-300 px-2.5 py-0.5 rounded-full text-[10px] font-[500] uppercase tracking-widest z-10">{t('recollect')}</span>;
+        default: return null;
+      }
+    }
+    function getPoiColors(status) {
+      switch(status) {
+        case 'pending': return { solid: 'bg-blue-400', ping: 'bg-blue-500', text: 'text-blue-400' };
+        case 'verified': return { solid: 'bg-emerald-400', ping: 'bg-emerald-500', text: 'text-emerald-400' };
+        case 'error': return { solid: 'bg-rose-500', ping: 'bg-rose-500', text: 'text-rose-500' };
+        case 'recollect': return { solid: 'bg-amber-400', ping: 'bg-amber-500', text: 'text-amber-400' };
+        default: return { solid: 'bg-cyan-400', ping: 'bg-cyan-500', text: 'text-cyan-400' };
+      }
+    }
+    function getMsgIcon(type) {
+      switch(type) {
+        case 'system': return <Icon name="bell" className="w-5 h-5" />;
+        case 'system_verify': return <Icon name="alert-triangle" className="w-5 h-5" />;
+        case 'private': return <Icon name="user" className="w-5 h-5" />;
+        case 'group': return <Icon name="users" className="w-5 h-5" />;
+        default: return <Icon name="message-square" className="w-5 h-5" />;
+      }
+    }
+
+    function App() {
+      const initial = useMemo(getInitialParams, []);
+      const disputeToken = useMemo(() => new URLSearchParams(window.location.search).get('disputeToken') || '', []);
+      const [openId, setOpenId] = useState(initial.openId);
+      const [appState, setAppState] = useState(initial.openId ? (initial.role ? 'main' : 'landing') : 'landing');
+      const [role, setRole] = useState(initial.role);
+      const [initialTab] = useState(initial.tab);
+      const [initialEditPoi] = useState(initial.editPoi);
+      const roleBindKeyRef = useRef('');
+      const [lang, setLangState] = useState(() => localStorage.getItem('poi_language') === 'en' ? 'en' : 'zh');
+      const t = useMemo(() => (key, params) => interpolate(TEXT[lang]?.[key] || TEXT.zh[key] || key, params), [lang]);
+      const langContext = useMemo(() => ({
+        lang,
+        setLang: nextLang => {
+          const normalized = nextLang === 'en' ? 'en' : 'zh';
+          localStorage.setItem('poi_language', normalized);
+          setLangState(normalized);
+          document.documentElement.lang = normalized === 'zh' ? 'zh-CN' : 'en';
+        },
+        t
+      }), [lang, t]);
+
+      useEffect(() => {
+        document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+      }, [lang]);
+
+      useEffect(() => {
+        if (!openId || !role) return;
+        const boundRole = apiRole(role);
+        const bindKey = `${openId}:${boundRole}`;
+        if (roleBindKeyRef.current === bindKey) return;
+        roleBindKeyRef.current = bindKey;
+        fetchJson('/api/user/bind-role', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ openId, role: boundRole })
+        }).catch(err => {
+          roleBindKeyRef.current = '';
+          console.warn('[bind-role:init]', err);
+        });
+      }, [openId, role]);
+
+      function handleOpenId(value) {
+        setOpenId(value);
+        saveOpenId(value);
+      }
+      async function handleLogin(selectedRole) {
+        if (!openId) {
+          alert(t('wechatAuthRequired'));
+          return;
+        }
+        await fetchJson('/api/user/bind-role', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ openId, role: apiRole(selectedRole) })
+        });
+        localStorage.setItem('userRole', selectedRole);
+        setRole(selectedRole);
+        setAppState('main');
+      }
+      function handleLogout() {
+        localStorage.removeItem('userRole');
+        setRole(null);
+        setAppState('landing');
+      }
+
+      return (
+        <LanguageContext.Provider value={langContext}>
+          <video
+            autoPlay loop muted playsInline
+            className="fixed inset-0 w-full h-full object-cover -z-20 opacity-60 grayscale"
+            src="https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260315_073750_51473149-4350-4920-ae24-c8214286f323.mp4"
+          />
+          <div className="fixed inset-0 bg-blue-950/60 mix-blend-multiply -z-10 pointer-events-none"></div>
+          <div className="fixed inset-0 bg-indigo-900/30 mix-blend-color -z-10 pointer-events-none"></div>
+          <div className="relative z-10 w-full min-h-screen text-slate-100 font-[500] flex">
+            {disputeToken ? <DisputeResolvePage token={disputeToken} /> : (
+              <>
+                {appState === 'landing' && <HeroLandingPage openId={openId} onOpenId={handleOpenId} onLogin={handleLogin} />}
+                {appState === 'main' && <MainLayout role={role || 'collector'} openId={openId} initialTab={initialTab} initialEditPoi={initialEditPoi} onLogout={handleLogout} />}
+              </>
+            )}
+          </div>
+        </LanguageContext.Provider>
+      );
+    }
+
+    function DisputeResolvePage({ token }) {
+      const { t } = useLang();
+      const [loading, setLoading] = useState(true);
+      const [error, setError] = useState('');
+      const [detail, setDetail] = useState(null);
+      const [finalAction, setFinalAction] = useState('approved');
+      const [finalOpinion, setFinalOpinion] = useState('');
+      const [submitting, setSubmitting] = useState(false);
+      const [done, setDone] = useState(false);
+
+      useEffect(() => {
+        loadDispute();
+      }, [token]);
+
+      async function loadDispute() {
+        setLoading(true);
+        setError('');
+        try {
+          const data = await fetchJson(`/api/dispute/${encodeURIComponent(token)}?_t=${Date.now()}`);
+          setDetail(data.data);
+        } catch (err) {
+          setError(err.message || t('disputeInvalid'));
+        } finally {
+          setLoading(false);
+        }
+      }
+      async function submitResult() {
+        if (finalAction === 'rejected' && !finalOpinion.trim()) return alert(t('finalOpinion'));
+        setSubmitting(true);
+        try {
+          await fetchJson(`/api/dispute/${encodeURIComponent(token)}/resolve`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ finalAction, finalOpinion })
+          });
+          setDone(true);
+        } catch (err) {
+          alert(err.message || t('adminActionFailed'));
+        } finally {
+          setSubmitting(false);
+        }
+      }
+      function loginToUpdatePoi() {
+        const poiId = detail?.poiId || poi._id || poi.id || '';
+        const url = new URL('/portal.html', window.location.origin);
+        url.searchParams.set('tab', 'collect');
+        url.searchParams.set('editPoi', poiId);
+        url.searchParams.set('role', 'collector');
+        if (detail?.collectorOpenId) url.searchParams.set('openid', detail.collectorOpenId);
+        window.location.href = url.toString();
+      }
+
+      const poi = detail?.poi || {};
+      return (
+        <div className="w-full h-screen overflow-y-auto mobile-scroll p-4 lg:p-8 flex items-start lg:items-center justify-center pb-24 lg:pb-8">
+          <div className="w-full max-w-4xl liquid-glass-strong rounded-[2.5rem] p-5 lg:p-8 animate-silky my-4 lg:my-0">
+            <div className="glass-content">
+              <div className="flex items-center justify-between gap-4 mb-6">
+                <div>
+                  <h1 className="text-xl lg:text-2xl text-white tracking-widest uppercase">{t('disputeReviewTitle')}</h1>
+                  <p className="text-xs text-rose-100/75 mt-2">{t('thirdPartyReminder')}</p>
+                </div>
+                <LanguageToggle />
+              </div>
+              {loading ? (
+                <div className="liquid-glass rounded-3xl p-8 text-sm text-white/70">{t('disputeLoading')}</div>
+              ) : error ? (
+                <div className="liquid-glass rounded-3xl p-8 text-sm text-rose-200">{error || t('disputeInvalid')}</div>
+              ) : done ? (
+                <div className="liquid-glass-strong rounded-3xl p-8 text-sm text-emerald-200">{t('disputeResolved')}</div>
+              ) : (
+                <div className="grid lg:grid-cols-[minmax(0,1fr)_320px] gap-4 lg:gap-6">
+                  <div className="space-y-4 min-w-0">
+                    <div className="liquid-glass rounded-3xl overflow-hidden min-h-[180px]">
+                      {poi.imageUrl ? <img src={poi.imageUrl} alt={poi.poiName || poi.name || t('unknownPoi')} className="w-full h-56 object-cover opacity-85 grayscale" /> : <div className="h-56 flex items-center justify-center"><Icon name="image" className="w-10 h-10 text-white/40" /></div>}
+                    </div>
+                    <div className="liquid-glass p-5 rounded-3xl">
+                      <div className="text-xl text-white mb-2">{poi.poiName || poi.name || t('unknownPoi')}</div>
+                      <div className="grid sm:grid-cols-2 gap-3 text-xs text-white/70">
+                        <div>{t('classification')}: {poi.category || t('pendingCategory')}</div>
+                        <div>{t('coordinates')}: {Number(poi.lat ?? poi.location?.lat ?? 0).toFixed(6)}, {Number(poi.lng ?? poi.location?.lng ?? 0).toFixed(6)}</div>
+                        <div>{t('collector')}: {detail.collectorOpenId || '-'}</div>
+                        <div>{t('reviewer')}: {detail.reviewerOpenId || '-'}</div>
+                      </div>
+                      <div className="w-full h-px bg-white/10 my-4"></div>
+                      <div className="space-y-3 text-sm">
+                        <div><div className="text-[10px] text-white/45 uppercase tracking-widest mb-1">{t('originalRejectReason')}</div><div className="text-white/85 whitespace-pre-wrap">{poi.rejectReason || t('noDetail')}</div></div>
+                        <div><div className="text-[10px] text-white/45 uppercase tracking-widest mb-1">{t('disputeReason')}</div><div className="text-white/85 whitespace-pre-wrap">{detail.reason || t('noDetail')}</div></div>
+                        <div><div className="text-[10px] text-white/45 uppercase tracking-widest mb-1">{t('logData')}</div><div className="text-white/85 whitespace-pre-wrap">{poi.description || t('noLogData')}</div></div>
+                      </div>
+                      <button onClick={loginToUpdatePoi} className="mt-5 w-full liquid-glass-strong rounded-2xl py-4 text-xs uppercase tracking-widest text-cyan-100 active:scale-95 transition-transform">
+                        {t('loginToUpdatePoi')}
+                      </button>
+                      <div className="mt-2 text-[10px] text-white/45 text-center uppercase tracking-widest">{t('loginToUpdateHint')}</div>
+                    </div>
+                  </div>
+                  <div className="liquid-glass p-5 rounded-3xl h-fit">
+                    <div className="text-xs text-white/50 uppercase tracking-widest mb-4">{t('submitFinalResult')}</div>
+                    <div className="grid grid-cols-2 gap-2 mb-4">
+                      <button onClick={() => setFinalAction('approved')} className={`${finalAction === 'approved' ? 'liquid-glass-strong text-emerald-200' : 'liquid-glass text-white/65'} rounded-2xl py-3 text-xs uppercase tracking-widest active:scale-95 transition-all`}>{t('finalApprove')}</button>
+                      <button onClick={() => setFinalAction('rejected')} className={`${finalAction === 'rejected' ? 'liquid-glass-strong text-rose-200' : 'liquid-glass text-white/65'} rounded-2xl py-3 text-xs uppercase tracking-widest active:scale-95 transition-all`}>{t('finalReject')}</button>
+                    </div>
+                    <label className="block text-[10px] text-white/50 uppercase tracking-widest mb-2">{t('finalOpinion')}</label>
+                    <textarea value={finalOpinion} onChange={e => setFinalOpinion(e.target.value)} rows="7" maxLength="800" placeholder={t('finalOpinionPlaceholder')} className="w-full liquid-glass rounded-2xl px-4 py-3 text-white placeholder:text-white/30 outline-none text-sm resize-none mb-4" />
+                    <button onClick={submitResult} disabled={submitting} className="w-full liquid-glass-strong rounded-2xl py-4 text-xs uppercase tracking-widest text-white disabled:opacity-50 active:scale-95 transition-transform">
+                      {submitting ? t('connecting') : t('submitFinalResult')}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function HeroLandingPage({ openId, onOpenId, onLogin }) {
+      const { t } = useLang();
+      const qrRef = useRef(null);
+      const pollRef = useRef(null);
+      const [statusKey, setStatusKey] = useState(openId ? 'deviceAuthenticated' : 'initializingWechat');
+      const [statusText, setStatusText] = useState('');
+      const [qrReady, setQrReady] = useState(false);
+      const [loggingRole, setLoggingRole] = useState('');
+      const isWeChat = /MicroMessenger/i.test(navigator.userAgent);
+
+      useEffect(() => {
+        if (openId) return;
+        if (isWeChat) {
+          setStatusKey('redirectingWechat');
+          location.href = '/auth/wechat?redirect=' + encodeURIComponent('/portal.html');
+          return;
+        }
+        initQrLogin();
+        return () => clearTimeout(pollRef.current);
+      }, []);
+
+      async function initQrLogin() {
+        clearTimeout(pollRef.current);
+        setQrReady(false);
+        setStatusKey('generatingQr');
+        setStatusText('');
+        if (qrRef.current) qrRef.current.innerHTML = '';
+        try {
+          const data = await fetchJson('/auth/wechat/qr?_t=' + Date.now());
+          if (window.QRCode && qrRef.current) {
+            new QRCode(qrRef.current, {
+              text: data.qrUrl,
+              width: 168,
+              height: 168,
+              correctLevel: QRCode.CorrectLevel.M
+            });
+          }
+          setQrReady(true);
+          setStatusKey('scanToAuth');
+          pollStatus(data.sid);
+        } catch (err) {
+          setStatusText(err.message || t('qrInitFailed'));
+        }
+      }
+      async function pollStatus(sid) {
+        try {
+          const data = await fetchJson('/auth/status?sid=' + encodeURIComponent(sid) + '&_t=' + Date.now());
+          if (data.status === 'ok' && data.openid) {
+            setStatusKey('authComplete');
+            setStatusText('');
+            onOpenId(data.openid);
+            return;
+          }
+          if (data.status === 'expired') {
+            setStatusKey('qrExpired');
+            setStatusText('');
+            return;
+          }
+        } catch (_err) {
+          setStatusKey('networkWaiting');
+          setStatusText('');
+        }
+        pollRef.current = setTimeout(() => pollStatus(sid), 2000);
+      }
+      async function submitRole(role) {
+        setLoggingRole(role);
+        try { await onLogin(role); }
+        catch (err) { alert(err.message || t('loginFailed')); }
+        finally { setLoggingRole(''); }
+      }
+
+      return (
+        <div className="auth-scroll flex min-h-screen w-full relative p-4 lg:p-6 animate-silky items-center justify-center mobile-scroll">
+          <div className="fixed top-5 right-5 z-30"><LanguageToggle /></div>
+          <div className="w-full max-w-5xl flex flex-col lg:flex-row gap-4 lg:gap-6 relative z-10">
+            <div className="flex-1 liquid-glass-strong rounded-[2.5rem] mobile-card-pad p-10 flex flex-col justify-center items-center text-center">
+              <div className="glass-content flex flex-col items-center">
+                <div className="w-16 h-16 rounded-full liquid-glass flex items-center justify-center mb-6">
+                  <Icon name="globe" className="w-8 h-8 text-blue-200" />
+                </div>
+                <h1 className="mobile-tight-title text-4xl lg:text-5xl tracking-[-0.05em] text-white leading-[1.2] mb-8 font-[500]">
+                  POI <i className="font-serif italic text-blue-200">GeoSync</i> <br/> Platform
+                </h1>
+                <div className="w-40 h-40 lg:w-48 lg:h-48 liquid-glass rounded-3xl flex items-center justify-center p-4 mb-6 hover:scale-105 transition-transform cursor-pointer">
+                  {openId ? (
+                    <Icon name="check" className="w-20 h-20 lg:w-24 lg:h-24 text-emerald-300" />
+                  ) : (
+                    <div className="relative z-10 bg-white p-2 rounded-2xl">
+                      <div ref={qrRef} className={qrReady ? '' : 'hidden'}></div>
+                      {!qrReady && <Icon name="qr-code" className="w-24 h-24 text-slate-300" />}
+                    </div>
+                  )}
+                </div>
+                <p className="text-xs text-blue-100/60 uppercase tracking-widest min-h-[1.25rem]">{statusText || t(statusKey)}</p>
+                {!openId && !isWeChat && (
+                  <button onClick={initQrLogin} className="mt-5 liquid-glass px-5 py-3 rounded-full text-xs uppercase tracking-widest text-white">
+                    {t('refreshQr')}
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="flex-1 liquid-glass-strong rounded-[2.5rem] mobile-card-pad p-10 flex flex-col justify-center mb-6 lg:mb-0">
+              <div className="glass-content h-full flex flex-col justify-center">
+                <h2 className="text-2xl font-[500] text-white mb-2">{t('systemLogin')}</h2>
+                <p className="text-sm text-blue-100/50 mb-6 lg:mb-10">{t('selectNode')}</p>
+                <div className="flex flex-col gap-4 lg:gap-5">
+                  <RoleButton disabled={!openId || loggingRole} loading={loggingRole === 'collector'} icon="camera" title={t('collectorNode')} subtitle={t('collectorSubtitle')} onClick={() => submitRole('collector')} />
+                  <RoleButton disabled={!openId || loggingRole} loading={loggingRole === 'verifier'} icon="check-circle" title={t('verifierNode')} subtitle={t('verifierSubtitle')} onClick={() => submitRole('verifier')} />
+                </div>
+                {!openId && <p className="mt-6 text-[11px] text-blue-100/50 uppercase tracking-widest text-center">{t('authorizeBeforeRole')}</p>}
+                <div className="mt-auto pt-8 flex items-center justify-center space-x-4">
+                  <div className="h-px w-8 bg-blue-100/20"></div>
+                  <span className="text-[10px] tracking-widest uppercase text-blue-100/40">{t('secureConnection')}</span>
+                  <div className="h-px w-8 bg-blue-100/20"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function RoleButton({ icon, title, subtitle, onClick, disabled, loading }) {
+      return (
+        <button onClick={onClick} disabled={disabled} className="liquid-glass p-5 lg:p-6 rounded-2xl flex items-center group active:scale-95 transition-transform cursor-pointer hover:scale-[1.02] disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:scale-100">
+          <div className="glass-content flex items-center w-full">
+            <div className="w-12 h-12 lg:w-14 lg:h-14 rounded-full liquid-glass flex items-center justify-center mr-4 lg:mr-6 text-blue-300 shrink-0">
+              <Icon name={loading ? 'loader-2' : icon} className={`w-6 h-6 ${loading ? 'animate-spin' : ''}`} />
+            </div>
+            <div className="text-left flex-1">
+              <div className="font-[500] text-lg text-white">{title}</div>
+              <div className="text-xs text-blue-100/50 uppercase tracking-widest mt-1">{subtitle}</div>
+            </div>
+            <Icon name="arrow-right" className="w-5 h-5 text-white/50 group-hover:text-white transition-colors" />
+          </div>
+        </button>
+      );
+    }
+
+    function MainLayout({ role, openId, initialTab, initialEditPoi, onLogout }) {
+      const { t } = useLang();
+      const [activeTab, setActiveTab] = useState(initialTab || 'home');
+      const [pois, setPois] = useState([]);
+      const [loadingPois, setLoadingPois] = useState(false);
+      const [editingPoi, setEditingPoi] = useState(null);
+      const pendingEditRef = useRef(initialEditPoi || '');
+      const socketRef = useRef(null);
+
+      useEffect(() => { loadPois(); }, [role, openId]);
+      useEffect(() => {
+        if (!window.io || !openId) return;
+        const socket = io({ query: { openId } });
+        socketRef.current = socket;
+        socket.on('newPoi', loadPois);
+        socket.on('poiStatusChanged', loadPois);
+        return () => socket.disconnect();
+      }, [openId, role]);
+
+      async function loadPois() {
+        if (!openId) return;
+        setLoadingPois(true);
+        try {
+          const stamp = Date.now();
+          const publicUrl = `/api/poi/all?_t=${stamp}`;
+          const workUrl = role === 'verifier'
+            ? `/api/admin/list?page=1&size=80&_t=${stamp}`
+            : `/api/poi/my?openId=${encodeURIComponent(openId)}&page=1&size=80&_t=${stamp}`;
+          const [publicData, workData] = await Promise.all([
+            fetchJson(publicUrl),
+            fetchJson(workUrl)
+          ]);
+          const publicPois = (publicData.data || []).map(item => normalizePoi(item, 'approved'));
+          const workPois = (workData.data || []).map(item => normalizePoi(item, 'pending'));
+          const mergedPois = mergePoiLists(publicPois, workPois);
+          setPois(mergedPois);
+          if (pendingEditRef.current && role === 'collector') {
+            const target = mergedPois.find(p => (p.rawId || p.id) === pendingEditRef.current);
+            if (target) {
+              pendingEditRef.current = '';
+              setEditingPoi(target);
+              setActiveTab('collect');
+            }
+          }
+        } catch (err) {
+          console.warn('[loadPois]', err);
+          setPois([]);
+        } finally {
+          setLoadingPois(false);
+        }
+      }
+      function renderContent() {
+        switch(activeTab) {
+          case 'home': return <HomeDashboard role={role} pois={pois} setActiveTab={setActiveTab} loading={loadingPois} />;
+          case 'collect': return <CollectWorkspace openId={openId} editingPoi={editingPoi} onCancelEdit={() => setEditingPoi(null)} onSubmitted={async ({ editing } = {}) => { await loadPois(); setEditingPoi(null); if (editing) setActiveTab('map'); }} />;
+          case 'map': return <MapWorkspace role={role} openId={openId} pois={pois} loading={loadingPois} reloadPois={loadPois} setActiveTab={setActiveTab} onEditPoi={(poi) => { setEditingPoi(poi); setActiveTab('collect'); }} />;
+          case 'messages': return <MessageCenter role={role} openId={openId} pois={pois} reloadPois={loadPois} />;
+          case 'settings': return <SettingsView role={role} openId={openId} onLogout={onLogout} />;
+          default: return null;
+        }
+      }
+      return (
+        <div className="flex h-screen w-full overflow-hidden p-4 lg:p-6 pb-0 lg:pb-6 gap-6 relative mobile-app-frame">
+          <div className="hidden lg:flex w-24 liquid-glass-strong rounded-3xl flex-col items-center py-8 justify-between z-20">
+            <div className="glass-content flex flex-col items-center h-full justify-between">
+              <div className="flex flex-col items-center space-y-10">
+                <div className="w-12 h-12 liquid-glass rounded-2xl flex items-center justify-center">
+                  <Icon name="globe" className="text-blue-200 w-6 h-6" />
+                </div>
+                <nav className="flex flex-col space-y-6">
+                  <SidebarItem icon="home" active={activeTab === 'home'} onClick={() => setActiveTab('home')} title={t('navCore')} />
+                  {role === 'collector' && <SidebarItem icon="plus-square" active={activeTab === 'collect'} onClick={() => { setEditingPoi(null); setActiveTab('collect'); }} title={t('navCollect')} />}
+                  <SidebarItem icon="map" active={activeTab === 'map'} onClick={() => setActiveTab('map')} title={t('navRadar')} />
+                  <SidebarItem icon="message-square" active={activeTab === 'messages'} onClick={() => setActiveTab('messages')} title={t('navComms')} hasDot />
+                  <SidebarItem icon="settings" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} title={t('navConfig')} />
+                </nav>
+              </div>
+              <button onClick={onLogout} className="w-12 h-12 liquid-glass rounded-2xl flex items-center justify-center text-blue-100/50 hover:text-white hover:scale-105 active:scale-95 transition-all">
+                <Icon name="log-out" className="w-5 h-5" />
+              </button>
+            </div>
+          </div>
+          <div className="flex-1 flex overflow-hidden relative z-20 h-full mobile-main-safe lg:pb-0">
+            <div key={activeTab} className="w-full h-full animate-silky flex">{renderContent()}</div>
+          </div>
+          <div className="lg:hidden absolute mobile-bottom-nav left-4 right-4 liquid-glass-strong rounded-3xl flex justify-around items-center h-[75px] z-50 px-2 pb-safe shadow-2xl">
+            <div className="glass-content w-full h-full flex justify-around items-center">
+              <MobileTab icon="home" active={activeTab === 'home'} onClick={() => setActiveTab('home')} />
+              {role === 'collector' && (
+                <div className="relative -top-2 shrink-0" onClick={() => { setEditingPoi(null); setActiveTab('collect'); }}>
+                  <div className={`w-12 h-12 liquid-glass-strong rounded-full flex items-center justify-center cursor-pointer hover:scale-105 active:scale-95 transition-transform shadow-lg ${activeTab === 'collect' ? 'text-blue-200' : 'text-white'}`}>
+                    <Icon name="camera" className="w-5 h-5" />
+                  </div>
+                </div>
+              )}
+              <MobileTab icon="map" active={activeTab === 'map'} onClick={() => setActiveTab('map')} />
+              <MobileTab icon="message-square" active={activeTab === 'messages'} onClick={() => setActiveTab('messages')} hasDot />
+              <MobileTab icon="settings" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} />
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function SidebarItem({ icon, active, onClick, title, hasDot }) {
+      return (
+        <button onClick={onClick} className={`p-3 rounded-2xl transition-all relative flex flex-col items-center justify-center group ${active ? 'liquid-glass text-blue-300' : 'text-blue-100/50 hover:scale-110 hover:text-blue-100'}`} title={title}>
+          <Icon name={icon} className="w-6 h-6" />
+          {hasDot && <span className="absolute top-2 right-2 w-2 h-2 bg-blue-400 rounded-full"></span>}
+        </button>
+      );
+    }
+    function MobileTab({ icon, active, onClick, hasDot }) {
+      return (
+        <div onClick={onClick} className="flex flex-col items-center justify-center w-14 h-full cursor-pointer relative">
+          <div className={`transition-colors ${active ? 'text-blue-300' : 'text-blue-100/50'}`}>
+            <Icon name={icon} className="w-6 h-6" />
+          </div>
+          {hasDot && <span className="absolute top-4 right-3 w-1.5 h-1.5 bg-blue-400 rounded-full"></span>}
+        </div>
+      );
+    }
+
+    function HomeDashboard({ role, pois, setActiveTab, loading }) {
+      const { t } = useLang();
+      const pending = pois.filter(p => p.status === 'pending').length;
+      const alerts = pois.filter(p => p.status === 'error').length;
+      const verified = pois.filter(p => p.status === 'verified').length;
+      return (
+        <div className="flex-1 liquid-glass-strong rounded-[2.5rem] p-5 lg:p-8 flex flex-col items-center justify-start lg:justify-center w-full pb-[110px] lg:pb-8 overflow-y-auto hide-scrollbar mobile-panel-height">
+          <div className="glass-content flex flex-col items-center w-full my-0 lg:my-auto">
+            <div className="relative mb-6 lg:mb-10 flex flex-col items-center hover:scale-105 transition-transform duration-500">
+              <div className="w-24 h-24 lg:w-32 lg:h-32 liquid-glass rounded-full flex items-center justify-center relative z-10">
+                <Icon name="globe" className="w-10 h-10 lg:w-12 lg:h-12 text-blue-200" />
+              </div>
+              <div className="relative -mt-3 lg:-mt-4 z-20 liquid-glass px-4 lg:px-5 py-2 rounded-full text-[11px] lg:text-xs text-white uppercase tracking-widest flex items-center font-[500]">
+                <span className="w-1.5 h-1.5 bg-blue-400 rounded-full mr-3 animate-pulse"></span> {t('nodeActive')}
+              </div>
+            </div>
+            <h2 className="text-3xl md:text-5xl font-bold text-white mb-6 lg:mb-16 tracking-tight text-center leading-tight">
+              {t('awaitingDirective')}
+            </h2>
+            <div className="grid grid-cols-3 gap-2 lg:gap-3 mb-4 lg:mb-6 w-full max-w-xl">
+              <MetricPill label={t('pending')} value={loading ? '--' : pending} />
+              <MetricPill label={t('verified')} value={loading ? '--' : verified} />
+              <MetricPill label={t('alert')} value={loading ? '--' : alerts} />
+            </div>
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 lg:gap-4 w-full max-w-4xl">
+              <DashboardCard icon={role === 'collector' ? 'camera' : 'check-circle'} title={role === 'collector' ? t('collection') : t('verification')} onClick={() => setActiveTab(role === 'collector' ? 'collect' : 'map')} primary />
+              <DashboardCard icon="message-square" title={t('communications')} onClick={() => setActiveTab('messages')} />
+              <DashboardCard icon="map" title={t('spatialRadar')} onClick={() => setActiveTab('map')} />
+              <DashboardCard icon="settings" title={t('preferences')} onClick={() => setActiveTab('settings')} />
+            </div>
+          </div>
+        </div>
+      );
+    }
+    function MetricPill({ label, value }) {
+      return (
+        <div className="liquid-glass rounded-2xl px-3 lg:px-4 py-2.5 lg:py-3 text-center shrink-0">
+          <div className="glass-content">
+            <div className="text-lg lg:text-xl text-white">{value}</div>
+            <div className="text-[9px] text-white/50 uppercase tracking-widest truncate">{label}</div>
+          </div>
+        </div>
+      );
+    }
+    function DashboardCard({ icon, title, onClick, primary }) {
+      return (
+        <div onClick={onClick} className={`p-4 lg:p-8 min-h-[108px] lg:min-h-0 rounded-3xl flex flex-col items-center justify-center cursor-pointer hover:scale-105 active:scale-95 transition-transform shrink-0 ${primary ? 'liquid-glass-strong' : 'liquid-glass'}`}>
+          <div className="glass-content flex flex-col items-center">
+            <div className="w-10 h-10 lg:w-12 lg:h-12 rounded-full liquid-glass flex items-center justify-center mb-3 lg:mb-4 text-white">
+              <Icon name={icon} className="w-5 h-5 lg:w-6 lg:h-6" />
+            </div>
+            <span className="text-xs lg:text-sm font-[500] text-slate-200 tracking-wide text-center leading-snug">{title}</span>
+          </div>
+        </div>
+      );
+    }
+
+    function CollectWorkspace({ openId, editingPoi, onCancelEdit, onSubmitted }) {
+      const { lang, t } = useLang();
+      const fileInputRef = useRef(null);
+      const [photoTaken, setPhotoTaken] = useState(false);
+      const [isProcessing, setIsProcessing] = useState(false);
+      const [file, setFile] = useState(null);
+      const [previewUrl, setPreviewUrl] = useState('');
+      const [poiName, setPoiName] = useState('');
+      const [location, setLocation] = useState(null);
+      const [locationError, setLocationError] = useState('');
+      const [manualLat, setManualLat] = useState('');
+      const [manualLng, setManualLng] = useState('');
+      const [category, setCategory] = useState('');
+      const [desc, setDesc] = useState('');
+      const [isSubmitted, setIsSubmitted] = useState(false);
+      const [submitting, setSubmitting] = useState(false);
+      const [ocrHint, setOcrHint] = useState('');
+      const isEditing = Boolean(editingPoi);
+
+      useEffect(() => {
+        if (editingPoi) {
+          const parsed = splitDescriptionAndCategory(editingPoi.desc, editingPoi.category);
+          setPhotoTaken(true);
+          setFile(null);
+          setPreviewUrl(editingPoi.imageUrl || '');
+          setPoiName(editingPoi.name || '');
+          setLocation({ lat: editingPoi.lat, lng: editingPoi.lng, address: t('previousCoordinate') });
+          setManualLat(Number.isFinite(editingPoi.lat) ? String(editingPoi.lat) : '');
+          setManualLng(Number.isFinite(editingPoi.lng) ? String(editingPoi.lng) : '');
+          setCategory(parsed.category);
+          setDesc(parsed.desc);
+        } else resetForm();
+      }, [editingPoi && editingPoi.id]);
+
+      function resetForm() {
+        revokePreview(previewUrl);
+        setPhotoTaken(false); setIsProcessing(false); setFile(null); setPreviewUrl(''); setPoiName('');
+        setLocation(null); setLocationError(''); setManualLat(''); setManualLng(''); setCategory(''); setDesc(''); setIsSubmitted(false);
+        setOcrHint('');
+        if (fileInputRef.current) fileInputRef.current.value = '';
+      }
+      function handleTakePhoto() { fileInputRef.current?.click(); }
+      async function handleFileChange(event) {
+        const selected = event.target.files && event.target.files[0];
+        if (!selected) return;
+        setPhotoTaken(true); setIsProcessing(true); setLocationError('');
+        setCategory('');
+        setOcrHint(t('ocrClassifying'));
+        let nextFile = selected;
+        try {
+          const compressed = await compressImage(selected);
+          nextFile = compressed;
+          setFile(compressed);
+          revokePreview(previewUrl);
+          setPreviewUrl(URL.createObjectURL(compressed));
+        } catch (_err) {
+          nextFile = selected;
+          setFile(selected);
+          try { setPreviewUrl(URL.createObjectURL(selected)); } catch (_e) {}
+        }
+        const ocrForm = new FormData();
+        ocrForm.append('poiImage', nextFile, 'poi-preview.jpg');
+        ocrForm.append('poiName', poiName.trim());
+        ocrForm.append('description', desc.trim());
+        const ocrPromise = fetchJson('/api/ocr/classify', { method: 'POST', body: ocrForm }).then(data => {
+          const nextCategory = data?.category || '';
+          if (CATEGORY_VALUE_SET.has(nextCategory)) {
+            setCategory(nextCategory);
+            setOcrHint(t('ocrCategoryReady', { category: nextCategory }));
+          } else {
+            setOcrHint(t('ocrCategoryFallback'));
+          }
+        }).catch(() => {
+          setOcrHint(t('ocrCategoryFallback'));
+        });
+        const locationPromise = getBrowserLocation(t).then(pos => {
+          setLocation({ ...pos, address: t('accuracy', { value: pos.accuracy }) });
+        }).catch(err => {
+          setLocationError(getLocationErrorMessage(err, t));
+          if (!isEditing) setLocation(null);
+        });
+        await Promise.allSettled([ocrPromise, locationPromise]);
+        setIsProcessing(false);
+      }
+      function applyManualLocation() {
+        const lat = Number(manualLat);
+        const lng = Number(manualLng);
+        if (!Number.isFinite(lat) || lat < -90 || lat > 90 || !Number.isFinite(lng) || lng < -180 || lng > 180) {
+          alert(t('coordinateInvalid'));
+          return;
+        }
+        setLocation({ lat, lng, address: t('manualCoordinate') });
+        setLocationError('');
+      }
+      async function retryLocation() {
+        setIsProcessing(true);
+        try {
+          const pos = await getBrowserLocation(t);
+          setLocation({ ...pos, address: t('accuracy', { value: pos.accuracy }) });
+          setLocationError('');
+        } catch (err) {
+          setLocationError(getLocationErrorMessage(err, t));
+        } finally { setIsProcessing(false); }
+      }
+      async function handleSubmit() {
+        if (!isEditing && !file) return alert(t('captureImageRequired'));
+        if (!poiName.trim()) return alert(t('entityNameRequired'));
+        if (!location) return alert(locationError || t('coordinateMissing'));
+        setSubmitting(true);
+        try {
+          const formData = new FormData();
+          if (isEditing) formData.append('id', editingPoi.rawId || editingPoi.id);
+          formData.append('poiName', poiName.trim());
+          formData.append('description', [desc.trim(), category ? `人工分类：${category}` : ''].filter(Boolean).join('\n'));
+          formData.append('lng', location.lng);
+          formData.append('lat', location.lat);
+          formData.append('userOpenId', openId);
+          if (file) formData.append('poiImage', file, 'poi-upload.jpg');
+          const data = await fetchJson(isEditing ? '/api/poi/update' : '/api/submit-poi', { method: 'POST', body: formData });
+          setIsSubmitted(true);
+          if (onSubmitted) await onSubmitted({ editing: isEditing, poiId: editingPoi?.id || data.id });
+          setTimeout(resetForm, 2200);
+        } catch (err) {
+          alert(err.message || t('transmitFailed'));
+        } finally { setSubmitting(false); }
+      }
+
+      return (
+        <div className="flex-1 flex flex-col lg:flex-row gap-5 lg:gap-6 w-full h-full mobile-scroll collect-mobile-shell lg:pb-0">
+          <input ref={fileInputRef} type="file" accept="image/jpeg,image/png,image/*" capture="environment" className="hidden" onChange={handleFileChange} />
+          <div className="w-full lg:w-1/2 flex flex-col collect-camera-panel lg:h-full lg:min-h-0 lg:max-h-none">
+            <div className={`flex-1 liquid-glass-strong rounded-[2.5rem] flex flex-col items-center justify-center relative transition-all ${!photoTaken ? 'cursor-pointer hover:scale-[1.01]' : ''}`} onClick={!photoTaken ? handleTakePhoto : undefined}>
+              <div className="glass-content w-full h-full flex items-center justify-center">
+                {!photoTaken && (
+                  <>
+                    <div className="absolute top-8 left-8 w-8 h-8 border-t-2 border-l-2 border-blue-200/50"></div>
+                    <div className="absolute top-8 right-8 w-8 h-8 border-t-2 border-r-2 border-blue-200/50"></div>
+                    <div className="absolute bottom-8 left-8 w-8 h-8 border-b-2 border-l-2 border-blue-200/50"></div>
+                    <div className="absolute bottom-8 right-8 w-8 h-8 border-b-2 border-r-2 border-blue-200/50"></div>
+                  </>
+                )}
+                {!photoTaken ? (
+                  <div className="text-center p-8 z-10 flex flex-col items-center">
+                    <div className="w-20 h-20 liquid-glass rounded-full flex items-center justify-center mb-6">
+                      <Icon name={isEditing ? 'refresh-cw' : 'camera'} className="w-8 h-8 text-blue-200" />
+                    </div>
+                    <h3 className="text-lg font-[500] text-blue-100 mb-2 uppercase tracking-widest">{isEditing ? t('recapture') : t('opticalSync')}</h3>
+                    <p className="text-xs text-blue-100/60">{isEditing ? t('replaceImage') : t('tapToCapture')}</p>
+                  </div>
+                ) : (
+                  <div className="absolute inset-0 w-full h-full flex items-center justify-center overflow-hidden rounded-inherit">
+                    {previewUrl ? <img src={previewUrl} alt={t('capturedAlt')} className="w-full h-full object-cover opacity-60 mix-blend-luminosity grayscale" /> : <Icon name="image" className="w-14 h-14 text-white/40" />}
+                    {isProcessing && (
+                      <div className="absolute inset-0 bg-black/40 flex flex-col items-center justify-center backdrop-blur-md z-10">
+                        <div className="absolute top-0 w-full h-1 bg-blue-400 shadow-[0_0_20px_#60a5fa] animate-[silkyEnter_1.5s_infinite_alternate]"></div>
+                        <Icon name="loader-2" className="w-10 h-10 animate-spin mb-6 text-blue-300" />
+                        <div className="text-sm font-[500] tracking-widest text-blue-100 uppercase mb-3">{t('parsingMatrix')}</div>
+                        <div className="text-xs text-blue-200/80 flex items-center"><Icon name="map-pin" className="w-3 h-3 mr-2 animate-bounce" /> {t('connectingGps')}</div>
+                      </div>
+                    )}
+                    {!isProcessing && (
+                      <button onClick={(e) => { e.stopPropagation(); revokePreview(previewUrl); setPhotoTaken(false); setFile(null); setPreviewUrl(''); setCategory(''); setOcrHint(''); }} className="absolute bottom-8 right-8 liquid-glass text-white px-5 py-2.5 rounded-full text-xs font-medium flex items-center hover:scale-105 transition-all uppercase tracking-wider z-20">
+                        <Icon name="refresh-cw" className="w-3 h-3 mr-2" /> {t('recalibrate')}
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="w-full lg:w-1/2 flex flex-col flex-1 h-auto lg:h-full min-h-0 lg:min-h-[520px] collect-form-panel">
+            <div className="flex-1 liquid-glass-strong rounded-[2.5rem] p-6 lg:p-8 flex flex-col relative overflow-y-visible lg:overflow-y-auto hide-scrollbar pb-8">
+              <div className="glass-content flex flex-col h-full">
+                {isSubmitted && (
+                  <div className="absolute inset-0 bg-[#020617]/70 backdrop-blur-xl z-20 flex flex-col items-center justify-center animate-silky rounded-inherit">
+                    <div className="w-20 h-20 liquid-glass rounded-full flex items-center justify-center mb-6"><Icon name="check" className="w-8 h-8 text-emerald-400" /></div>
+                    <h3 className="text-2xl font-[500] text-white tracking-widest uppercase mb-2">{t('syncComplete')}</h3>
+                    <p className="text-xs text-white/60 uppercase tracking-widest">{isEditing ? t('resubmitted') : t('transmitted')}</p>
+                  </div>
+                )}
+                <div className="flex items-start justify-between gap-4 mb-8">
+                  <h2 className="text-xl font-[500] text-white tracking-widest uppercase">{t('dataMatrix')}</h2>
+                  {isEditing && <button onClick={onCancelEdit} className="liquid-glass px-4 py-2 rounded-full text-[10px] uppercase tracking-widest text-white/70">{t('cancelEdit')}</button>}
+                </div>
+                {isEditing && editingPoi?.errorMsg && (
+                  <div className="liquid-glass p-4 rounded-2xl mb-5 flex items-start text-rose-200 text-xs">
+                    <Icon name="alert-triangle" className="w-4 h-4 mr-3 shrink-0" />
+                    <span className="glass-content">{t('verificationAlert')}: {editingPoi.errorMsg}</span>
+                  </div>
+                )}
+                <div className="space-y-6 flex-1">
+                  <GlassField label={t('entityName')} status={photoTaken && !isProcessing && poiName ? t('opticalMatch') : ''}>
+                    <input type="text" value={poiName} onChange={e => setPoiName(e.target.value)} disabled={!photoTaken || isProcessing} placeholder={t('awaitingSensor')} className="w-full liquid-glass rounded-2xl px-5 py-4 outline-none text-white text-base placeholder:text-white/30" />
+                  </GlassField>
+                  <GlassField label={t('classification')}>
+                    <select value={category} onChange={e => setCategory(e.target.value)} disabled={!photoTaken || isProcessing} className="w-full liquid-glass rounded-2xl px-5 py-4 outline-none text-white text-base appearance-none cursor-pointer">
+                      <option value="" className="text-slate-900">{t('selectCategory')}</option>
+                      {CATEGORY_OPTIONS.map(item => <option key={item.value} value={item.value} className="text-slate-900">{item[lang]}</option>)}
+                    </select>
+                    {ocrHint && <div className="mt-2 text-[10px] text-white/55 leading-relaxed uppercase tracking-widest">{ocrHint}</div>}
+                  </GlassField>
+                  <GlassField label={t('coordinates')}>
+                    <div className={`w-full rounded-2xl p-5 ${location ? 'liquid-glass-strong' : 'liquid-glass'}`}>
+                      {location ? (
+                        <div className="glass-content min-w-0">
+                          <div className="font-[500] text-base text-white mb-1 truncate">{location.address}</div>
+                          <div className="text-[10px] font-mono text-white/70 tracking-wider">[{location.lat.toFixed(4)}, {location.lng.toFixed(4)}]</div>
+                        </div>
+                      ) : (
+                        <div className="text-xs text-white/50 flex items-center uppercase tracking-widest glass-content">
+                          {isProcessing ? <Icon name="loader-2" className="w-4 h-4 animate-spin mr-3 text-white"/> : <Icon name="map-pin" className="w-4 h-4 mr-3"/>}
+                          {isProcessing ? t('uplinking') : (locationError || t('awaitingSync'))}
+                        </div>
+                      )}
+                    </div>
+                    {(locationError || isEditing) && (
+                      <div className="grid grid-cols-2 gap-3 mt-3">
+                        <input value={manualLat} onChange={e => setManualLat(e.target.value)} inputMode="decimal" placeholder="Lat" className="liquid-glass rounded-2xl px-4 py-3 text-white placeholder:text-white/30 outline-none" />
+                        <input value={manualLng} onChange={e => setManualLng(e.target.value)} inputMode="decimal" placeholder="Lng" className="liquid-glass rounded-2xl px-4 py-3 text-white placeholder:text-white/30 outline-none" />
+                        <button onClick={applyManualLocation} className="liquid-glass rounded-2xl px-4 py-3 text-xs uppercase tracking-widest text-white">{t('useCoordinate')}</button>
+                        <button onClick={retryLocation} className="liquid-glass rounded-2xl px-4 py-3 text-xs uppercase tracking-widest text-white">{t('retryGps')}</button>
+                      </div>
+                    )}
+                  </GlassField>
+                  <GlassField label={t('logData')}>
+                    <textarea value={desc} onChange={e => setDesc(e.target.value)} disabled={!photoTaken || isProcessing} rows="3" placeholder={t('optionalNotes')} className="w-full liquid-glass rounded-2xl px-5 py-4 outline-none text-white text-sm placeholder:text-white/30 resize-none" />
+                  </GlassField>
+                  <div className="pt-2">
+                    <button onClick={handleSubmit} disabled={!photoTaken || isProcessing || submitting || !poiName || !location} className="w-full liquid-glass text-white py-5 rounded-2xl font-[500] text-sm uppercase tracking-widest flex items-center justify-center disabled:opacity-30 disabled:cursor-not-allowed hover:scale-[1.02] active:scale-95 transition-all">
+                      {submitting ? <Icon name="loader-2" className="w-4 h-4 animate-spin mr-3" /> : null}
+                      {isEditing ? t('transmitUpdated') : t('transmitArray')}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function GlassField({ label, status, children }) {
+      return (
+        <div>
+          <label className="flex items-center text-xs font-[500] text-white/60 uppercase tracking-widest mb-3">
+            {label}
+            {status && <span className="ml-3 text-[10px] text-white px-2 py-0.5 rounded-full liquid-glass flex items-center"><Icon name="check" className="w-3 h-3 mr-1"/>{status}</span>}
+          </label>
+          {children}
+        </div>
+      );
+    }
+
+    function MapWorkspace({ role, openId, pois, loading, reloadPois, setActiveTab, onEditPoi }) {
+      const { t, lang } = useLang();
+      const [selectedPoi, setSelectedPoi] = useState(null);
+      const [query, setQuery] = useState('');
+      const [categoryFilter, setCategoryFilter] = useState('');
+      const [routeMode, setRouteMode] = useState('walking');
+      const [mapMode, setMapMode] = useState('virtual');
+      const [virtualView, setVirtualView] = useState({ x: 0, y: 0, scale: 1 });
+      const [currentLocation, setCurrentLocation] = useState(null);
+      const [locationLoading, setLocationLoading] = useState(false);
+      const [locationError, setLocationError] = useState('');
+      const dragRef = useRef(null);
+      const displayPois = pois.filter(p => {
+        const roleHit = role === 'verifier' ? p.status !== 'recollect' : true;
+        const queryHit = !query.trim() || `${p.name}${p.category}${p.address}`.toLowerCase().includes(query.trim().toLowerCase());
+        const categoryHit = !categoryFilter || p.category === categoryFilter;
+        return roleHit && queryHit && categoryHit;
+      });
+      const pins = useMemo(() => makePins(displayPois), [displayPois]);
+
+      async function handleVerify(poi, isApproved) {
+        let rejectReason = '';
+        if (!isApproved) {
+          rejectReason = prompt(t('rejectPrompt'));
+          if (rejectReason === null) return;
+          if (!rejectReason.trim()) return alert(t('rejectReasonRequired'));
+        }
+        try {
+          await fetchJson('/api/admin/approve-poi', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: poi.rawId || poi.id, action: isApproved ? 'approved' : 'rejected', rejectReason, openId })
+          });
+          setSelectedPoi(null);
+          reloadPois();
+        } catch (err) { alert(err.message || t('verificationFailed')); }
+      }
+      function handleCollectorAction(poi, action) {
+        if (action === 'recollect') { setSelectedPoi(null); setActiveTab('collect'); return; }
+        if (action === 'update') { setSelectedPoi(null); onEditPoi(poi); return; }
+        if (action === 'reject') { setActiveTab('messages'); }
+      }
+      async function handleDispute(poi) {
+        const reason = prompt(t('disputePrompt'));
+        if (reason === null) return;
+        if (!reason.trim()) return alert(t('disputeReasonRequired'));
+        try {
+          await fetchJson('/api/poi/dispute', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: poi.rawId || poi.id, openId, reason })
+          });
+          alert(t('disputeSubmitted'));
+          reloadPois();
+        } catch (err) {
+          alert(err.message || t('disputeSubmitFailed'));
+        }
+      }
+      async function handleLocate() {
+        setLocationLoading(true);
+        setLocationError('');
+        try {
+          const pos = await getBrowserLocation(t);
+          setCurrentLocation(pos);
+        } catch (err) {
+          setLocationError(getLocationErrorMessage(err, t));
+        } finally {
+          setLocationLoading(false);
+        }
+      }
+      function updateVirtualZoom(delta) {
+        setVirtualView(view => ({ ...view, scale: Math.max(0.65, Math.min(2.6, view.scale + delta)) }));
+      }
+      function resetVirtualView() {
+        setVirtualView({ x: 0, y: 0, scale: 1 });
+      }
+      function handleVirtualPointerDown(e) {
+        if (mapMode !== 'virtual') return;
+        if (e.target.closest?.('[data-map-control="true"], button, input, textarea, select, a')) return;
+        e.currentTarget.setPointerCapture?.(e.pointerId);
+        dragRef.current = {
+          pointerId: e.pointerId,
+          startX: e.clientX,
+          startY: e.clientY,
+          originX: virtualView.x,
+          originY: virtualView.y
+        };
+      }
+      function handleVirtualPointerMove(e) {
+        const drag = dragRef.current;
+        if (!drag || drag.pointerId !== e.pointerId) return;
+        const nextX = drag.originX + e.clientX - drag.startX;
+        const nextY = drag.originY + e.clientY - drag.startY;
+        setVirtualView(view => ({ ...view, x: nextX, y: nextY }));
+      }
+      function handleVirtualPointerEnd(e) {
+        if (dragRef.current?.pointerId === e.pointerId) dragRef.current = null;
+      }
+      function handleVirtualWheel(e) {
+        if (mapMode !== 'virtual') return;
+        e.preventDefault();
+        updateVirtualZoom(e.deltaY > 0 ? -0.12 : 0.12);
+      }
+
+      return (
+        <div className="flex-1 flex flex-col lg:flex-row relative w-full h-full rounded-[2.5rem] liquid-glass-strong mobile-shell-flat overflow-y-auto lg:overflow-hidden hide-scrollbar mobile-panel-height map-mobile-shell lg:pb-0">
+          <div
+            className={`relative h-[36dvh] min-h-[240px] max-h-[340px] lg:h-full lg:max-h-none lg:min-h-0 lg:flex-1 flex items-center justify-center overflow-hidden z-10 shrink-0 ${mapMode === 'virtual' ? 'touch-none' : ''}`}
+            onPointerDown={handleVirtualPointerDown}
+            onPointerMove={handleVirtualPointerMove}
+            onPointerUp={handleVirtualPointerEnd}
+            onPointerCancel={handleVirtualPointerEnd}
+            onWheel={handleVirtualWheel}
+          >
+            {mapMode === 'virtual' ? (
+              <VirtualMapLayer pois={pins} selectedPoi={selectedPoi} setSelectedPoi={setSelectedPoi} currentLocation={currentLocation} virtualView={virtualView} loading={loading} />
+            ) : (
+              <AmapLayer pois={displayPois} selectedPoi={selectedPoi} setSelectedPoi={setSelectedPoi} currentLocation={currentLocation} />
+            )}
+            <MapModeSwitch mapMode={mapMode} setMapMode={setMapMode} />
+            <button data-map-control="true" onPointerDown={e => e.stopPropagation()} onClick={reloadPois} className="absolute top-6 right-6 liquid-glass rounded-full px-4 py-2 text-xs text-white uppercase tracking-widest z-10 flex items-center">
+              <Icon name={loading ? 'loader-2' : 'refresh-cw'} className={`w-3 h-3 mr-2 ${loading ? 'animate-spin' : ''}`} /> {t('reload')}
+            </button>
+            {mapMode === 'virtual' && <VirtualMapControls onZoomIn={() => updateVirtualZoom(0.15)} onZoomOut={() => updateVirtualZoom(-0.15)} onReset={resetVirtualView} />}
+            {!loading && displayPois.length === 0 && <div className="liquid-glass rounded-3xl px-6 py-5 text-sm text-white/70 z-10">{t('noSpatialNodes')}</div>}
+          </div>
+
+          <div className="relative min-h-0 lg:min-h-0 lg:h-full lg:w-96 liquid-glass-strong border-t lg:border-t-0 lg:border-l border-white/10 flex flex-col z-30 shrink-0 lg:shrink map-list-panel">
+            <div className="glass-content flex-1 flex flex-col h-full overflow-hidden">
+              {!selectedPoi ? (
+                <div className="flex-1 flex flex-col h-full p-6 animate-silky">
+                  <h2 className="text-lg font-[500] text-white tracking-widest uppercase mb-4 lg:mb-6">{role === 'collector' ? t('archive') : t('queue')}</h2>
+                  <div className="relative mb-4 lg:mb-6">
+                    <Icon name="search" className="w-4 h-4 absolute left-4 top-3.5 text-white/50 z-20" />
+                    <input value={query} onChange={e => setQuery(e.target.value)} type="text" placeholder={t('searchArray')} className="w-full liquid-glass rounded-2xl pl-11 pr-4 py-3 outline-none focus:scale-[1.02] transition-transform text-sm text-white placeholder:text-white/40 font-[500]" />
+                  </div>
+                  <div className="relative mb-4 lg:mb-6">
+                    <Icon name="sliders-horizontal" className="w-4 h-4 absolute left-4 top-3.5 text-white/50 z-20" />
+                    <select value={categoryFilter} onChange={e => setCategoryFilter(e.target.value)} className="w-full liquid-glass rounded-2xl pl-11 pr-4 py-3 outline-none text-sm text-white font-[500] appearance-none">
+                      <option value="" className="text-slate-900">{t('allCategories')}</option>
+                      {CATEGORY_OPTIONS.map(item => <option key={item.value} value={item.value} className="text-slate-900">{item[lang]}</option>)}
+                    </select>
+                  </div>
+                  <div className="flex-1 overflow-y-auto space-y-3 hide-scrollbar map-list-scroll lg:pb-0">
+                    {displayPois.map(poi => {
+                      const colors = getPoiColors(poi.status);
+                      return (
+                        <div key={poi.id} onClick={() => setSelectedPoi(poi)} className="liquid-glass p-4 rounded-2xl flex items-center cursor-pointer hover:scale-[1.02] active:scale-95 transition-all group">
+                          <div className="glass-content flex items-center w-full min-w-0">
+                            <div className="w-10 h-10 rounded-full liquid-glass flex items-center justify-center mr-4 shrink-0"><Icon name="map-pin" className={`w-4 h-4 ${colors.text} group-hover:scale-110 transition-transform`} /></div>
+                            <div className="flex-1 min-w-0">
+                              <div className="font-[500] text-white text-sm mb-1 truncate">{poi.name || t('unknownPoi')}</div>
+                              <div className="flex justify-between items-center gap-2"><div className="text-[10px] text-white/60 uppercase tracking-widest truncate max-w-[140px] pr-2">{poi.address || t('noCoordinate')}</div><StatusBadge status={poi.status} /></div>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : (
+                <PoiDetail role={role} poi={selectedPoi} routeMode={routeMode} setRouteMode={setRouteMode} currentLocation={currentLocation} locationLoading={locationLoading} locationError={locationError} onLocate={handleLocate} onBack={() => setSelectedPoi(null)} onVerify={handleVerify} onCollectorAction={handleCollectorAction} onDispute={handleDispute} onNavigate={() => openAmapRoute(selectedPoi, routeMode, currentLocation, t)} />
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function MapModeSwitch({ mapMode, setMapMode }) {
+      const { t } = useLang();
+      return (
+        <div data-map-control="true" onPointerDown={e => e.stopPropagation()} className="absolute top-6 left-6 z-30 liquid-glass rounded-full p-1 flex items-center gap-1 text-[10px] uppercase tracking-widest">
+          {[
+            ['virtual', t('virtualMap'), 'orbit'],
+            ['amap', t('amapMap'), 'map']
+          ].map(([mode, label, icon]) => (
+            <button key={mode} onClick={(e) => { e.stopPropagation(); setMapMode(mode); }} className={`${mapMode === mode ? 'liquid-glass-strong text-blue-100' : 'text-white/60'} px-3 py-2 rounded-full flex items-center gap-2 active:scale-95 transition-all`}>
+              <Icon name={icon} className="w-3 h-3" />
+              <span>{label}</span>
+            </button>
+          ))}
+        </div>
+      );
+    }
+
+    function VirtualMapLayer({ pois, selectedPoi, setSelectedPoi, currentLocation, virtualView, loading }) {
+      return (
+        <div className="absolute inset-0 overflow-hidden cursor-grab active:cursor-grabbing">
+          <div className="absolute inset-0 opacity-20 pointer-events-none" style={{ backgroundImage: 'linear-gradient(#fff 1px, transparent 1px), linear-gradient(90deg, #fff 1px, transparent 1px)', backgroundSize: '40px 40px' }}></div>
+          <div className="absolute inset-0 opacity-25 pointer-events-none" style={{ background: 'radial-gradient(circle at 65% 50%, rgba(148,163,184,0.28), transparent 36%), radial-gradient(circle at 42% 5%, rgba(59,130,246,0.16), transparent 22%)' }}></div>
+          <div className="absolute inset-0 transition-transform duration-75" style={{ transform: `translate(${virtualView.x}px, ${virtualView.y}px) scale(${virtualView.scale})`, transformOrigin: 'center' }}>
+            {currentLocation && (
+              <div className="absolute z-20 w-9 h-9 rounded-full border border-cyan-200/70 bg-cyan-300/20 shadow-[0_0_24px_rgba(125,211,252,0.8)] flex items-center justify-center" style={{ top: '50%', left: '50%', transform: 'translate(-50%, -50%)' }}>
+                <Icon name="crosshair" className="w-4 h-4 text-cyan-100" />
+              </div>
+            )}
+            {pois.map(({ poi, top, left }) => {
+              const colors = getPoiColors(poi.status);
+              const isSelected = selectedPoi?.id === poi.id;
+              return (
+                <div key={`pin-${poi.id}`} onClick={(e) => { e.stopPropagation(); setSelectedPoi(poi); }} className="absolute transform -translate-x-1/2 -translate-y-1/2 cursor-pointer group z-20" style={{ top: `${top}%`, left: `${left}%` }}>
+                  <div className={`relative w-8 h-8 rounded-full transition-all ${isSelected ? 'scale-125 z-30' : 'hover:scale-110'}`}>
+                    <div className={`absolute inset-0 w-full h-full rounded-full animate-ping opacity-50 ${colors.ping}`}></div>
+                    <div className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-4 h-4 rounded-full ${colors.solid} shadow-[0_0_12px_currentColor] z-10 flex items-center justify-center border-2 border-slate-900`}><div className="w-1.5 h-1.5 bg-white rounded-full"></div></div>
+                    <div className={`absolute top-full mt-2 left-1/2 -translate-x-1/2 liquid-glass text-white text-[10px] uppercase tracking-wider px-4 py-1.5 rounded-full flex items-center justify-center z-50 w-max transition-all pointer-events-none shadow-lg ${isSelected ? 'opacity-100 scale-100' : 'opacity-0 scale-95 group-hover:opacity-100 group-hover:scale-100'}`}>
+                      <div className="glass-content whitespace-nowrap">{poi.name}</div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+            {loading && <Icon name="loader-2" className="absolute left-1/2 top-1/2 w-8 h-8 -translate-x-1/2 -translate-y-1/2 animate-spin text-white/60" />}
+          </div>
+        </div>
+      );
+    }
+
+    function VirtualMapControls({ onZoomIn, onZoomOut, onReset }) {
+      const { t } = useLang();
+      return (
+        <div data-map-control="true" onPointerDown={e => e.stopPropagation()} className="absolute right-6 bottom-6 z-30 liquid-glass rounded-2xl p-1 flex flex-col gap-1">
+          <button onClick={(e) => { e.stopPropagation(); onZoomIn(); }} className="w-9 h-9 rounded-xl liquid-glass flex items-center justify-center text-white active:scale-95" title={t('zoomIn')}><Icon name="plus" className="w-4 h-4" /></button>
+          <button onClick={(e) => { e.stopPropagation(); onZoomOut(); }} className="w-9 h-9 rounded-xl liquid-glass flex items-center justify-center text-white active:scale-95" title={t('zoomOut')}><Icon name="minus" className="w-4 h-4" /></button>
+          <button onClick={(e) => { e.stopPropagation(); onReset(); }} className="w-9 h-9 rounded-xl liquid-glass flex items-center justify-center text-white active:scale-95" title={t('resetView')}><Icon name="maximize" className="w-4 h-4" /></button>
+        </div>
+      );
+    }
+
+    function AmapLayer({ pois, selectedPoi, setSelectedPoi, currentLocation }) {
+      const { t } = useLang();
+      const mapRef = useRef(null);
+      const instanceRef = useRef(null);
+      const markersRef = useRef([]);
+      const currentMarkerRef = useRef(null);
+      const [status, setStatus] = useState('loading');
+
+      useEffect(() => {
+        let cancelled = false;
+        loadAmapSdk()
+          .then(AMap => {
+            if (cancelled || !mapRef.current || instanceRef.current) return;
+            const valid = pois.filter(p => isValidCoordinate(p.lat, p.lng));
+            const center = valid[0] ? [valid[0].lng, valid[0].lat] : [116.397428, 39.90923];
+            instanceRef.current = new AMap.Map(mapRef.current, {
+              zoom: valid.length ? 14 : 4,
+              center,
+              resizeEnable: true,
+              viewMode: '2D',
+              mapStyle: 'amap://styles/darkblue'
+            });
+            setStatus('ready');
+          })
+          .catch(err => {
+            console.warn('[amap]', err);
+            setStatus(err.message === 'AMap key missing' ? 'missing-key' : 'error');
+          });
+        return () => { cancelled = true; };
+      }, []);
+
+      useEffect(() => {
+        const AMap = window.AMap;
+        const map = instanceRef.current;
+        if (!AMap || !map) return;
+        markersRef.current.forEach(marker => marker.setMap(null));
+        markersRef.current = spreadGeoPois(pois.filter(p => isValidCoordinate(p.lat, p.lng))).map(({ poi, lat, lng }) => {
+          const colors = getPoiColors(poi.status);
+          const marker = new AMap.Marker({
+            position: [lng, lat],
+            title: poi.name || t('unknownPoi'),
+            content: `<div style="width:18px;height:18px;border-radius:999px;background:${amapStatusColor(colors.text)};border:3px solid #0f172a;box-shadow:0 0 18px ${amapStatusColor(colors.text)};"></div>`,
+            offset: new AMap.Pixel(-9, -9)
+          });
+          marker.on('click', () => setSelectedPoi(poi));
+          marker.setMap(map);
+          return marker;
+        });
+        if (markersRef.current.length) map.setFitView(markersRef.current, false, [70, 70, 70, 70], 16);
+      }, [pois, setSelectedPoi, status, t]);
+
+      useEffect(() => {
+        const map = instanceRef.current;
+        if (!window.AMap || !map || !selectedPoi || !isValidCoordinate(selectedPoi.lat, selectedPoi.lng)) return;
+        map.setZoomAndCenter(Math.max(map.getZoom(), 15), [selectedPoi.lng, selectedPoi.lat], false, 300);
+      }, [selectedPoi, status]);
+
+      useEffect(() => {
+        const AMap = window.AMap;
+        const map = instanceRef.current;
+        if (!AMap || !map) return;
+        if (currentMarkerRef.current) currentMarkerRef.current.setMap(null);
+        currentMarkerRef.current = null;
+        if (currentLocation && isValidCoordinate(currentLocation.lat, currentLocation.lng)) {
+          currentMarkerRef.current = new AMap.Marker({
+            position: [currentLocation.lng, currentLocation.lat],
+            content: '<div style="width:20px;height:20px;border-radius:999px;background:rgba(125,211,252,.28);border:2px solid #bae6fd;box-shadow:0 0 24px rgba(125,211,252,.9);"></div>',
+            offset: new AMap.Pixel(-10, -10)
+          });
+          currentMarkerRef.current.setMap(map);
+        }
+      }, [currentLocation, status]);
+
+      return (
+        <div className="absolute inset-0 bg-slate-950">
+          <div ref={mapRef} className="absolute inset-0" />
+          {status !== 'ready' && (
+            <div className="absolute inset-0 flex items-center justify-center bg-slate-950/70 backdrop-blur-sm">
+              <div className="liquid-glass rounded-3xl px-6 py-4 text-sm text-white/75 flex items-center">
+                {status === 'loading' && <Icon name="loader-2" className="w-4 h-4 mr-3 animate-spin" />}
+                {status === 'loading' ? t('mapLoading') : status === 'missing-key' ? t('amapKeyMissing') : t('mapLoadFailed')}
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function amapStatusColor(textClass) {
+      if (textClass.includes('emerald')) return '#34d399';
+      if (textClass.includes('rose')) return '#fb7185';
+      if (textClass.includes('amber')) return '#fbbf24';
+      if (textClass.includes('blue')) return '#60a5fa';
+      return '#22d3ee';
+    }
+
+    function spreadGeoPois(pois) {
+      const groups = new Map();
+      pois.forEach(poi => {
+        const key = `${poi.lat.toFixed(5)},${poi.lng.toFixed(5)}`;
+        const group = groups.get(key) || [];
+        group.push(poi);
+        groups.set(key, group);
+      });
+      const result = [];
+      groups.forEach(group => {
+        if (group.length === 1) {
+          result.push({ poi: group[0], lat: group[0].lat, lng: group[0].lng });
+          return;
+        }
+        const radius = 0.000035 * Math.min(group.length, 8);
+        group.forEach((poi, index) => {
+          const angle = (Math.PI * 2 * index) / group.length;
+          result.push({
+            poi,
+            lat: poi.lat + Math.sin(angle) * radius,
+            lng: poi.lng + Math.cos(angle) * radius
+          });
+        });
+      });
+      return result;
+    }
+
+    function PoiDetail({ role, poi, routeMode, setRouteMode, currentLocation, locationLoading, locationError, onLocate, onBack, onVerify, onCollectorAction, onDispute, onNavigate }) {
+      const { t } = useLang();
+      const distance = getDistanceMeters(currentLocation, poi);
+      return (
+        <div className="flex-1 flex flex-col h-full p-5 lg:p-6 animate-silky">
+          <div className="flex justify-between items-center mb-6">
+            <button onClick={onBack} className="w-8 h-8 liquid-glass rounded-full flex items-center justify-center hover:scale-105 active:scale-95 transition-transform"><Icon name="chevron-left" className="w-4 h-4 text-white z-10"/></button>
+            <span className="text-xs font-[500] uppercase tracking-widest text-white/60">{t('nodeDetail')}</span>
+            <div className="w-8"></div>
+          </div>
+          <div className="flex-1 overflow-y-auto space-y-5 lg:space-y-6 hide-scrollbar map-detail-scroll lg:pb-0">
+            <div className="w-full h-28 lg:h-40 liquid-glass rounded-3xl flex items-center justify-center shrink-0 overflow-hidden">
+              {poi.imageUrl ? <img src={poi.imageUrl} alt={poi.name} className="w-full h-full object-cover opacity-80 grayscale" /> : <Icon name="image" className="w-8 h-8 text-white/50 z-10" />}
+            </div>
+            <div><h2 className="text-xl lg:text-2xl font-[500] text-white mb-3">{poi.name || t('unknownPoi')}</h2><StatusBadge status={poi.status} /></div>
+            <div className="liquid-glass-strong p-5 rounded-2xl">
+              <div className="glass-content space-y-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-[10px] text-white/50 uppercase tracking-widest mb-1">{t('navigationMode')}</div>
+                    <div className="text-sm font-[500] text-white">{t(routeMode || 'walking')}</div>
+                  </div>
+                  <button onClick={onLocate} className="w-10 h-10 rounded-full liquid-glass flex items-center justify-center text-white active:scale-95 transition-transform shrink-0" title={currentLocation ? t('refreshLocation') : t('locateMe')}>
+                    <Icon name={locationLoading ? 'loader-2' : 'crosshair'} className={`w-4 h-4 ${locationLoading ? 'animate-spin' : ''}`} />
+                  </button>
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  {['walking', 'driving', 'transit'].map(mode => (
+                    <button key={mode} onClick={() => setRouteMode(mode)} className={`${routeMode === mode ? 'liquid-glass-strong text-white' : 'liquid-glass text-white/65'} rounded-2xl py-2 text-[10px] uppercase tracking-widest active:scale-95 transition-all`}>
+                      {t(mode)}
+                    </button>
+                  ))}
+                </div>
+                <div className="flex items-center justify-between gap-3 text-[11px] lg:text-xs">
+                  <span className="text-white/55 uppercase tracking-widest truncate">{locationError || (currentLocation ? t('straightDistance') : t('currentPositionMissing'))}</span>
+                  <span className="text-white font-[500]">{Number.isFinite(distance) ? formatDistance(distance) : t('distancePending')}</span>
+                </div>
+                <button onClick={onNavigate} className="w-full liquid-glass rounded-2xl py-3 text-[11px] lg:text-xs font-[500] uppercase tracking-widest text-cyan-100 flex items-center justify-center active:scale-95 transition-all">
+                  <Icon name="navigation" className="w-4 h-4 mr-2" /> {t('openNavigation')}
+                </button>
+              </div>
+            </div>
+            <div className="liquid-glass p-5 rounded-2xl space-y-4">
+              <div className="glass-content">
+                <div><div className="text-[10px] text-white/50 uppercase tracking-widest mb-1">{t('coordinates')}</div><div className="text-sm font-[500] text-white break-words">{poi.address || t('noCoordinate')}</div><div className="text-[10px] font-mono text-white/60 mt-1">[{poi.lat.toFixed(4)}, {poi.lng.toFixed(4)}]</div></div>
+                <div className="w-full h-px bg-white/10 my-4"></div>
+                <div><div className="text-[10px] text-white/50 uppercase tracking-widest mb-1">{t('logData')}</div><div className="text-sm font-[500] text-white/90 whitespace-pre-wrap">{poi.desc || t('noLogData')}</div></div>
+              </div>
+            </div>
+            {poi.status === 'error' && (
+              <div className="p-4 liquid-glass rounded-2xl flex items-start">
+                <Icon name="alert-triangle" className="w-4 h-4 text-rose-400 mr-3 shrink-0 z-10" />
+                <div className="glass-content"><div className="text-xs font-[500] text-rose-300 mb-1 uppercase tracking-widest">{t('verificationAlert')}</div><div className="text-xs text-white/80 leading-relaxed">{poi.errorMsg || t('noDetail')}</div></div>
+              </div>
+            )}
+          </div>
+          <div className="pt-3 flex gap-3 shrink-0 map-detail-actions lg:pb-0">
+            {role === 'verifier' && poi.status === 'pending' && (
+              <>
+                <button onClick={() => onVerify(poi, false)} className="flex-1 liquid-glass py-4 rounded-2xl text-xs font-[500] uppercase tracking-widest text-white/80 hover:text-white active:scale-95 transition-all">{t('flagError')}</button>
+                <button onClick={() => onVerify(poi, true)} className="flex-1 liquid-glass-strong py-4 rounded-2xl text-xs font-[500] uppercase tracking-widest text-emerald-300 active:scale-95 transition-all">{t('verify')}</button>
+              </>
+            )}
+            {role === 'collector' && poi.status === 'error' && (
+              <>
+                <button onClick={() => onCollectorAction(poi, 'update')} className="flex-1 liquid-glass-strong py-4 rounded-2xl text-[10px] lg:text-xs font-[500] uppercase tracking-widest text-white active:scale-95 transition-all">{t('update')}</button>
+                <button onClick={() => onCollectorAction(poi, 'reject')} className="flex-1 liquid-glass py-4 rounded-2xl text-[10px] lg:text-xs font-[500] uppercase tracking-widest text-white/80 active:scale-95 transition-all">{t('comms')}</button>
+                <button onClick={() => onDispute(poi)} className="flex-1 liquid-glass py-4 rounded-2xl text-[10px] lg:text-xs font-[500] uppercase tracking-widest text-amber-100 active:scale-95 transition-all">{t('submitDispute')}</button>
+              </>
+            )}
+            {((role === 'verifier' && poi.status !== 'pending') || (role === 'collector' && poi.status !== 'error')) && (
+              <div className="w-full liquid-glass py-4 rounded-2xl text-center text-xs uppercase tracking-widest text-white/60">{t('noActionRequired')}</div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    function makePins(pois) {
+      if (!pois.length) return [];
+      const valid = pois.filter(p => isValidCoordinate(p.lat, p.lng));
+      if (!valid.length) return [];
+      const minLat = Math.min(...valid.map(p => p.lat));
+      const maxLat = Math.max(...valid.map(p => p.lat));
+      const minLng = Math.min(...valid.map(p => p.lng));
+      const maxLng = Math.max(...valid.map(p => p.lng));
+      const basePins = valid.map((poi, index) => ({
+        poi,
+        left: maxLng === minLng ? 50 : 15 + ((poi.lng - minLng) / (maxLng - minLng)) * 70,
+        top: maxLat === minLat ? 50 : 85 - ((poi.lat - minLat) / (maxLat - minLat)) * 70,
+        index
+      }));
+      const buckets = new Map();
+      basePins.forEach(pin => {
+        const key = `${Math.round(pin.left / 3)},${Math.round(pin.top / 3)}`;
+        const bucket = buckets.get(key) || [];
+        bucket.push(pin);
+        buckets.set(key, bucket);
+      });
+      buckets.forEach(bucket => {
+        if (bucket.length <= 1) return;
+        const radius = Math.min(10, 3.6 + bucket.length * 0.8);
+        bucket.forEach((pin, index) => {
+          const angle = (Math.PI * 2 * index) / bucket.length;
+          pin.left += Math.cos(angle) * radius;
+          pin.top += Math.sin(angle) * radius;
+        });
+      });
+      return basePins.map(pin => ({
+        poi: pin.poi,
+        left: Math.max(8, Math.min(92, pin.left)),
+        top: Math.max(8, Math.min(92, pin.top))
+      }));
+    }
+
+    function MessageCenter({ role, openId, pois = [], reloadPois }) {
+      const { t } = useLang();
+      const pendingPois = pois.filter(poi => poi.status === 'pending');
+      const [activeChat, setActiveChat] = useState(null);
+      const [selectedRoomId, setSelectedRoomId] = useState('');
+      const [notifications, setNotifications] = useState([]);
+      const [unreadCount, setUnreadCount] = useState(0);
+      const [chatRooms, setChatRooms] = useState([]);
+      const groupRoomId = groupRoomIdForRole(role);
+      const [chatLogs, setChatLogs] = useState({ [groupRoomIdForRole(role)]: [] });
+      const [input, setInput] = useState({ [groupRoomIdForRole(role)]: '' });
+      const [socketReady, setSocketReady] = useState(false);
+      const socketRef = useRef(null);
+      const selectedRoom = chatRooms.find(room => room.roomId === selectedRoomId) || null;
+      const groupLogs = chatLogs[groupRoomId] || [];
+
+      const messageItems = useMemo(() => [
+        { id: 'notifications', type: 'system', title: t('systemNotice'), content: unreadCount ? t('unreadNotifications', { count: unreadCount }) : (notifications[0]?.content || t('noticeFallback')), time: notifications[0]?.time || t('online'), unread: unreadCount > 0 },
+        { id: 'tasks', type: 'system_verify', title: t('taskReminder'), content: role === 'verifier' ? t('verifierTaskContent', { count: pendingPois.length }) : t('collectorTaskContent', { count: pendingPois.length }), time: t('online'), unread: role === 'verifier' && pendingPois.length > 0 },
+        { id: 'private', type: 'private', title: t('privateChat'), content: chatRooms[0]?.lastMessage || t('privateChatContent', { count: chatRooms.length }), time: chatRooms[0]?.time || t('online'), unread: false },
+        { id: 'group', type: 'group', title: role === 'verifier' ? t('reviewerGroupChat') : t('collectorGroupChat'), content: groupLogs.at(-1)?.text || t('groupFallback'), time: groupLogs.at(-1)?.time || t('online'), unread: false }
+      ], [unreadCount, notifications, role, pendingPois.length, chatRooms, groupLogs, t]);
+
+      useEffect(() => { loadNotifications(); loadChatRooms(); loadChatHistory(groupRoomId); }, [openId, groupRoomId]);
+      useEffect(() => {
+        if (!window.io || !openId) return;
+        const socket = io({ query: { openId } });
+        socketRef.current = socket;
+        socket.on('connect', () => { setSocketReady(true); socket.emit('setNickname', { nickname: `${role === 'verifier' ? 'Verifier' : 'Collector'}-${openId.slice(-4)}` }); });
+        socket.on('disconnect', () => setSocketReady(false));
+        socket.on('chatMessage', msg => setChatLogs(prev => ({ ...prev, [msg.roomId]: [...(prev[msg.roomId] || []), msg] })));
+        socket.on('chatRoomUpdated', room => {
+          setChatRooms(prev => [room, ...prev.filter(item => item.roomId !== room.roomId)]);
+          socket.emit('joinChatRoom', { roomId: room.roomId });
+        });
+        socket.on('notification', msg => { setNotifications(prev => [msg, ...prev.filter(item => item.id !== msg.id)]); setUnreadCount(c => c + (msg.read ? 0 : 1)); });
+        socket.on('announcement', () => loadNotifications());
+        return () => socket.disconnect();
+      }, [openId, role]);
+
+      async function loadNotifications() {
+        if (!openId) return;
+        try {
+          const data = await fetchJson(`/api/notifications?openId=${encodeURIComponent(openId)}&page=1&size=80&_t=${Date.now()}`);
+          setNotifications(data.data || []);
+          setUnreadCount(data.unreadCount || 0);
+        } catch (err) { console.warn('[notifications]', err); }
+      }
+      async function loadChatRooms() {
+        if (!openId) return;
+        try {
+          const data = await fetchJson(`/api/chat/rooms?openId=${encodeURIComponent(openId)}&_t=${Date.now()}`);
+          setChatRooms(data.data || []);
+        } catch (err) { console.warn('[rooms]', err); }
+      }
+      async function loadChatHistory(roomId) {
+        try {
+          const data = await fetchJson(`/api/chat/history?roomId=${encodeURIComponent(roomId)}&openId=${encodeURIComponent(openId)}&size=100&_t=${Date.now()}`);
+          setChatLogs(prev => ({ ...prev, [roomId]: data.data || [] }));
+        } catch (err) { console.warn('[history]', err); }
+      }
+      async function markRead() {
+        try {
+          await fetchJson('/api/notifications/read', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ openId }) });
+          setNotifications(prev => prev.map(item => ({ ...item, read: true })));
+          setUnreadCount(0);
+        } catch (_err) {}
+      }
+      function selectItem(item) {
+        setActiveChat(item);
+        if (item.id !== 'private') setSelectedRoomId('');
+        if (item.id === 'notifications' && unreadCount) markRead();
+        if (item.id === 'group') loadChatHistory(groupRoomId);
+        if (item.id === 'private') loadChatRooms();
+      }
+      function openPrivateRoom(room) {
+        setSelectedRoomId(room.roomId);
+        loadChatHistory(room.roomId);
+        socketRef.current?.emit('joinChatRoom', { roomId: room.roomId });
+      }
+      function closePrivateRoom() {
+        setSelectedRoomId('');
+      }
+      function activeRoomId() {
+        if (!activeChat) return null;
+        if (activeChat.id === 'group') return groupRoomId;
+        if (activeChat.id === 'private') return selectedRoomId || null;
+        return null;
+      }
+      function sendMessage() {
+        const roomId = activeRoomId();
+        if (!roomId) return;
+        const text = (input[roomId] || '').trim();
+        if (!text || !socketRef.current) return;
+        socketRef.current.emit('chatMessage', { text, roomId, openId });
+        setInput(prev => ({ ...prev, [roomId]: '' }));
+      }
+      const roomId = activeRoomId();
+      const logs = roomId ? (chatLogs[roomId] || []) : [];
+
+      return (
+        <div className="flex-1 flex flex-col lg:flex-row relative w-full h-full rounded-[2.5rem] liquid-glass-strong overflow-hidden mobile-panel-height min-h-0">
+          <div className={`w-full lg:w-96 flex flex-col h-full min-h-0 border-r border-white/10 ${activeChat ? 'hidden lg:flex' : 'flex'}`}>
+            <div className="glass-content flex flex-col h-full">
+              <div className="p-6 border-b border-white/10">
+                <div className="flex items-center justify-between gap-3">
+                  <h2 className="text-lg font-[500] text-white tracking-widest uppercase">{t('messagesTitle')}</h2>
+                  <LanguageToggle compact />
+                </div>
+                <p className={`text-[10px] mt-2 uppercase tracking-widest ${socketReady ? 'text-emerald-300' : 'text-white/40'}`}>{socketReady ? t('socketOnline') : t('connecting')}</p>
+              </div>
+              <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3 hide-scrollbar pb-[100px] lg:pb-4">
+                {messageItems.map(msg => (
+                  <div key={msg.id} onClick={() => selectItem(msg)} className={`liquid-glass p-4 rounded-2xl flex items-center cursor-pointer transition-transform hover:scale-[1.02] active:scale-95 shrink-0 ${activeChat?.id === msg.id ? 'liquid-glass-strong' : ''}`}>
+                    <div className="glass-content flex items-center w-full min-w-0">
+                      <div className="w-10 h-10 rounded-full liquid-glass flex items-center justify-center mr-4 shrink-0 text-white">{getMsgIcon(msg.type)}</div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex justify-between items-baseline mb-1"><h4 className="text-sm font-[500] text-white truncate">{msg.title}</h4><span className="text-[10px] text-white/50 uppercase tracking-widest ml-2 shrink-0">{msg.time}</span></div>
+                        <p className="text-xs text-white/60 truncate font-[400]">{msg.content}</p>
+                      </div>
+                      {msg.unread && <div className="w-1.5 h-1.5 bg-blue-400 rounded-full ml-3 shrink-0"></div>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+          <div className={`flex-1 flex flex-col h-full min-h-0 absolute inset-0 lg:relative z-20 ${!activeChat ? 'hidden lg:flex' : 'flex animate-silky lg:animate-none'}`}>
+            {activeChat ? (
+              <div className="glass-content flex flex-col h-full min-h-0 w-full bg-[#020617]/40 lg:bg-transparent backdrop-blur-md lg:backdrop-blur-none">
+                <div className="p-4 lg:p-6 border-b border-white/10 flex items-center shrink-0">
+                  <div className="flex items-center min-w-0">
+                    <button onClick={() => selectedRoomId ? closePrivateRoom() : setActiveChat(null)} className="p-2 -ml-2 mr-2 text-white/60 hover:text-white lg:hidden"><Icon name="chevron-left" className="w-5 h-5" /></button>
+                    <div className="flex items-center space-x-4"><div className="w-10 h-10 rounded-full liquid-glass flex items-center justify-center text-white">{getMsgIcon(activeChat.type)}</div><div><h3 className="text-sm font-[500] text-white tracking-wide">{selectedRoom ? (selectedRoom.poiName || t('unknownPoi')) : activeChat.title}</h3><p className="text-[10px] text-white/50 uppercase tracking-widest mt-0.5">{selectedRoom ? `${role === 'verifier' ? t('collector') : t('reviewer')}: ${role === 'verifier' ? (selectedRoom.collectorName || selectedRoom.collectorOpenId || '') : (selectedRoom.reviewerName || selectedRoom.reviewerOpenId || '')}` : (activeChat.type.includes('system') ? t('encrypted') : t('online'))}</p></div></div>
+                  </div>
+                </div>
+                <div className="flex-1 min-h-0 overflow-y-auto p-4 lg:p-6 flex flex-col hide-scrollbar pb-[120px] lg:pb-6 gap-3">
+                  {activeChat.id === 'notifications' ? (
+                    notifications.length ? notifications.map(n => <NoticeCard key={n.id} item={n} />) : <EmptyComms content={t('noNotifications')} type={activeChat.type} />
+                  ) : activeChat.id === 'tasks' ? (
+                    <TaskCards pois={pendingPois} reloadPois={reloadPois} />
+                  ) : activeChat.id === 'private' && !selectedRoomId ? (
+                    chatRooms.length ? (
+                      <div className="space-y-3">
+                        <div className="text-[10px] text-white/50 uppercase tracking-widest px-1">{t('roomList')}</div>
+                        {chatRooms.map(room => (
+                          <button
+                            key={room.roomId}
+                            onClick={() => openPrivateRoom(room)}
+                            className="w-full liquid-glass p-4 rounded-2xl text-left hover:scale-[1.01] active:scale-95 transition-transform"
+                          >
+                            <div className="glass-content flex items-start justify-between gap-4">
+                              <div className="min-w-0">
+                                <div className="text-sm text-white font-[500] truncate">{room.poiName || t('unknownPoi')}</div>
+                                <div className="text-[10px] text-white/50 uppercase tracking-widest mt-1 truncate">
+                                  {role === 'verifier'
+                                    ? `${t('collector')}: ${room.collectorName || room.collectorOpenId || ''}`
+                                    : `${t('reviewer')}: ${room.reviewerName || room.reviewerOpenId || ''}`}
+                                </div>
+                                <div className="text-xs text-white/65 mt-3 truncate">{room.lastMessage || t('noChatHistory')}</div>
+                              </div>
+                              <div className="text-[10px] text-white/40 whitespace-nowrap">{room.time || formatDisplayTime(room.lastTime)}</div>
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    ) : <EmptyComms content={t('noPrivateRoom')} type={activeChat.type} />
+                  ) : roomId ? (
+                    <>
+                      {activeChat.id === 'private' && selectedRoomId && (
+                        <button onClick={closePrivateRoom} className="self-start liquid-glass px-4 py-2 rounded-full text-[10px] uppercase tracking-widest text-white/70 hover:text-white">
+                          <Icon name="chevron-left" className="w-3 h-3 inline-block mr-1" /> {t('backToRooms')}
+                        </button>
+                      )}
+                      {logs.length ? logs.map((msg, idx) => <ChatBubble key={idx} msg={msg} self={msg.openId === openId || msg.fromOpenId === openId} />) : <EmptyComms content={activeChat.id === 'private' ? t('noChatHistory') : activeChat.content} type={activeChat.type} />}
+                    </>
+                  ) : (
+                    <EmptyComms content={chatRooms.length ? t('selectPrivateRoom') : t('noPrivateRoom')} type={activeChat.type} />
+                  )}
+                </div>
+                {roomId && (
+                  <div className="p-4 border-t border-white/10 flex gap-3">
+                    <input value={input[roomId] || ''} onChange={e => setInput(prev => ({ ...prev, [roomId]: e.target.value }))} onKeyDown={e => { if (e.key === 'Enter') sendMessage(); }} placeholder={t('transmitMessage')} className="flex-1 liquid-glass rounded-2xl px-4 py-3 text-white placeholder:text-white/30 outline-none text-sm" />
+                    <button onClick={sendMessage} className="liquid-glass px-5 py-3 rounded-2xl text-white" title={t('send')}><Icon name="send" className="w-4 h-4" /></button>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="flex-1 flex flex-col items-center justify-center text-white/40 glass-content"><Icon name="message-square" className="w-12 h-12 mb-4 opacity-50" /><p className="text-xs uppercase tracking-widest">{t('awaitingConnection')}</p></div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    function NoticeCard({ item }) {
+      return <div className="liquid-glass p-5 rounded-2xl shrink-0 min-h-[132px]"><div className="glass-content"><div className="text-xs uppercase tracking-widest text-white/50 mb-2">{item.time || formatDisplayTime(item.createTime)}</div><div className="text-white text-sm font-[500] mb-2 leading-snug">{item.title}</div><div className="text-white/70 text-sm leading-relaxed whitespace-pre-wrap break-words">{item.content}</div></div></div>;
+    }
+    function TaskCards({ pois, reloadPois }) {
+      const { t } = useLang();
+      return <div className="space-y-3">{pois.length ? pois.map(p => <div key={p.id} className="liquid-glass p-5 rounded-2xl shrink-0"><div className="glass-content flex justify-between gap-4"><div><div className="text-white text-sm font-[500]">{p.name || t('unknownPoi')}</div><div className="text-white/50 text-xs mt-1">{p.address || t('noCoordinate')}</div></div><StatusBadge status={p.status} /></div></div>) : <EmptyComms content={t('noPendingTasks')} type="system_verify" />}</div>;
+    }
+    function ChatBubble({ msg, self }) {
+      const { t } = useLang();
+      return <div className={`max-w-[82%] ${self ? 'self-end text-right' : 'self-start'}`}><div className="text-[10px] text-white/40 mb-1">{msg.user || t('anonymous')} {msg.time || formatDisplayTime(msg.createTime)}</div><div className={`${self ? 'liquid-glass-strong' : 'liquid-glass'} rounded-2xl px-4 py-3 text-sm text-white/90 text-left`}>{msg.text}</div></div>;
+    }
+    function EmptyComms({ content, type }) {
+      return <div className="flex-1 flex items-center justify-center"><div className="liquid-glass p-6 lg:p-8 rounded-3xl max-w-sm w-full text-center"><div className="glass-content"><div className="w-12 h-12 mx-auto rounded-full liquid-glass flex items-center justify-center mb-6 text-white">{getMsgIcon(type)}</div><div className="text-white text-sm leading-relaxed font-[400] liquid-glass p-6 rounded-2xl">{content}</div></div></div></div>;
+    }
+
+
+    function SettingsView({ role, openId, onLogout }) {
+      const { t } = useLang();
+      const [adminLoginOpen, setAdminLoginOpen] = useState(false);
+      const [adminPanelOpen, setAdminPanelOpen] = useState(false);
+      const [adminForm, setAdminForm] = useState({ username: '', password: '' });
+      const [adminToken, setAdminToken] = useState(sessionStorage.getItem('adminToken') || '');
+
+      async function loginAdmin() {
+        if (!adminForm.username.trim() || !adminForm.password) return alert(t('adminEmpty'));
+        try {
+          const data = await fetchJson('/api/admin/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(adminForm) });
+          sessionStorage.setItem('adminToken', data.token);
+          setAdminToken(data.token);
+          setAdminLoginOpen(false);
+          setAdminPanelOpen(true);
+          setAdminForm({ username: '', password: '' });
+        } catch (err) { alert(err.message || t('adminLoginFailed')); }
+      }
+
+      if (adminPanelOpen && adminToken) return <AdminPanel adminToken={adminToken} onBack={() => setAdminPanelOpen(false)} />;
+
+      return (
+        <div className="flex-1 flex flex-col p-6 lg:p-12 overflow-y-auto w-full items-center liquid-glass-strong mobile-shell-flat rounded-[2.5rem] hide-scrollbar pb-[100px] lg:pb-12 mobile-panel-height relative mobile-settings-shell">
+          <div className="glass-content w-full max-w-md lg:max-w-xl animate-silky mt-4">
+            <div className="flex items-center justify-between gap-3 mb-10">
+              <h2 className="text-xl font-[500] text-white tracking-widest uppercase">{t('settingsTitle')}</h2>
+              <LanguageToggle />
+            </div>
+            <div className="mb-4 px-2 text-[10px] font-[500] text-white/60 uppercase tracking-widest">{t('interface')}</div>
+            <div className="space-y-3 mb-10">
+              <SettingRow icon="volume-2" title={t('environmentAudio')} subtitle={t('audioLevel')} toggle />
+              <SettingRow icon="moon" title={t('visualMode')} subtitle={t('glassMode')} />
+            </div>
+            <div className="mb-4 px-2 text-[10px] font-[500] text-white/60 uppercase tracking-widest">{t('system')}</div>
+            <div className="space-y-3 mb-10">
+              <SettingRow icon="user" title={t('identity')} subtitle={`${role === 'verifier' ? t('reviewer') : t('collector')} - ${openId ? openId.slice(0, 8) + '...' : t('noId')}`} />
+              <SettingRow icon="smartphone" title={t('hardwareLink')} subtitle={t('hardwareSynced')} />
+              <SettingRow icon="shield" title={t('adminEntry')} subtitle={adminToken ? t('adminLoggedIn') : t('adminEntryHint')} onClick={() => adminToken ? setAdminPanelOpen(true) : setAdminLoginOpen(true)} />
+            </div>
+            <button onClick={onLogout} className="w-full liquid-glass text-white py-4 rounded-2xl text-xs font-[500] hover:scale-[1.02] active:scale-95 transition-transform uppercase tracking-widest mt-4">{t('disconnectNode')}</button>
+          </div>
+          {adminLoginOpen && (
+            <div className="absolute inset-0 bg-black/50 backdrop-blur-md z-50 flex items-center justify-center p-5">
+              <div className="liquid-glass-strong rounded-3xl p-6 w-full max-w-sm">
+                <div className="glass-content space-y-4">
+                  <h3 className="text-lg text-white uppercase tracking-widest">{t('adminAuth')}</h3>
+                  <input value={adminForm.username} onChange={e => setAdminForm({ ...adminForm, username: e.target.value })} placeholder={t('adminUsername')} className="w-full liquid-glass rounded-2xl px-4 py-3 text-white placeholder:text-white/30 outline-none" />
+                  <input type="password" value={adminForm.password} onChange={e => setAdminForm({ ...adminForm, password: e.target.value })} placeholder={t('adminPassword')} className="w-full liquid-glass rounded-2xl px-4 py-3 text-white placeholder:text-white/30 outline-none" />
+                  <div className="grid grid-cols-2 gap-3">
+                    <button onClick={() => setAdminLoginOpen(false)} className="liquid-glass py-3 rounded-2xl text-xs uppercase tracking-widest text-white/70">{t('cancel')}</button>
+                    <button onClick={loginAdmin} className="liquid-glass-strong py-3 rounded-2xl text-xs uppercase tracking-widest text-white">{t('login')}</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function AdminPanel({ adminToken, onBack }) {
+      const { t } = useLang();
+      const [pois, setPois] = useState([]);
+      const [thirdPartyEmail, setThirdPartyEmail] = useState('');
+      const [broadcast, setBroadcast] = useState({ audience: 'all', title: '', content: '' });
+      const [collectionPaused, setCollectionPaused] = useState(false);
+      const [loading, setLoading] = useState(false);
+      const [broadcasting, setBroadcasting] = useState(false);
+      const headers = { Authorization: `Bearer ${adminToken}` };
+      const adminUrl = (url) => `${url}${url.includes('?') ? '&' : '?'}adminToken=${encodeURIComponent(adminToken)}`;
+
+      useEffect(() => { loadAdminData(); }, [adminToken]);
+
+      async function loadAdminData() {
+        setLoading(true);
+        try {
+          const [poiData, statusData, disputeData] = await Promise.all([
+            fetchJson(adminUrl(`/api/admin/reviewed-pois?_t=${Date.now()}`), { headers }),
+            fetchJson(adminUrl(`/api/admin/collection-status?_t=${Date.now()}`), { headers }),
+            fetchJson(adminUrl(`/api/admin/dispute-settings?_t=${Date.now()}`), { headers })
+          ]);
+          setPois(poiData.data || []);
+          setCollectionPaused(Boolean(statusData.collectionPaused));
+          setThirdPartyEmail(disputeData.thirdPartyEmail || '');
+        } catch (err) { alert(err.message || t('adminLoadFailed')); }
+        finally { setLoading(false); }
+      }
+      async function toggleCollection() {
+        try {
+          const data = await fetchJson(adminUrl('/api/admin/collection-status'), {
+            method: 'POST',
+            headers: { ...headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ collectionPaused: !collectionPaused, adminToken })
+          });
+          setCollectionPaused(Boolean(data.collectionPaused));
+        } catch (err) { alert(err.message || t('adminActionFailed')); }
+      }
+      async function deletePoi(poi) {
+        if (!confirm(t('confirmDeletePoi'))) return;
+        try {
+          await fetchJson(adminUrl(`/api/admin/poi/${encodeURIComponent(poi.id || poi._id)}`), { method: 'DELETE', headers });
+          setPois(prev => prev.filter(item => (item.id || item._id) !== (poi.id || poi._id)));
+        } catch (err) { alert(err.message || t('adminActionFailed')); }
+      }
+      async function emailPoi(poi) {
+        try {
+          const data = await fetchJson(adminUrl('/api/admin/email-poi'), {
+            method: 'POST',
+            headers: { ...headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: poi.id || poi._id, adminToken })
+          });
+          alert(t('emailSentTo', { email: data.email || thirdPartyEmail }));
+        } catch (err) { alert(err.message || t('emailSendFailed')); }
+      }
+      async function sendBroadcast() {
+        const content = broadcast.content.trim();
+        if (!content) return alert(t('broadcastEmpty'));
+        setBroadcasting(true);
+        try {
+          const data = await fetchJson(adminUrl('/api/admin/broadcast'), {
+            method: 'POST',
+            headers: { ...headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              audience: broadcast.audience,
+              title: broadcast.title.trim() || t('broadcastTitlePlaceholder'),
+              content,
+              adminToken
+            })
+          });
+          setBroadcast(prev => ({ ...prev, content: '' }));
+          alert(t('broadcastSent', { count: data.count ?? 0 }));
+        } catch (err) { alert(err.message || t('broadcastFailed')); }
+        finally { setBroadcasting(false); }
+      }
+      async function saveDisputeSettings() {
+        try {
+          const data = await fetchJson(adminUrl('/api/admin/dispute-settings'), {
+            method: 'POST',
+            headers: { ...headers, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ thirdPartyEmail, adminToken })
+          });
+          setThirdPartyEmail(data.thirdPartyEmail || thirdPartyEmail);
+          alert(t('thirdPartyEmailSaved'));
+        } catch (err) { alert(err.message || t('adminActionFailed')); }
+      }
+
+      return (
+        <div className="flex-1 w-full h-full mobile-panel-height overflow-y-auto lg:overflow-hidden hide-scrollbar pb-[110px] lg:pb-0">
+          <div className="w-full max-w-6xl mx-auto h-full flex flex-col p-4 lg:p-6 animate-silky">
+            <div className="liquid-glass-strong rounded-3xl px-4 lg:px-6 py-4 mb-4 shrink-0">
+              <div className="glass-content flex items-center justify-between gap-4">
+                <button onClick={onBack} className="w-10 h-10 liquid-glass rounded-2xl flex items-center justify-center text-white hover:scale-105 active:scale-95 transition-transform"><Icon name="chevron-left" className="w-5 h-5" /></button>
+                <div className="min-w-0 text-center">
+                  <h2 className="text-base lg:text-xl text-white uppercase tracking-widest truncate">{t('adminPanel')}</h2>
+                  <p className="text-[10px] text-white/45 uppercase tracking-widest mt-1">{t('reviewedPois')} - {pois.length}</p>
+                </div>
+                <button onClick={loadAdminData} className="w-10 h-10 liquid-glass rounded-2xl flex items-center justify-center text-white hover:scale-105 active:scale-95 transition-transform"><Icon name={loading ? 'loader-2' : 'refresh-cw'} className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} /></button>
+              </div>
+            </div>
+            <div className="grid lg:grid-cols-[300px_minmax(0,1fr)] gap-4 lg:gap-5 min-h-0 flex-1">
+              <div className="space-y-4 lg:overflow-y-auto hide-scrollbar">
+                <div className="liquid-glass p-5 rounded-2xl">
+                  <div className="glass-content">
+                    <div className="text-xs text-white/50 uppercase tracking-widest mb-3">{t('collectionSwitch')}</div>
+                    <button onClick={toggleCollection} className={`w-full py-4 rounded-2xl text-xs uppercase tracking-widest ${collectionPaused ? 'liquid-glass-strong text-rose-200' : 'liquid-glass text-emerald-200'}`}>
+                      {collectionPaused ? t('resumeCollection') : t('pauseCollection')}
+                    </button>
+                    <p className="text-xs text-white/55 mt-3 leading-relaxed">{collectionPaused ? t('collectionPaused') : t('collectionOpen')}</p>
+                  </div>
+                </div>
+                <div className="liquid-glass p-5 rounded-2xl">
+                  <div className="glass-content space-y-3">
+                    <label className="block text-xs text-white/50 uppercase tracking-widest">{t('thirdPartyEmail')}</label>
+                    <input value={thirdPartyEmail} onChange={e => setThirdPartyEmail(e.target.value)} placeholder={t('thirdPartyEmailPlaceholder')} className="w-full liquid-glass rounded-2xl px-4 py-3 text-white placeholder:text-white/30 outline-none text-sm" />
+                    <button onClick={saveDisputeSettings} className="w-full liquid-glass-strong rounded-2xl py-3 text-[10px] uppercase tracking-widest text-white active:scale-95 transition-transform">{t('save')}</button>
+                  </div>
+                </div>
+                <div className="liquid-glass p-5 rounded-2xl">
+                  <div className="glass-content space-y-3">
+                    <div className="text-xs text-white/50 uppercase tracking-widest">{t('broadcastPanel')}</div>
+                    <input value={broadcast.title} onChange={e => setBroadcast(prev => ({ ...prev, title: e.target.value }))} placeholder={t('broadcastTitlePlaceholder')} className="w-full liquid-glass rounded-2xl px-4 py-3 text-white placeholder:text-white/30 outline-none text-sm" />
+                    <select value={broadcast.audience} onChange={e => setBroadcast(prev => ({ ...prev, audience: e.target.value }))} className="w-full liquid-glass rounded-2xl px-4 py-3 text-white outline-none text-sm">
+                      <option className="bg-slate-950" value="all">{t('audienceAll')}</option>
+                      <option className="bg-slate-950" value="collector">{t('audienceCollector')}</option>
+                      <option className="bg-slate-950" value="reviewer">{t('audienceReviewer')}</option>
+                    </select>
+                    <textarea value={broadcast.content} onChange={e => setBroadcast(prev => ({ ...prev, content: e.target.value }))} rows="4" maxLength="500" placeholder={t('broadcastContentPlaceholder')} className="w-full liquid-glass rounded-2xl px-4 py-3 text-white placeholder:text-white/30 outline-none text-sm resize-none" />
+                    <button onClick={sendBroadcast} disabled={broadcasting} className="w-full liquid-glass-strong rounded-2xl py-3 text-[10px] uppercase tracking-widest text-white disabled:opacity-50 active:scale-95 transition-transform">
+                      {broadcasting ? t('connecting') : t('send')}
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div className="liquid-glass-strong rounded-3xl p-4 lg:p-5 min-h-[360px] lg:min-h-0 flex flex-col overflow-hidden">
+                <div className="glass-content flex flex-col min-h-0 h-full">
+                  <div className="flex items-center justify-between gap-3 px-1 pb-4 shrink-0">
+                    <div className="text-[10px] text-white/50 uppercase tracking-widest">{t('reviewedPois')}</div>
+                    <div className="liquid-glass rounded-full px-3 py-1 text-[10px] text-white/60 font-mono">{pois.length}</div>
+                  </div>
+                  <div className="flex-1 min-h-0 overflow-y-auto space-y-3 hide-scrollbar lg:pr-1">
+                    {pois.length ? pois.map(poi => (
+                      <div key={poi.id || poi._id} className="liquid-glass p-4 rounded-2xl">
+                        <div className="glass-content grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_auto] md:items-center gap-4">
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-3 mb-2 min-w-0">
+                              <div className="text-sm text-white font-[500] truncate">{poi.poiName || poi.name || t('unknownPoi')}</div>
+                              <StatusBadge status={poi.status} />
+                            </div>
+                            <div className="text-[10px] text-white/50 font-mono truncate">[{Number((poi.lat ?? poi.location?.lat) || 0).toFixed(6)}, {Number((poi.lng ?? poi.location?.lng) || 0).toFixed(6)}]</div>
+                            {poi.rejectReason && <div className="text-xs text-rose-200/80 mt-2 truncate">{poi.rejectReason}</div>}
+                          </div>
+                          <div className="grid grid-cols-2 gap-2 md:w-48 shrink-0">
+                            <button onClick={() => emailPoi(poi)} className="liquid-glass rounded-2xl py-3 text-[10px] uppercase tracking-widest text-cyan-100 hover:scale-[1.02] active:scale-95 transition-transform">{t('emailPoi')}</button>
+                            <button onClick={() => deletePoi(poi)} className="liquid-glass rounded-2xl py-3 text-[10px] uppercase tracking-widest text-rose-200 hover:scale-[1.02] active:scale-95 transition-transform">{t('deletePoi')}</button>
+                          </div>
+                        </div>
+                      </div>
+                    )) : <EmptyComms content={t('noReviewedPois')} type="system" />}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function SettingRow({ icon, title, subtitle, toggle, onClick }) {
+      return (
+        <div onClick={onClick} className="liquid-glass p-5 rounded-2xl flex items-center cursor-pointer hover:scale-[1.02] active:scale-95 transition-transform group">
+          <div className="glass-content flex items-center w-full">
+            <div className="w-10 h-10 rounded-xl liquid-glass flex items-center justify-center mr-4 shrink-0 text-white group-hover:scale-105 transition-transform"><Icon name={icon} className="w-4 h-4" /></div>
+            <div className="flex-1 min-w-0"><div className="font-[500] text-white text-sm truncate">{title}</div>{subtitle && <div className="text-[10px] text-white/60 uppercase tracking-widest mt-1 font-mono truncate">{subtitle}</div>}</div>
+            {toggle ? <div className="w-10 h-5 liquid-glass rounded-full p-1 flex justify-end shrink-0 ml-4"><div className="w-3 h-3 bg-white rounded-full shadow-sm"></div></div> : <Icon name="chevron-right" className="w-4 h-4 text-white/40 group-hover:translate-x-1 transition-transform group-hover:text-white shrink-0 ml-4" />}
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<ErrorBoundary><App /></ErrorBoundary>);
+  </script>
+</body>
+</html>
