@@ -1,44 +1,175 @@
 'use strict';
-// 03文档 §2：鉴权中间件。requireUser 校验 X-Open-Id；requireAdmin Bearer token；screenOrAdmin 大屏只读。
 
 const { CONFIG } = require('../config');
 const { fail } = require('./respond');
 const { getModels } = require('../models');
+const {
+    SESSION_KINDS,
+    DEFAULT_COOKIE_NAMES,
+    DEFAULT_HEADER_NAMES,
+    SessionAuthConfigurationError,
+    validateSessionSecret,
+    verifySessionToken,
+    extractRequestToken,
+    timingSafeEqualText
+} = require('./sessionAuth');
+
+const LEGACY_ADMIN_SESSION_MARKER = 'cookie-session';
+
+function isProduction() {
+    return CONFIG.isProduction === true || String(CONFIG.nodeEnv || '').toLowerCase() === 'production';
+}
+
+function legacyOpenIdAllowed() {
+    return !isProduction() && CONFIG.authSignRequired === false && CONFIG.legacyOpenIdEnabled !== false;
+}
+
+function userIsRevoked(user) {
+    return !user || user.enabled === false || user.disabled === true || user.banned === true;
+}
+
+function verifySignedCredential(token, expectedKind) {
+    return verifySessionToken(token, {
+        secret: CONFIG.sessionSecret,
+        expectedKind
+    });
+}
+
+function userCredential(req) {
+    return extractRequestToken(req, {
+        headerName: DEFAULT_HEADER_NAMES.user,
+        cookieName: DEFAULT_COOKIE_NAMES.user,
+        allowBearer: true
+    });
+}
 
 async function requireUser(req, res, next) {
-    const openId = String(req.headers['x-open-id'] || '').trim();
-    if (!openId) return fail(res, 401, 9001, '缺少身份标识');
+    let credential;
+    try {
+        credential = userCredential(req);
+    } catch {
+        return fail(res, 401, 9001, 'User session is invalid');
+    }
+
+    let openId = '';
+    let session = null;
+    if (credential) {
+        try {
+            session = verifySignedCredential(credential.token, SESSION_KINDS.USER);
+            openId = session.subject;
+        } catch (error) {
+            if (error instanceof SessionAuthConfigurationError) {
+                return fail(res, 503, 9001, 'User authentication is not configured securely');
+            }
+            return fail(res, 401, 9001, 'User session is invalid');
+        }
+    } else if (legacyOpenIdAllowed()) {
+        openId = String(req.headers['x-open-id'] || '').trim();
+    }
+    if (!openId) return fail(res, 401, 9001, 'A valid user session is required');
+
     try {
         const { ExternalUser } = getModels();
         const user = await ExternalUser.findOne({ openId }).lean();
-        if (!user) return fail(res, 401, 9001, '用户不存在，请先完成微信授权');
+        if (userIsRevoked(user)) return fail(res, 401, 9001, 'User does not exist or is disabled');
         req.openId = openId;
         req.user = user;
-        next();
-    } catch (e) {
-        console.error('[GeoSync] [AUTH]', e.message);
-        fail(res, 500, 9001, '鉴权失败');
+        req.authSession = session;
+        return next();
+    } catch (error) {
+        console.error('[GeoSync] [AUTH]', error?.name || 'Error');
+        return fail(res, 500, 9001, 'Authentication failed');
     }
 }
 
-function getBearer(req) {
-    const auth = String(req.headers.authorization || '').trim();
-    if (auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim();
-    return '';
+function configuredOpaqueToken(value, name) {
+    try {
+        validateSessionSecret(value, { name });
+        return String(value);
+    } catch {
+        return '';
+    }
 }
 
 function requireAdmin(req, res, next) {
-    if (!CONFIG.adminToken || getBearer(req) !== CONFIG.adminToken) {
-        return fail(res, 403, 9001, '管理员权限无效');
+    let bearerCredential;
+    let cookieCredential;
+    try {
+        bearerCredential = extractRequestToken(req, { allowBearer: true });
+        cookieCredential = extractRequestToken(req, { cookieName: DEFAULT_COOKIE_NAMES.admin });
+    } catch {
+        return fail(res, 403, 9001, 'Administrator permission is invalid');
     }
-    next();
+
+    if (bearerCredential && bearerCredential.token !== LEGACY_ADMIN_SESSION_MARKER) {
+        const configuredToken = configuredOpaqueToken(CONFIG.adminToken, 'ADMIN_TOKEN');
+        if (configuredToken && timingSafeEqualText(bearerCredential.token, configuredToken)) {
+            req.adminAuth = Object.freeze({ source: 'bearer', kind: 'opaque-admin-token' });
+            return next();
+        }
+        return fail(res, 403, 9001, 'Administrator permission is invalid');
+    }
+    if (!cookieCredential) return fail(res, 403, 9001, 'Administrator permission is invalid');
+
+    try {
+        const session = verifySignedCredential(cookieCredential.token, SESSION_KINDS.ADMIN);
+        if (!timingSafeEqualText(session.subject, CONFIG.adminUsername)) {
+            throw new Error('invalid administrator subject');
+        }
+        req.adminAuth = Object.freeze({ source: cookieCredential.source, kind: 'signed-session', session });
+        return next();
+    } catch {
+        return fail(res, 403, 9001, 'Administrator permission is invalid');
+    }
 }
 
-// 大屏 token 或 admin token 均可（只读接口）
 function screenOrAdmin(req, res, next) {
-    const st = String(req.query.screenToken || '').trim();
-    if (CONFIG.screenToken && st === CONFIG.screenToken) return next();
+    if (req.query && Object.prototype.hasOwnProperty.call(req.query, 'screenToken')) {
+        return fail(res, 403, 9001, 'Screen credentials must not be passed in the query string');
+    }
+
+    let headerCredential;
+    let cookieCredential;
+    try {
+        headerCredential = extractRequestToken(req, {
+            headerName: DEFAULT_HEADER_NAMES.screen
+        });
+        cookieCredential = extractRequestToken(req, {
+            cookieName: DEFAULT_COOKIE_NAMES.screen
+        });
+    } catch {
+        return fail(res, 403, 9001, 'Screen permission is invalid');
+    }
+    if (headerCredential) {
+        const screenToken = configuredOpaqueToken(CONFIG.screenToken, 'SCREEN_TOKEN');
+        if (screenToken && timingSafeEqualText(headerCredential.token, screenToken)) {
+            req.screenAuth = Object.freeze({ source: headerCredential.source, kind: 'opaque-screen-token' });
+            return next();
+        }
+        return fail(res, 403, 9001, 'Screen permission is invalid');
+    }
+    if (cookieCredential) {
+        try {
+            const session = verifySignedCredential(cookieCredential.token, SESSION_KINDS.SCREEN);
+            if (session.subject !== 'screen') throw new Error('invalid screen subject');
+            req.screenAuth = Object.freeze({
+                source: cookieCredential.source,
+                kind: 'signed-screen-session',
+                session
+            });
+            return next();
+        } catch {
+            return requireAdmin(req, res, next);
+        }
+    }
     return requireAdmin(req, res, next);
 }
 
-module.exports = { requireUser, requireAdmin, screenOrAdmin };
+module.exports = {
+    LEGACY_ADMIN_SESSION_MARKER,
+    requireUser,
+    requireAdmin,
+    screenOrAdmin,
+    legacyOpenIdAllowed,
+    userIsRevoked
+};

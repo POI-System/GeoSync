@@ -9,8 +9,9 @@ const { registerModels, getModels } = require('./models');
 const bus = require('./lib/eventBus');
 const memCache = require('./lib/memCache');
 const geo = require('./lib/geo');
-const { requireAdmin, screenOrAdmin } = require('./lib/auth');
+const { requireAdmin, screenOrAdmin, legacyOpenIdAllowed, userIsRevoked } = require('./lib/auth');
 const { wrap } = require('./lib/respond');
+const { createSocketRoomAuthorizer } = require('./lib/socketRoomAuth');
 const { createSuperMapGateway } = require('./integrations/supermap');
 const notifyBridge = require('./services/notifyBridge');
 const walkGraph = require('./services/walkGraph');
@@ -81,32 +82,31 @@ function startSseLoops() {
 }
 
 // ===================== Socket.io 房间协议（04文档 §1.1）=====================
-function bindSocket(io, getSocketIdentity) {
+function bindSocket(io, getSocketIdentity, options = {}) {
     notifyBridge.setIo(io);
+    const refreshIntervalMs = Number.isInteger(options.refreshIntervalMs)
+        && options.refreshIntervalMs >= 10
+        && options.refreshIntervalMs <= 5 * 60 * 1000
+        ? options.refreshIntervalMs
+        : 60 * 1000;
     io.on('connection', socket => {
-        // 只新增事件监听，不动宿主已有 connection handler
-        socket.on('geosync:join', async () => {
-            try {
-                const identity = await getSocketIdentity(socket);
-                const openId = String(identity?.openId || '').trim();
-                const scenicId = CONFIG.scenicId;
-                const rooms = [];
-                if (identity?.isAdmin === true) {
-                    rooms.push(`admin:${scenicId}`);
-                } else {
-                    if (!openId) return socket.emit('geosync:joined', { ok: false, message: '缺少身份' });
-                    const { ExternalUser } = getModels();
-                    const user = await ExternalUser.findOne({ openId }).lean();
-                    if (!user) return socket.emit('geosync:joined', { ok: false, message: '用户不存在' });
-                    rooms.push(`scenic:${scenicId}`, `user:${openId}`);
-                }
-                for (const r of rooms) socket.join(r);
-                socket.emit('geosync:joined', { ok: true, rooms });
-            } catch (e) {
-                console.error('[GeoSync] [SOCKET] join failed:', e.message);
-                socket.emit('geosync:joined', { ok: false, message: '加入失败' });
-            }
+        const authorizer = createSocketRoomAuthorizer({
+            socket,
+            scenicId: CONFIG.scenicId,
+            getIdentity: getSocketIdentity,
+            getUser: async openId => {
+                const { ExternalUser } = getModels();
+                return ExternalUser.findOne({ openId }).lean();
+            },
+            isRevoked: userIsRevoked
         });
+        socket.on('geosync:join', () => { void authorizer.refresh(); });
+        void authorizer.refresh();
+        const timer = setInterval(() => { void authorizer.refresh(); }, refreshIntervalMs);
+        timer.unref?.();
+        const stop = () => clearInterval(timer);
+        if (typeof socket.once === 'function') socket.once('disconnect', stop);
+        else socket.on('disconnect', stop);
     });
 }
 
@@ -338,12 +338,23 @@ let attachmentResult = null;
 let attachmentError = null;
 
 async function defaultSocketIdentity(socket) {
-    const openId = String(socket?.openId || '').trim();
-    if (!openId) return null;
-    const { ExternalUser } = getModels();
-    const user = await ExternalUser.findOne({ openId }).lean();
-    if (!user) return null;
-    return { openId, role: user.role || '', isAdmin: user.role === 'admin' };
+    const verified = socket?.data?.authIdentity || socket?.authIdentity;
+    const isAdmin = verified?.kind === 'admin' || verified?.isAdmin === true;
+    const openId = String(verified?.openId || (verified?.kind === 'user' ? verified.subject : '') || '').trim();
+    if (isAdmin || openId) {
+        return {
+            kind: isAdmin ? 'admin' : 'user',
+            ...(isAdmin ? { subject: verified.subject || openId || 'admin' } : {}),
+            ...(openId ? { openId, role: verified.role || '' } : {}),
+            isAdmin,
+            authenticated: verified.authenticated !== false
+        };
+    }
+    if (!legacyOpenIdAllowed()) return null;
+    const legacyOpenId = String(socket?.openId || '').trim();
+    return legacyOpenId
+        ? { kind: 'user', openId: legacyOpenId, isAdmin: false, authenticated: true }
+        : null;
 }
 
 function attach({
@@ -510,4 +521,4 @@ function attach({
     }
 }
 
-module.exports = { attach, sseSend };
+module.exports = { attach, sseSend, bindSocket, defaultSocketIdentity };

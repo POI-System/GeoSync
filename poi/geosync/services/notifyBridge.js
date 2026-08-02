@@ -31,7 +31,6 @@ async function pushProposal(openId, proposal) {
 
 async function alertAdmin(level, subject, body) {
     console.warn(`[GeoSync] [ALERT:${level}]`, subject, body);
-    if (ioRef) ioRef.to('admin:default').emit('alert:crowd', { level, subject, body });
     if (level === 'red' && helpers.sendMail) {
         try {
             await helpers.sendMail(process.env.ALERT_EMAIL || '', `[红色预警] ${subject}`, body);

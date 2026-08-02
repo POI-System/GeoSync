@@ -2,6 +2,11 @@
 // 05文档 §8：打卡四重校验流水线（fail-fast）+ 积分账本 + 徽章。
 
 const crypto = require('crypto');
+const {
+    SessionAuthConfigurationError,
+    validateSessionSecret,
+    timingSafeEqualText
+} = require('../lib/sessionAuth');
 const { CONFIG } = require('../config');
 const { getModels } = require('../models');
 const { BizError } = require('../lib/respond');
@@ -178,16 +183,26 @@ async function badgeProgress(openId, poi) {
 
 // 扫码 token：HMAC(poiId+日期)，日轮换（03文档 §6.3）
 function qrTokenOf(poiId, date = new Date()) {
+    const key = validateSessionSecret(CONFIG.hmacSecret, {
+        name: 'POSITION_HMAC_SECRET',
+        minBytes: 32
+    });
     const day = geo.dateStrOf(date);
-    return crypto.createHmac('sha256', CONFIG.hmacSecret)
+    return crypto.createHmac('sha256', key)
         .update(`qr:${poiId}:${day}`).digest('hex').slice(0, 16);
 }
 
-function verifyQrToken(token) {
-    // token 格式约定：<poiId>.<hmac16>
-    const [poiId, sig] = String(token).split('.');
-    if (!poiId || !sig) return null;
-    return sig === qrTokenOf(poiId) ? poiId : null;
+function verifyQrToken(token, date = new Date()) {
+    const parts = String(token || '').split('.');
+    if (parts.length !== 2) return null;
+    const [poiId, sig] = parts;
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(poiId) || !/^[a-f0-9]{16}$/.test(sig)) return null;
+    try {
+        return timingSafeEqualText(sig, qrTokenOf(poiId, date)) ? poiId : null;
+    } catch (error) {
+        if (error instanceof SessionAuthConfigurationError) return null;
+        throw error;
+    }
 }
 
 module.exports = { verify, setOcrFn, addPoints, badgeProgress, similarity, editDistance, qrTokenOf, verifyQrToken };

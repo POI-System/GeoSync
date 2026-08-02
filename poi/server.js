@@ -11,6 +11,53 @@ const multer = require('multer');
 const nodemailer = require('nodemailer');
 const { Server } = require('socket.io');
 const geosync = require('./geosync');
+const { OAuthStateStore } = require('./geosync/services/oauthState');
+const { serializePublicPoi } = require('./geosync/services/publicPoiProjection');
+const { createHostSocketRoomSync } = require('./geosync/services/hostSocketRooms');
+const { createFixedWindowRateLimiter } = require('./geosync/services/fixedWindowRateLimiter');
+const {
+    COLLECTOR_TEMPLATE_LABEL,
+    normalizeAudience,
+    activeAudienceQuery,
+    activeReviewerQuery,
+    publishAnnouncementRefresh
+} = require('./geosync/services/hostNotificationPolicy');
+const {
+    LEGACY_ADMIN_SESSION_MARKER,
+    HostAuthError,
+    createHostAuth
+} = require('./geosync/services/hostAuth');
+const {
+    SESSION_KINDS,
+    DEFAULT_COOKIE_NAMES,
+    createSessionToken,
+    extractRequestToken,
+    serializeSessionCookie,
+    serializeExpiredCookie,
+    timingSafeEqualText
+} = require('./geosync/lib/sessionAuth');
+
+const OAUTH_STATE_COOKIE_NAME = 'poi_oauth_state';
+const QR_CLAIM_COOKIE_NAME = 'poi_qr_login_claim';
+const AUTH_FLOW_TTL_MS = 5 * 60 * 1000;
+const AUTH_FLOW_MAX_PENDING = 2048;
+
+function boundedPositiveInteger(value, fallback, max) {
+    const parsed = Number(value);
+    return Number.isInteger(parsed) && parsed > 0 && parsed <= max ? parsed : fallback;
+}
+
+function normalizeTrustProxy(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return 'loopback';
+    if (raw.toLowerCase() === 'false') return false;
+    if (/^\d+$/.test(raw)) {
+        const hops = Number(raw);
+        return Number.isInteger(hops) && hops >= 0 && hops <= 10 ? hops : 'loopback';
+    }
+    if (raw.toLowerCase() === 'true' || raw === '*') return 'loopback';
+    return raw;
+}
 
 const Ocr20191230 = require('@alicloud/ocr20191230');
 const OcrApi20210707 = require('@alicloud/ocr-api20210707');
@@ -18,6 +65,7 @@ const OpenApi = require('@alicloud/openapi-client');
 const { RuntimeOptions } = require('@alicloud/tea-util');
 
 const CONFIG = {
+    nodeEnv: String(process.env.NODE_ENV || 'development').trim().toLowerCase(),
     port: Number(process.env.PORT) || 3000,
     host: process.env.HOST || '127.0.0.1',
     publicHost: process.env.PUBLIC_HOST || 'http://localhost:3000',
@@ -27,6 +75,26 @@ const CONFIG = {
         username: process.env.ADMIN_USERNAME || '',
         password: process.env.ADMIN_PASSWORD || ''
     },
+    trustProxy: normalizeTrustProxy(process.env.TRUST_PROXY),
+    authSessionSecret: process.env.AUTH_SESSION_SECRET || '',
+    userSessionTtlSec: boundedPositiveInteger(
+        process.env.AUTH_USER_SESSION_TTL_SEC,
+        7 * 24 * 60 * 60,
+        30 * 24 * 60 * 60
+    ),
+    adminSessionTtlSec: boundedPositiveInteger(
+        process.env.AUTH_ADMIN_SESSION_TTL_SEC,
+        8 * 60 * 60,
+        30 * 24 * 60 * 60
+    ),
+    screenSessionTtlSec: boundedPositiveInteger(
+        process.env.SCREEN_SESSION_TTL_S,
+        15 * 60,
+        24 * 60 * 60
+    ),
+    screenToken: String(process.env.SCREEN_TOKEN || '').trim(),
+    reviewerOpenIds: new Set(String(process.env.REVIEWER_OPENIDS || '')
+        .split(',').map(value => value.trim()).filter(Boolean)),
     corsOrigin: process.env.CORS_ORIGIN || process.env.PUBLIC_HOST || 'http://localhost:3000',
 
     aliyun: {
@@ -61,6 +129,9 @@ const CONFIG = {
         defaultTestEmail: process.env.DEFAULT_TEST_EMAIL || ''
     }
 };
+CONFIG.authCookieSecure = process.env.AUTH_COOKIE_SECURE === undefined
+    ? CONFIG.publicHost.startsWith('https://')
+    : String(process.env.AUTH_COOKIE_SECURE).toLowerCase() !== 'false';
 
 const ocrEnabled = Boolean(CONFIG.aliyun.accessKeyId && CONFIG.aliyun.accessKeySecret);
 const ocrClient = ocrEnabled
@@ -91,9 +162,41 @@ const userSchema = new mongoose.Schema({
     openId: { type: String, required: true, unique: true, index: true, trim: true },
     nickname: { type: String, default: '' },
     role: { type: String, enum: ['collector', 'reviewer', 'thirdParty'], default: 'collector' },
-    reviewerSubscribed: { type: Boolean, default: false }
+    reviewerSubscribed: { type: Boolean, default: false },
+    disabled: { type: Boolean, default: false }
 });
 const User = mongoose.model('User', userSchema);
+
+const hostAuth = createHostAuth({
+    User,
+    sessionSecret: CONFIG.authSessionSecret,
+    adminToken: CONFIG.adminToken,
+    adminUsername: CONFIG.admin.username || 'admin',
+    reviewerOpenIds: CONFIG.reviewerOpenIds,
+    userSessionTtlSec: CONFIG.userSessionTtlSec,
+    adminSessionTtlSec: CONFIG.adminSessionTtlSec,
+    cookieSecure: CONFIG.authCookieSecure,
+    production: CONFIG.nodeEnv === 'production',
+    allowLegacyUserHeader: process.env.AUTH_SIGN_REQUIRED === 'false'
+});
+const {
+    requireUser,
+    requireAdmin,
+    requireReviewerOrAdmin
+} = hostAuth;
+
+const adminLoginIpLimiter = createFixedWindowRateLimiter({
+    windowMs: 15 * 60 * 1000,
+    maxAttempts: 30
+});
+const adminLoginAccountLimiter = createFixedWindowRateLimiter({
+    windowMs: 15 * 60 * 1000,
+    maxAttempts: 10
+});
+const oauthIssueLimiter = createFixedWindowRateLimiter({
+    windowMs: 60 * 1000,
+    maxAttempts: 20
+});
 
 const adminUserSchema = new mongoose.Schema({
     username: { type: String, required: true, unique: true, trim: true },
@@ -210,7 +313,10 @@ async function sendTemplate(openId, templateId, data = {}) {
             { timeout: 8000 }
         );
         if (r.data.errcode !== 0) {
-            console.warn('[Template Fail]', openId, r.data);
+            console.warn('[Template Fail]', {
+                recipient: crypto.createHash('sha256').update(String(openId)).digest('hex').slice(0, 12),
+                errcode: Number.isFinite(Number(r.data?.errcode)) ? Number(r.data.errcode) : null
+            });
         }
         return r.data;
     } catch (e) {
@@ -221,7 +327,7 @@ async function sendTemplate(openId, templateId, data = {}) {
 const app = express();
 const server = http.createServer(app);
 
-app.set('trust proxy', true);
+app.set('trust proxy', CONFIG.trustProxy);
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
@@ -446,7 +552,7 @@ function isLikelyWechatOpenId(openId) {
 
 async function getReviewerTemplateOpenIds() {
     const reviewers = await User.find(
-        { $or: [{ role: 'reviewer' }, { reviewerSubscribed: true }] },
+        activeReviewerQuery(CONFIG.reviewerOpenIds),
         { openId: 1 }
     ).lean();
     const openIds = [...new Set(
@@ -462,6 +568,23 @@ async function getReviewerTemplateOpenIds() {
         console.warn('[Template Skip] no valid reviewer openId; open the reviewer menu once to subscribe a real WeChat user');
     }
     return openIds;
+}
+
+async function isActiveUser(openId) {
+    if (!openId) return false;
+    return Boolean(await User.findOne(
+        { openId, disabled: { $ne: true } },
+        { _id: 1 }
+    ).lean());
+}
+
+async function sendTemplateToActiveUser(openId, templateId, data) {
+    try {
+        if (!await isActiveUser(openId)) return;
+        return sendTemplate(openId, templateId, data);
+    } catch (error) {
+        console.warn('[Template Skip]', error?.name || 'Error');
+    }
 }
 
 function serializePoi(item) {
@@ -484,17 +607,44 @@ function serializePoi(item) {
     };
 }
 
-function getAdminToken(req) {
-    const auth = String(req.headers.authorization || '').trim();
-    if (auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim();
-    return String(req.query.adminToken || req.body?.adminToken || '').trim();
+function appendCookie(res, cookie) {
+    const current = res.getHeader('Set-Cookie');
+    const values = current === undefined ? [] : Array.isArray(current) ? current : [current];
+    res.setHeader('Set-Cookie', [...values, cookie]);
 }
 
-function requireAdmin(req, res, next) {
-    if (!CONFIG.adminToken || getAdminToken(req) !== CONFIG.adminToken) {
-        return res.status(403).json({ success: false, message: '管理员权限无效' });
-    }
-    next();
+function requestNetworkKey(req) {
+    return String(req.ip || req.socket?.remoteAddress || 'unknown')
+        .trim()
+        .toLowerCase()
+        .slice(0, 128) || 'unknown';
+}
+
+function accountRateKey(username) {
+    return crypto.createHash('sha256')
+        .update(String(username || '').trim().toLowerCase(), 'utf8')
+        .digest('hex');
+}
+
+function enforceRateLimit(res, ...results) {
+    const rejected = results.filter(result => result?.allowed === false);
+    if (!rejected.length) return true;
+    const retryAfterSec = Math.max(...rejected.map(result => result.retryAfterSec || 1));
+    res.set('Retry-After', String(retryAfterSec));
+    res.status(429).json({ success: false, message: 'Too many authentication attempts' });
+    return false;
+}
+
+async function ensureOAuthUser(openId) {
+    const normalizedOpenId = String(openId || '').trim();
+    if (!normalizedOpenId) throw new Error('OAuth identity is missing');
+    const user = await User.findOneAndUpdate(
+        { openId: normalizedOpenId },
+        { $setOnInsert: { openId: normalizedOpenId, role: 'collector', reviewerSubscribed: false } },
+        { upsert: true, new: true, runValidators: true, setDefaultsOnInsert: true }
+    );
+    if (!user || user.disabled === true) throw new Error('OAuth identity is disabled');
+    return user;
 }
 
 async function getSystemSetting() {
@@ -725,14 +875,22 @@ async function saveChatMessage({ roomId, fromOpenId, user, text }) {
 async function createNotification(payload) {
     const item = await Notification.create(payload);
     const data = serializeNotification(item);
-    if (io) io.to(`user_${data.recipientOpenId || payload.recipientOpenId}`).emit('notification', data);
+    const recipientOpenId = data.recipientOpenId || payload.recipientOpenId;
+    if (io) {
+        try {
+            if (await isActiveUser(recipientOpenId)) {
+                io.to(`user_${recipientOpenId}`).emit('notification', data);
+            }
+        } catch (error) {
+            console.warn('[notification fanout]', error?.name || 'Error');
+        }
+    }
     return data;
 }
 
 async function broadcastNotification({ audience = 'all', title, content, type = 'system' }) {
-    const allowedAudiences = new Set(['all', 'collector', 'reviewer']);
-    const targetAudience = allowedAudiences.has(audience) ? audience : 'all';
-    const query = targetAudience === 'all' ? {} : { role: targetAudience };
+    const targetAudience = normalizeAudience(audience);
+    const query = activeAudienceQuery(targetAudience, CONFIG.reviewerOpenIds);
     const users = await User.find(query, { openId: 1 }).lean();
     const uniqueOpenIds = [...new Set(users.map(u => String(u.openId || '').trim()).filter(Boolean))];
     const docs = uniqueOpenIds.map(openId => ({
@@ -746,10 +904,7 @@ async function broadcastNotification({ audience = 'all', title, content, type = 
     }
     const created = await Notification.insertMany(docs, { ordered: false });
     const notifications = created.map(serializeNotification);
-    if (io) {
-        notifications.forEach(item => io.to(`user_${item.recipientOpenId}`).emit('notification', item));
-        io.emit('announcement', { audience: targetAudience, title, content });
-    }
+    publishAnnouncementRefresh(io, notifications, targetAudience);
     await Promise.allSettled(uniqueOpenIds.map(openId =>
         sendTemplate(openId, CONFIG.wechat.templates.adminNotice, buildTemplateData({
             title: title || '管理员公告',
@@ -760,20 +915,30 @@ async function broadcastNotification({ audience = 'all', title, content, type = 
     return { audience: targetAudience, count: notifications.length, notifications };
 }
 
-app.post('/api/user/bind-role', async (req, res) => {
+app.post('/api/user/bind-role', requireUser, async (req, res) => {
     try {
         const { openId, role } = req.body;
-        if (!openId || !role || !VALID_ROLES.has(role)) {
+        if (!role || !VALID_ROLES.has(role)) {
             return res.status(400).json({ success: false, message: '参数不足' });
+        }
+        if (openId && String(openId).trim() !== req.openId) {
+            return res.status(403).json({ success: false, message: '身份与会话不一致' });
+        }
+        if (role === 'thirdParty') {
+            return res.status(403).json({ success: false, message: '第三方角色只能由管理员配置' });
+        }
+        if (role === 'reviewer' && !CONFIG.reviewerOpenIds.has(req.openId)) {
+            return res.status(403).json({ success: false, message: '审核员身份未获授权' });
         }
         const update = { role };
         if (role === 'reviewer') update.reviewerSubscribed = true;
-        await User.findOneAndUpdate(
-            { openId },
+        const user = await User.findOneAndUpdate(
+            { openId: req.openId, disabled: { $ne: true } },
             { $set: update },
-            { upsert: true, new: true, runValidators: true, setDefaultsOnInsert: true }
+            { new: true, runValidators: true }
         );
-        res.json({ success: true, message: '绑定成功' });
+        if (!user) return res.status(401).json({ success: false, message: '用户身份无效' });
+        res.json({ success: true, message: '绑定成功', role: user.role });
     } catch (e) {
         console.error('[bind-role]', e.message);
         res.status(500).json({ success: false, message: '服务器错误' });
@@ -781,26 +946,100 @@ app.post('/api/user/bind-role', async (req, res) => {
 });
 
 app.post('/api/admin/login', async (req, res) => {
+    res.set('Cache-Control', 'no-store');
     try {
         const { username, password } = req.body;
         if (!username || !password) {
             return res.status(400).json({ success: false, message: '参数不足' });
         }
-        if (!CONFIG.admin.username || !CONFIG.admin.password || !CONFIG.adminToken) {
-            return res.status(500).json({ success: false, message: '管理员账号未配置' });
+        if (!CONFIG.admin.username || !CONFIG.admin.password) {
+            return res.status(503).json({ success: false, message: '管理员账号未配置' });
         }
-        const envAdminMatched = username === CONFIG.admin.username && password === CONFIG.admin.password;
-        if (envAdminMatched) {
-            res.json({ success: true, token: CONFIG.adminToken });
-        } else {
-            res.json({ success: false, message: '账号密码错误' });
+        const networkKey = requestNetworkKey(req);
+        const pairKey = `${networkKey}:${accountRateKey(username)}`;
+        if (!enforceRateLimit(
+            res,
+            adminLoginIpLimiter.consume(networkKey),
+            adminLoginAccountLimiter.consume(pairKey)
+        )) return;
+        const usernameMatched = timingSafeEqualText(String(username), CONFIG.admin.username);
+        const passwordMatched = timingSafeEqualText(String(password), CONFIG.admin.password);
+        const envAdminMatched = usernameMatched && passwordMatched;
+        if (!envAdminMatched) {
+            return res.status(401).json({ success: false, message: '账号密码错误' });
         }
+        adminLoginAccountLimiter.clear(pairKey);
+        hostAuth.issueAdminSession(res);
+        res.json({
+            success: true,
+            token: LEGACY_ADMIN_SESSION_MARKER,
+            expiresInSec: hostAuth.adminSessionTtlSec
+        });
     } catch (e) {
+        if (e instanceof HostAuthError) {
+            return res.status(e.httpStatus).json({ success: false, message: '管理员会话未安全配置' });
+        }
         res.status(500).json({ success: false, message: '服务器错误' });
     }
 });
 
-app.post('/api/ocr/classify', uploadPoiImage, async (req, res) => {
+app.post('/api/admin/logout', (req, res) => {
+    hostAuth.clearAdminSession(res);
+    res.json({ success: true });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+    hostAuth.clearUserSession(res);
+    res.json({ success: true });
+});
+
+app.get('/api/auth/session', requireUser, (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json({
+        success: true,
+        data: {
+            openId: req.openId,
+            role: req.principal.role
+        }
+    });
+});
+
+app.post('/api/admin/screen/session', requireAdmin, (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    try {
+        const screenSession = createSessionToken({
+            secret: CONFIG.authSessionSecret,
+            kind: SESSION_KINDS.SCREEN,
+            subject: 'screen',
+            role: 'viewer',
+            ttlSec: CONFIG.screenSessionTtlSec
+        });
+        appendCookie(res, serializeSessionCookie(
+            DEFAULT_COOKIE_NAMES.screen,
+            screenSession,
+            {
+                maxAgeSec: CONFIG.screenSessionTtlSec,
+                secure: CONFIG.authCookieSecure,
+                sameSite: 'Lax',
+                path: '/api/screen'
+            }
+        ));
+        res.json({ success: true, expiresInSec: CONFIG.screenSessionTtlSec });
+    } catch {
+        res.status(503).json({ success: false, message: 'Screen access is not configured securely' });
+    }
+});
+
+app.post('/api/admin/screen/logout', requireAdmin, (_req, res) => {
+    appendCookie(res, serializeExpiredCookie(DEFAULT_COOKIE_NAMES.screen, {
+        secure: CONFIG.authCookieSecure,
+        sameSite: 'Lax',
+        path: '/api/screen'
+    }));
+    res.json({ success: true });
+});
+
+app.post('/api/ocr/classify', requireUser, uploadPoiImage, async (req, res) => {
     try {
         const { poiName, description } = req.body;
         if (!req.file) {
@@ -816,16 +1055,17 @@ app.post('/api/ocr/classify', uploadPoiImage, async (req, res) => {
     }
 });
 
-app.post('/api/submit-poi', uploadPoiImage, async (req, res) => {
+app.post('/api/submit-poi', requireUser, uploadPoiImage, async (req, res) => {
     try {
         if (await isCollectionPaused()) {
             cleanupUploadedFile(req.file);
             return res.status(423).json({ success: false, message: '采集已暂停，请等待管理员开放采集' });
         }
-        const { poiName, description, lng, lat, userOpenId } = req.body;
+        const { poiName, description, lng, lat } = req.body;
+        const userOpenId = req.openId;
         const parsedLng = parseCoordinate(lng);
         const parsedLat = parseCoordinate(lat);
-        if (!poiName || !lng || !lat || !userOpenId || !req.file) {
+        if (!poiName || !lng || !lat || !req.file) {
             cleanupUploadedFile(req.file);
             return res.status(400).json({ success: false, message: '参数不足' });
         }
@@ -851,7 +1091,7 @@ app.post('/api/submit-poi', uploadPoiImage, async (req, res) => {
         for (const reviewerOpenId of reviewerOpenIds) {
             sendTemplate(reviewerOpenId, CONFIG.wechat.templates.newPoiWait, buildTemplateData({
                 poi: poi.poiName,
-                user: userOpenId,
+                user: COLLECTOR_TEMPLATE_LABEL,
                 time: formatDateTime(poi.createTime)
             }));
         }
@@ -869,16 +1109,17 @@ app.post('/api/submit-poi', uploadPoiImage, async (req, res) => {
     }
 });
 
-app.post('/api/poi/update', uploadPoiImage, async (req, res) => {
+app.post('/api/poi/update', requireUser, uploadPoiImage, async (req, res) => {
     try {
         if (await isCollectionPaused()) {
             cleanupUploadedFile(req.file);
             return res.status(423).json({ success: false, message: '采集已暂停，请等待管理员开放采集' });
         }
-        const { id, poiName, description, lng, lat, userOpenId } = req.body;
+        const { id, poiName, description, lng, lat } = req.body;
+        const userOpenId = req.openId;
         const parsedLng = parseCoordinate(lng);
         const parsedLat = parseCoordinate(lat);
-        if (!id || !mongoose.isValidObjectId(id) || !poiName || lng === undefined || lat === undefined || !userOpenId) {
+        if (!id || !mongoose.isValidObjectId(id) || !poiName || lng === undefined || lat === undefined) {
             cleanupUploadedFile(req.file);
             return res.status(400).json({ success: false, message: '参数不足' });
         }
@@ -913,7 +1154,7 @@ app.post('/api/poi/update', uploadPoiImage, async (req, res) => {
         for (const reviewerOpenId of reviewerOpenIds) {
             sendTemplate(reviewerOpenId, CONFIG.wechat.templates.newPoiWait, buildTemplateData({
                 poi: poi.poiName,
-                user: userOpenId,
+                user: COLLECTOR_TEMPLATE_LABEL,
                 time: formatDateTime(poi.createTime)
             }));
         }
@@ -937,9 +1178,12 @@ app.post('/api/poi/update', uploadPoiImage, async (req, res) => {
     }
 });
 
-app.post('/api/admin/approve-poi', async (req, res) => {
+app.post('/api/admin/approve-poi', requireReviewerOrAdmin, async (req, res) => {
     try {
-        const { id, action, rejectReason, openId } = req.body;
+        const { id, action, rejectReason } = req.body;
+        const reviewerId = req.principal?.kind === 'user'
+            ? req.openId
+            : `admin:${req.admin?.username || 'operator'}`;
         if (!id || !mongoose.isValidObjectId(id) || !['approved', 'rejected'].includes(action)) {
             return res.status(400).json({ success: false, message: '参数错误' });
         }
@@ -949,7 +1193,7 @@ app.post('/api/admin/approve-poi', async (req, res) => {
 
         const poi = await POI.findOneAndUpdate(
             { _id: id, status: 'pending' },
-            { status: action, rejectReason: rejectReason || '', reviewerId: openId || '' },
+            { status: action, rejectReason: rejectReason || '', reviewerId },
             { new: true, runValidators: true }
         );
         if (!poi) {
@@ -973,7 +1217,7 @@ app.post('/api/admin/approve-poi', async (req, res) => {
             status: action
         });
 
-        const auditRoom = await getOrCreateAuditRoom(poi, openId || 'unknown_reviewer');
+        const auditRoom = await getOrCreateAuditRoom(poi, reviewerId);
         auditRoom.status = action;
         auditRoom.poiName = poi.poiName;
         await auditRoom.save();
@@ -982,12 +1226,12 @@ app.post('/api/admin/approve-poi', async (req, res) => {
             : `审核完毕：你提交的「${poi.poiName}」已被驳回。审批意见：${rejectReason || '无'}`;
         const auditChat = await saveChatMessage({
             roomId: auditRoom.roomId,
-            fromOpenId: openId || 'system_reviewer',
+            fromOpenId: reviewerId,
             user: auditRoom.reviewerName || '核验者',
             text: auditChatText
         });
 
-        await sendTemplate(poi.userOpenId, CONFIG.wechat.templates.auditResult, buildTemplateData({
+        await sendTemplateToActiveUser(poi.userOpenId, CONFIG.wechat.templates.auditResult, buildTemplateData({
             result: statusText,
             time: formatDateTime(new Date()),
             remark: action === 'approved' ? `点位「${poi.poiName}」已通过审核` : (rejectReason || '无')
@@ -996,7 +1240,7 @@ app.post('/api/admin/approve-poi', async (req, res) => {
         if (io) {
             io.to(`chat_${auditRoom.roomId}`).emit('chatMessage', serializeChatMessage(auditChat));
             io.to(`user_${poi.userOpenId}`).emit('chatRoomUpdated', serializeChatRoom(auditRoom));
-            if (openId) io.to(`user_${openId}`).emit('chatRoomUpdated', serializeChatRoom(auditRoom));
+            if (req.openId) io.to(`user_${req.openId}`).emit('chatRoomUpdated', serializeChatRoom(auditRoom));
             io.to(`user_${poi.userOpenId}`).emit('poiStatusChanged', {
                 poiId: poi._id,
                 poiName: poi.poiName,
@@ -1022,37 +1266,34 @@ app.post('/api/admin/approve-poi', async (req, res) => {
 
 app.get('/api/poi/all', async (_req, res) => {
     try {
-        const data = await POI.find({ status: 'approved' }).sort({ createTime: -1 });
-        res.json({ success: true, data });
+        const data = await POI.find({ status: 'approved' }).sort({ createTime: -1 }).lean();
+        res.json({ success: true, data: data.map(serializePublicPoi) });
     } catch (e) {
         res.status(500).json({ success: false, message: '查询失败' });
     }
 });
 
-app.get('/api/poi/my', async (req, res) => {
+app.get('/api/poi/my', requireUser, async (req, res) => {
     try {
-        const openId = String(req.query.openId || req.query.openid || '').trim();
-        if (!openId) {
-            return res.status(400).json({ success: false, message: '缺少 openId' });
-        }
+        const openId = req.openId;
         const page = Math.max(Number.parseInt(req.query.page, 10) || 1, 1);
         const size = Math.min(Math.max(Number.parseInt(req.query.size, 10) || 50, 1), 100);
         const data = await POI.find({ userOpenId: openId })
             .sort({ createTime: -1 })
             .skip((page - 1) * size)
             .limit(size);
-        res.json({ success: true, data });
+        res.json({ success: true, data: data.map(serializePoi) });
     } catch (e) {
         res.status(500).json({ success: false, message: '查询失败' });
     }
 });
 
-app.post('/api/poi/dispute', async (req, res) => {
+app.post('/api/poi/dispute', requireUser, async (req, res) => {
     try {
         const id = String(req.body?.id || '').trim();
-        const openId = String(req.body?.openId || req.body?.openid || '').trim();
+        const openId = req.openId;
         const reason = String(req.body?.reason || '').trim().slice(0, 800);
-        if (!id || !mongoose.isValidObjectId(id) || !openId || !reason) {
+        if (!id || !mongoose.isValidObjectId(id) || !reason) {
             return res.status(400).json({ success: false, message: '异议说明不能为空' });
         }
         const poi = await POI.findOne({ _id: id, userOpenId: openId, status: 'rejected' });
@@ -1131,7 +1372,7 @@ app.post('/api/poi/dispute', async (req, res) => {
     }
 });
 
-app.get('/api/admin/list', async (_req, res) => {
+app.get('/api/admin/list', requireReviewerOrAdmin, async (_req, res) => {
     try {
         const page = Math.max(Number.parseInt(_req.query.page, 10) || 1, 1);
         const size = Math.min(Math.max(Number.parseInt(_req.query.size, 10) || 50, 1), 100);
@@ -1396,9 +1637,9 @@ app.post('/api/dispute/:token/resolve', async (req, res) => {
     }
 });
 
-app.get('/api/notifications', async (req, res) => {
+app.get('/api/notifications', requireUser, async (req, res) => {
     try {
-        const openId = String(req.query.openId || req.query.openid || '').trim();
+        const openId = req.openId;
         if (!openId) {
             return res.status(400).json({ success: false, message: '缺少 openId' });
         }
@@ -1416,9 +1657,10 @@ app.get('/api/notifications', async (req, res) => {
     }
 });
 
-app.post('/api/notifications/read', async (req, res) => {
+app.post('/api/notifications/read', requireUser, async (req, res) => {
     try {
-        const { openId, id } = req.body;
+        const { id } = req.body;
+        const openId = req.openId;
         if (!openId) {
             return res.status(400).json({ success: false, message: '缺少 openId' });
         }
@@ -1437,9 +1679,9 @@ app.post('/api/notifications/read', async (req, res) => {
     }
 });
 
-app.get('/api/chat/rooms', async (req, res) => {
+app.get('/api/chat/rooms', requireUser, async (req, res) => {
     try {
-        const openId = String(req.query.openId || req.query.openid || '').trim();
+        const openId = req.openId;
         if (!openId) {
             return res.status(400).json({ success: false, message: '缺少 openId' });
         }
@@ -1453,10 +1695,10 @@ app.get('/api/chat/rooms', async (req, res) => {
     }
 });
 
-app.get('/api/chat/history', async (req, res) => {
+app.get('/api/chat/history', requireUser, async (req, res) => {
     try {
         const roomId = String(req.query.roomId || 'private').trim();
-        const openId = String(req.query.openId || req.query.openid || '').trim();
+        const openId = req.openId;
         if (!roomId || roomId.length > 160) {
             return res.status(400).json({ success: false, message: 'Invalid chat room' });
         }
@@ -1464,8 +1706,7 @@ app.get('/api/chat/history', async (req, res) => {
             return res.status(400).json({ success: false, message: 'Missing openId' });
         }
         if (isRoleGroupRoom(roomId)) {
-            const user = await User.findOne({ openId }, { role: 1 }).lean();
-            const role = user ? user.role : 'collector';
+            const role = req.principal.role;
             if (!canAccessRoom(role, roomId)) {
                 return res.status(403).json({ success: false, message: 'Forbidden group chat' });
             }
@@ -1484,8 +1725,9 @@ app.get('/api/chat/history', async (req, res) => {
     }
 });
 
-const qrSessions = new Map(); 
-const QR_TTL_MS = 5 * 60 * 1000;
+const qrSessions = new Map();
+const oauthStateStore = new OAuthStateStore({ ttlMs: AUTH_FLOW_TTL_MS });
+const QR_TTL_MS = AUTH_FLOW_TTL_MS;
 const PORTAL_VERSION = process.env.PORTAL_VERSION || 'ui-i18n-chat-20260512-1131';
 
 function appendPortalVersion(target) {
@@ -1505,26 +1747,128 @@ function appendPortalVersion(target) {
 setInterval(() => {
     const now = Date.now();
     for (const [sid, sess] of qrSessions) {
-        if (now - sess.ts > QR_TTL_MS) qrSessions.delete(sid);
+        if (sess.expiresAt <= now) qrSessions.delete(sid);
     }
+    oauthStateStore.prune();
 }, 60 * 1000).unref();
 
+function normalizeAuthQuery(value, maxLength = 4096) {
+    const raw = Array.isArray(value) ? value[0] : value;
+    return typeof raw === 'string' ? raw.trim().slice(0, maxLength) : '';
+}
+
+function buildWechatAuthorizeUrl(callbackUrl, state) {
+    const query = new URLSearchParams({
+        appid: CONFIG.wechat.appId,
+        redirect_uri: callbackUrl,
+        response_type: 'code',
+        scope: 'snsapi_base',
+        state
+    });
+    return `https://open.weixin.qq.com/connect/oauth2/authorize?${query}#wechat_redirect`;
+}
+
+function oauthStateCookieOptions() {
+    return {
+        maxAgeSec: Math.ceil(AUTH_FLOW_TTL_MS / 1000),
+        secure: CONFIG.authCookieSecure,
+        sameSite: 'Lax',
+        path: '/auth/wechat/callback'
+    };
+}
+
+function clearOAuthStateCookie(res) {
+    appendCookie(res, serializeExpiredCookie(OAUTH_STATE_COOKIE_NAME, {
+        secure: CONFIG.authCookieSecure,
+        sameSite: 'Lax',
+        path: '/auth/wechat/callback'
+    }));
+}
+
+function qrClaimCookieOptions() {
+    return {
+        maxAgeSec: Math.ceil(QR_TTL_MS / 1000),
+        secure: CONFIG.authCookieSecure,
+        sameSite: 'Strict',
+        path: '/auth/status'
+    };
+}
+
+function clearQrClaimCookie(res) {
+    appendCookie(res, serializeExpiredCookie(QR_CLAIM_COOKIE_NAME, {
+        secure: CONFIG.authCookieSecure,
+        sameSite: 'Strict',
+        path: '/auth/status'
+    }));
+}
+
+function hashQrClaim(value) {
+    return crypto.createHash('sha256').update(String(value), 'utf8').digest('hex');
+}
+
+function redirectWithOpenId(target, openId) {
+    const url = new URL(target || '/portal.html', CONFIG.publicHost);
+    url.searchParams.set('openid', openId);
+    return url.pathname + url.search + url.hash;
+}
+
 app.get('/auth/wechat', (req, res) => {
+    if (!hostAuth.configured || !CONFIG.wechat.appId || !CONFIG.wechat.appSecret) {
+        return res.status(503).send('WeChat authorization is not configured');
+    }
+    if (!enforceRateLimit(res, oauthIssueLimiter.consume(requestNetworkKey(req)))) return;
+    if (oauthStateStore.size >= AUTH_FLOW_MAX_PENDING) {
+        return res.status(429).send('Too many pending authorization requests');
+    }
     const redirect = appendPortalVersion(req.query.redirect || '/portal.html');
-    const callbackUrl = encodeURIComponent(
-        `${CONFIG.publicHost}/auth/wechat/callback?redirect=${encodeURIComponent(redirect)}`
-    );
-    const url = `https://open.weixin.qq.com/connect/oauth2/authorize` +
-        `?appid=${CONFIG.wechat.appId}` +
-        `&redirect_uri=${callbackUrl}` +
-        `&response_type=code&scope=snsapi_base&state=STATE#wechat_redirect`;
-    res.redirect(url);
+    const issued = oauthStateStore.issue({ kind: 'browser', redirect });
+    appendCookie(res, serializeSessionCookie(
+        OAUTH_STATE_COOKIE_NAME,
+        issued.state,
+        oauthStateCookieOptions()
+    ));
+    res.redirect(buildWechatAuthorizeUrl(
+        `${CONFIG.publicHost}/auth/wechat/callback`,
+        issued.state
+    ));
 });
 
 app.get('/auth/wechat/callback', async (req, res) => {
+    const callbackSid = normalizeAuthQuery(req.query.sid, 64);
+    let stateReservation = null;
     try {
-        const { code, sid, redirect = '/portal.html' } = req.query;
-        if (!code) return res.status(400).send('缺少 code');
+        const code = normalizeAuthQuery(req.query.code);
+        const sid = callbackSid;
+        const state = normalizeAuthQuery(req.query.state, 256);
+        if (!code || !state) return res.status(400).send('Invalid OAuth callback');
+
+        let flow = null;
+        if (sid) {
+            const session = /^[a-f0-9]{32}$/i.test(sid) ? qrSessions.get(sid) : null;
+            if (!session || session.expiresAt <= Date.now()) {
+                qrSessions.delete(sid);
+                return res.status(400).send('Invalid or expired OAuth state');
+            }
+            flow = oauthStateStore.reserve(state, { kind: 'qr', subject: sid });
+        } else {
+            let boundState = '';
+            try {
+                boundState = extractRequestToken(req, {
+                    cookieName: OAUTH_STATE_COOKIE_NAME
+                })?.token || '';
+            } catch {
+                return res.status(400).send('Invalid or expired OAuth state');
+            }
+            flow = oauthStateStore.reserve(state, {
+                kind: 'browser',
+                boundState
+            });
+        }
+        if (!flow) return res.status(400).send('Invalid or expired OAuth state');
+        stateReservation = flow;
+        if (!CONFIG.wechat.appId || !CONFIG.wechat.appSecret) {
+            return res.status(503).send('WeChat authorization is not configured');
+        }
 
         const r = await axios.get('https://api.weixin.qq.com/sns/oauth2/access_token', {
             params: {
@@ -1536,17 +1880,29 @@ app.get('/auth/wechat/callback', async (req, res) => {
             timeout: 8000
         });
 
-        const openid = r.data.openid;
-        if (!openid) {
-            return res.status(500).send('授权失败:' + JSON.stringify(r.data));
+        const openid = normalizeAuthQuery(r.data?.openid);
+        if (!openid || openid.length > 128 || !/^[A-Za-z0-9._:-]+$/.test(openid)) {
+            console.warn('[wechat callback]', {
+                upstreamCode: Number.isFinite(Number(r.data?.errcode)) ? Number(r.data.errcode) : null
+            });
+            return res.status(502).send('WeChat authorization failed');
         }
 
+        const user = await ensureOAuthUser(openid);
+
         
-        if (sid && qrSessions.has(sid)) {
+        if (sid) {
             const sess = qrSessions.get(sid);
-            sess.openid = openid;
+            if (!sess || sess.expiresAt <= Date.now() || sess.status !== 'pending') {
+                if (sess?.expiresAt <= Date.now()) qrSessions.delete(sid);
+                return res.status(400).send('Invalid or expired OAuth state');
+            }
+            if (!oauthStateStore.commit(stateReservation)) {
+                return res.status(400).send('Invalid or expired OAuth state');
+            }
+            stateReservation = null;
+            sess.openid = user.openId;
             sess.status = 'ok';
-            sess.ts = Date.now();
             return res.send(`
                 <html><head><meta charset="UTF-8"><title>授权成功</title>
                 <style>body{font-family:sans-serif;text-align:center;padding-top:80px;color:#07c160}</style>
@@ -1557,56 +1913,103 @@ app.get('/auth/wechat/callback', async (req, res) => {
             `);
         }
 
-        
-        const redirectTarget = appendPortalVersion(redirect);
-        const separator = redirectTarget.includes('?') ? '&' : '?';
-        res.redirect(`${redirectTarget}${separator}openid=${encodeURIComponent(openid)}`);
+        const committedFlow = oauthStateStore.commit(stateReservation);
+        if (!committedFlow) return res.status(400).send('Invalid or expired OAuth state');
+        stateReservation = null;
+        clearOAuthStateCookie(res);
+        hostAuth.issueUserSession(res, user);
+        res.redirect(redirectWithOpenId(committedFlow.redirect, user.openId));
     } catch (e) {
-        console.error('[wechat callback]', e.message);
-        res.status(500).send('回调处理失败');
+        console.error('[wechat callback]', e?.name || 'Error');
+        const status = e instanceof HostAuthError ? e.httpStatus : 500;
+        res.status(status).send(status === 503
+            ? 'User session authentication is unavailable'
+            : 'OAuth callback failed');
+    } finally {
+        if (stateReservation) oauthStateStore.release(stateReservation);
     }
 });
 
-app.get('/auth/wechat/qr', (_req, res) => {
-    const sid = crypto.randomBytes(8).toString('hex');
-    qrSessions.set(sid, { status: 'pending', openid: null, ts: Date.now() });
+app.get('/auth/wechat/qr', (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    if (!hostAuth.configured || !CONFIG.wechat.appId || !CONFIG.wechat.appSecret) {
+        return res.status(503).json({ status: 'unavailable' });
+    }
+    if (!enforceRateLimit(res, oauthIssueLimiter.consume(requestNetworkKey(req)))) return;
+    if (oauthStateStore.size >= AUTH_FLOW_MAX_PENDING
+        || qrSessions.size >= AUTH_FLOW_MAX_PENDING) {
+        return res.status(429).json({ status: 'busy' });
+    }
+    const sid = crypto.randomBytes(16).toString('hex');
+    const claim = crypto.randomBytes(24).toString('base64url');
+    qrSessions.set(sid, {
+        status: 'pending',
+        openid: null,
+        claimHash: hashQrClaim(claim),
+        expiresAt: Date.now() + QR_TTL_MS
+    });
+    const issued = oauthStateStore.issue({ kind: 'qr', subject: sid });
+    appendCookie(res, serializeSessionCookie(
+        QR_CLAIM_COOKIE_NAME,
+        claim,
+        qrClaimCookieOptions()
+    ));
 
-    const callbackUrl = encodeURIComponent(`${CONFIG.publicHost}/auth/wechat/callback?sid=${sid}`);
-    const qrUrl = `https://open.weixin.qq.com/connect/oauth2/authorize` +
-        `?appid=${CONFIG.wechat.appId}` +
-        `&redirect_uri=${callbackUrl}` +
-        `&response_type=code&scope=snsapi_base&state=qr#wechat_redirect`;
+    const qrUrl = buildWechatAuthorizeUrl(
+        `${CONFIG.publicHost}/auth/wechat/callback?sid=${encodeURIComponent(sid)}`,
+        issued.state
+    );
 
     res.json({ sid, qrUrl });
 });
 
-app.get('/auth/status', (req, res) => {
-    const { sid } = req.query;
+app.get('/auth/status', async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    const sid = normalizeAuthQuery(req.query.sid, 64);
+    let claim = '';
+    try {
+        claim = extractRequestToken(req, {
+            cookieName: QR_CLAIM_COOKIE_NAME
+        })?.token || '';
+    } catch {
+        return res.status(403).json({ status: 'invalid' });
+    }
+    if (!claim) return res.status(403).json({ status: 'invalid' });
     if (!sid || !qrSessions.has(sid)) {
+        clearQrClaimCookie(res);
         return res.json({ status: 'expired' });
     }
     const sess = qrSessions.get(sid);
-    if (Date.now() - sess.ts > QR_TTL_MS) {
+    if (!timingSafeEqualText(hashQrClaim(claim), sess.claimHash)) {
+        return res.status(403).json({ status: 'invalid' });
+    }
+    if (sess.expiresAt <= Date.now()) {
         qrSessions.delete(sid);
+        clearQrClaimCookie(res);
         return res.json({ status: 'expired' });
     }
-    res.json({
-        status: sess.status,
-        openid: sess.status === 'ok' ? sess.openid : undefined
-    });
+    if (sess.status !== 'ok') {
+        return res.json({ status: 'pending' });
+    }
+
+    sess.status = 'consuming';
+    try {
+        const user = await ensureOAuthUser(sess.openid);
+        hostAuth.issueUserSession(res, user);
+        qrSessions.delete(sid);
+        clearQrClaimCookie(res);
+        return res.json({ status: 'ok', openid: user.openId });
+    } catch (e) {
+        if (qrSessions.has(sid)) sess.status = 'ok';
+        const status = e instanceof HostAuthError ? e.httpStatus : 503;
+        return res.status(status).json({ status: 'unavailable' });
+    }
 });
 
 function normalizeSocketString(value, maxLength) {
     const raw = Array.isArray(value) ? value[0] : value;
     if (typeof raw !== 'string') return '';
     return raw.trim().slice(0, maxLength);
-}
-
-function getSocketOpenId(socket) {
-    return normalizeSocketString(
-        socket.handshake.query.openId || socket.handshake.query.openid,
-        128
-    );
 }
 
 const socketCorsOrigins = CONFIG.corsOrigin
@@ -1623,36 +2026,40 @@ const io = new Server(server, {
     pingTimeout: 30000
 });
 
-io.on('connection', async (socket) => {
-    const openId = getSocketOpenId(socket);
-    if (!openId) return socket.disconnect(true);
+io.use(hostAuth.socketMiddleware);
 
-    socket.openId = openId;
+const hostSocketRooms = createHostSocketRoomSync({
+    getIdentity: hostAuth.getSocketIdentity,
+    ChatRoom,
+    groupRoomForRole,
+    socketRoomForGroup,
+    privateRoomLimit: 100,
+    logger: console
+});
+
+io.on('connection', async (socket) => {
     socket.nickname = '匿名';
-    socket.join(`user_${openId}`);
 
     try {
-        const u = await User.findOne({ openId });
-        socket.role = u ? u.role : 'collector';
-        socket.join(socketRoomForGroup(groupRoomForRole(socket.role)));
-        if (socket.role === 'reviewer') socket.join('reviewer_group');
-        const rooms = await ChatRoom.find({
-            $or: [{ collectorOpenId: openId }, { reviewerOpenId: openId }]
-        }, { roomId: 1 }).lean();
-        rooms.forEach(room => socket.join(`chat_${room.roomId}`));
+        const identity = await hostSocketRooms.sync(socket);
+        if (!identity) return;
+        hostSocketRooms.start(socket);
     } catch (e) {
-        console.warn('[socket auth]', e.message);
+        console.warn('[socket auth]', e?.name || 'Error');
+        return socket.disconnect(true);
     }
 
     
-    socket.on('setNickname', d => {
-        if (!socket.openId) return;
+    socket.on('setNickname', async d => {
+        const identity = await hostSocketRooms.refresh(socket);
+        if (!identity?.openId) return;
         const nickname = normalizeSocketString(d && d.nickname, 20);
         if (nickname) socket.nickname = nickname;
     });
 
     socket.on('joinChatRoom', async d => {
-        if (!socket.openId) return;
+        const identity = await hostSocketRooms.refresh(socket);
+        if (!identity?.openId) return;
         const roomId = normalizeSocketString(d && d.roomId, 160);
         if (!roomId) return;
         if (isRoleGroupRoom(roomId)) {
@@ -1671,7 +2078,8 @@ io.on('connection', async (socket) => {
 
     
     socket.on('chatMessage', async d => {
-        if (!socket.openId) return;
+        const identity = await hostSocketRooms.refresh(socket);
+        if (!identity?.openId) return;
         const text = normalizeSocketString(d && d.text, 500);
         const roomId = normalizeSocketString(d && d.roomId, 160) || groupRoomForRole(socket.role);
         if (!text) return;
@@ -1703,7 +2111,8 @@ io.on('connection', async (socket) => {
 
     
     socket.on('super_publish_notice', async (d) => {
-        if (!CONFIG.adminToken || !socket.openId || !d || d.adminToken !== CONFIG.adminToken) return;
+        const identity = await hostSocketRooms.refresh(socket);
+        if (!identity?.isAdmin || !d) return;
         const text = normalizeSocketString(d.text, 500);
         if (!text) return;
 
@@ -1729,7 +2138,8 @@ geosync.attach({
         sendTemplate,
         sendMail: sendGeoSyncMail,
         ocr: recognizeGeoSyncPhoto,
-        uploadDir
+        uploadDir,
+        getSocketIdentity: hostAuth.getSocketIdentity
     },
     options: {
         startBackground: String(process.env.GEOSYNC_BACKGROUND_ENABLED || 'true').toLowerCase() !== 'false',

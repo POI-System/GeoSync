@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('node:fs');
+const net = require('node:net');
 
 const SUPPORTED_CONTRACT_MAJOR = 1;
 const MAX_FEATURES = 500;
@@ -12,6 +13,50 @@ const REQUIRED_SERVICE_OPERATIONS = Object.freeze({
     data: ['status', 'queryFeatures'],
     network: ['status', 'findPath', 'findPathWithBarriers']
 });
+const NON_PUBLIC_DNS_SUFFIXES = Object.freeze([
+    'localhost',
+    'local',
+    'localdomain',
+    'internal',
+    'intranet',
+    'lan',
+    'home',
+    'home.arpa',
+    'corp',
+    'private',
+    'test',
+    'invalid',
+    'example',
+    'onion'
+]);
+const NON_PUBLIC_IPV4_RANGES = Object.freeze([
+    ['0.0.0.0', 8],
+    ['10.0.0.0', 8],
+    ['100.64.0.0', 10],
+    ['127.0.0.0', 8],
+    ['169.254.0.0', 16],
+    ['172.16.0.0', 12],
+    ['192.0.0.0', 24],
+    ['192.0.2.0', 24],
+    ['192.88.99.0', 24],
+    ['192.168.0.0', 16],
+    ['198.18.0.0', 15],
+    ['198.51.100.0', 24],
+    ['203.0.113.0', 24],
+    ['224.0.0.0', 4],
+    ['240.0.0.0', 4]
+].map(([network, prefix]) => Object.freeze({
+    network: ipv4ToInteger(network),
+    mask: (0xffffffff << (32 - prefix)) >>> 0
+})));
+const NON_PUBLIC_IPV6_RANGES = (() => {
+    const blockList = new net.BlockList();
+    blockList.addSubnet('2001::', 23, 'ipv6');
+    blockList.addSubnet('2001:db8::', 32, 'ipv6');
+    blockList.addSubnet('2002::', 16, 'ipv6');
+    blockList.addSubnet('3fff::', 20, 'ipv6');
+    return blockList;
+})();
 
 class ManifestValidationError extends Error {
     constructor(message, options = {}) {
@@ -51,6 +96,97 @@ function requireLogicalName(value, field) {
         fail(field, 'must contain only letters, numbers, underscores, or hyphens and start with a letter');
     }
     return name;
+}
+
+function ipv4ToInteger(address) {
+    return address.split('.').reduce(
+        (result, octet) => (((result << 8) | Number(octet)) >>> 0),
+        0
+    );
+}
+
+function isPublicIpv4(address) {
+    const numericAddress = ipv4ToInteger(address);
+    return !NON_PUBLIC_IPV4_RANGES.some(({ network, mask }) => (
+        (numericAddress & mask) >>> 0
+    ) === ((network & mask) >>> 0));
+}
+
+function isPublicIpv6(address) {
+    const firstHextet = Number.parseInt(address.split(':', 1)[0] || '0', 16);
+    const isGlobalUnicast = Number.isFinite(firstHextet) && (firstHextet & 0xe000) === 0x2000;
+    return isGlobalUnicast && !NON_PUBLIC_IPV6_RANGES.check(address, 'ipv6');
+}
+
+function normalizePublicHostname(value, field) {
+    const unbracketed = value.startsWith('[') && value.endsWith(']')
+        ? value.slice(1, -1)
+        : value;
+    const hostname = unbracketed.toLowerCase().replace(/\.$/, '');
+    const ipVersion = net.isIP(hostname);
+
+    if (ipVersion === 4) {
+        if (!isPublicIpv4(hostname)) fail(field, 'must use a publicly routable host');
+        return hostname;
+    }
+    if (ipVersion === 6) {
+        if (!isPublicIpv6(hostname)) fail(field, 'must use a publicly routable host');
+        return hostname;
+    }
+
+    const labels = hostname.split('.');
+    if (labels.length < 2 || labels.some(label => (
+        label.length === 0
+        || label.length > 63
+        || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)
+    ))) {
+        fail(field, 'must use a valid public DNS hostname');
+    }
+    if (hostname.length > 253 || /^\d+$/.test(labels[labels.length - 1])) {
+        fail(field, 'must use a valid public DNS hostname');
+    }
+    if (NON_PUBLIC_DNS_SUFFIXES.some(suffix => (
+        hostname === suffix || hostname.endsWith(`.${suffix}`)
+    ))) {
+        fail(field, 'must not use an internal or reserved hostname');
+    }
+    return hostname;
+}
+
+function canonicalPublicHost(parsed, field) {
+    const hostname = normalizePublicHostname(parsed.hostname, field);
+    const formattedHostname = net.isIP(hostname) === 6 ? `[${hostname}]` : hostname;
+    return parsed.port ? `${formattedHostname}:${parsed.port}` : formattedHostname;
+}
+
+function normalizeAllowedPublicHosts(value) {
+    if (value === undefined) return [];
+    if (!Array.isArray(value)) fail('public.allowedHosts', 'must be an array of public hosts');
+
+    const seen = new Set();
+    return value.map((rawHost, index) => {
+        const field = `public.allowedHosts[${index}]`;
+        const host = requireNonEmptyString(rawHost, field);
+        if (host.includes('://') || host.includes('/') || host.includes('\\')
+            || host.includes('?') || host.includes('#')) {
+            fail(field, 'must contain only a hostname and optional port');
+        }
+
+        let parsed;
+        try {
+            parsed = new URL(`https://${host}`);
+        } catch (error) {
+            fail(field, 'must contain a valid hostname and optional port', 'SUPERMAP_MANIFEST_INVALID', error);
+        }
+        if (parsed.username || parsed.password || parsed.pathname !== '/') {
+            fail(field, 'must contain only a hostname and optional port');
+        }
+
+        const normalizedHost = canonicalPublicHost(parsed, field);
+        if (seen.has(normalizedHost)) fail(field, 'must not duplicate another allowed host');
+        seen.add(normalizedHost);
+        return normalizedHost;
+    });
 }
 
 function assertOnlyKeys(object, allowedKeys, field) {
@@ -266,12 +402,16 @@ function normalizeLimits(value) {
     return { maxFeatures: Math.min(maxFeatures, MAX_FEATURES) };
 }
 
-function normalizePublicUrl(value, field) {
+function normalizePublicUrl(value, field, allowedHosts) {
     const url = requireNonEmptyString(value, field);
     let parsed;
 
+    if (url.includes('\\')) fail(field, 'must not contain backslashes');
+    if (url.includes('?')) fail(field, 'must not contain a query string');
+    if (url.includes('#')) fail(field, 'must not contain a fragment');
+
     if (url.startsWith('/')) {
-        if (url.startsWith('//') || url.includes('\\')) fail(field, 'must be a safe root-relative URL');
+        if (url.startsWith('//')) fail(field, 'must be a safe root-relative URL');
         parsed = new URL(url, 'https://public.invalid');
     } else {
         try {
@@ -281,16 +421,18 @@ function normalizePublicUrl(value, field) {
         }
         if (!['http:', 'https:'].includes(parsed.protocol)) fail(field, 'must use HTTP or HTTPS');
         if (parsed.username || parsed.password) fail(field, 'must not contain embedded credentials');
+        const host = canonicalPublicHost(parsed, field);
+        if (!allowedHosts.has(host)) {
+            fail(field, 'absolute URL host must be listed in public.allowedHosts');
+        }
     }
 
-    if (parsed.search) fail(field, 'must not contain a query string');
-    if (parsed.hash) fail(field, 'must not contain a fragment');
     return url;
 }
 
 function normalizePublic(value, services) {
     const publicConfig = requireObject(value, 'public');
-    assertOnlyKeys(publicConfig, ['features', 'services'], 'public');
+    assertOnlyKeys(publicConfig, ['features', 'services', 'allowedHosts'], 'public');
 
     const features = requireObject(publicConfig.features, 'public.features');
     const normalizedFeatures = {};
@@ -300,6 +442,8 @@ function normalizePublic(value, services) {
         normalizedFeatures[featureKey] = enabled;
     }
 
+    const allowedHosts = normalizeAllowedPublicHosts(publicConfig.allowedHosts);
+    const allowedHostSet = new Set(allowedHosts);
     const publicServices = requireObject(publicConfig.services, 'public.services');
     const normalizedServices = {};
     for (const [serviceKey, publicUrl] of Object.entries(publicServices)) {
@@ -307,10 +451,14 @@ function normalizePublic(value, services) {
         if (!services[serviceKey] || !services[serviceKey].enabled) {
             fail(`public.services.${serviceKey}`, 'must reference an enabled logical service');
         }
-        normalizedServices[serviceKey] = normalizePublicUrl(publicUrl, `public.services.${serviceKey}`);
+        normalizedServices[serviceKey] = normalizePublicUrl(
+            publicUrl,
+            `public.services.${serviceKey}`,
+            allowedHostSet
+        );
     }
 
-    return { features: normalizedFeatures, services: normalizedServices };
+    return { features: normalizedFeatures, services: normalizedServices, allowedHosts };
 }
 
 function validateManifest(input) {

@@ -220,9 +220,83 @@ test('public config contains only safe metadata and explicitly public values', (
     assert.equal(publicConfig.internalNote, undefined);
 });
 
-test('public URLs reject embedded credentials, query strings, and fragments', () => {
+test('absolute public URLs require an exact allowlisted public host without projecting the policy', () => {
+    const manifest = readExample();
+    manifest.public.allowedHosts = ['Maps.Example.COM:8443'];
+    manifest.public.services.map = 'https://maps.example.com:8443/public/map';
+
+    const validated = validateManifest(manifest);
+    const publicConfig = createPublicConfig(validated);
+
+    assert.deepEqual(validated.public.allowedHosts, ['maps.example.com:8443']);
+    assert.equal(publicConfig.publicServices.map, 'https://maps.example.com:8443/public/map');
+    assert.equal(publicConfig.allowedHosts, undefined);
+
+    const absentAllowlist = readExample();
+    absentAllowlist.public.services.map = 'https://maps.example.com/public/map';
+    assert.throws(
+        () => validateManifest(absentAllowlist),
+        error => error instanceof ManifestValidationError
+            && error.field === 'public.services.map'
+            && error.message.includes('public.allowedHosts')
+    );
+
+    const wrongPort = readExample();
+    wrongPort.public.allowedHosts = ['maps.example.com'];
+    wrongPort.public.services.map = 'https://maps.example.com:8443/public/map';
+    assert.throws(
+        () => validateManifest(wrongPort),
+        error => error instanceof ManifestValidationError
+            && error.field === 'public.services.map'
+            && error.message.includes('public.allowedHosts')
+    );
+
+    const publicIpv6 = readExample();
+    publicIpv6.public.allowedHosts = ['[2001:4860:4860::8888]'];
+    publicIpv6.public.services.map = 'https://[2001:4860:4860::8888]/public/map';
+    assert.equal(
+        validateManifest(publicIpv6).public.services.map,
+        'https://[2001:4860:4860::8888]/public/map'
+    );
+});
+
+test('absolute public URLs reject non-public and internal hosts even when explicitly allowlisted', () => {
+    const unsafeHosts = [
+        'localhost',
+        'tiles.localhost',
+        'intranet',
+        'tiles.internal',
+        'tiles.local',
+        '10.1.2.3',
+        '100.64.0.1',
+        '127.1',
+        '169.254.1.1',
+        '172.16.0.1',
+        '192.168.1.1',
+        '198.18.0.1',
+        '[::1]',
+        '[fc00::1]',
+        '[fe80::1]',
+        '[2001:db8::1]'
+    ];
+
+    for (const host of unsafeHosts) {
+        const manifest = readExample();
+        manifest.public.allowedHosts = [host];
+        manifest.public.services.map = `https://${host}/public/map`;
+        assert.throws(
+            () => validateManifest(manifest),
+            error => error instanceof ManifestValidationError
+                && error.field === 'public.allowedHosts[0]',
+            `expected ${host} to be rejected`
+        );
+    }
+});
+
+test('public URLs reject embedded credentials, query strings, fragments, and unsafe allowlist entries', () => {
     const embedded = readExample();
-    embedded.public.services.map = 'https://user:password@example.invalid/map';
+    embedded.public.allowedHosts = ['maps.example.com'];
+    embedded.public.services.map = 'https://user:password@maps.example.com/map';
     assert.throws(
         () => validateManifest(embedded),
         error => error instanceof ManifestValidationError
@@ -238,12 +312,37 @@ test('public URLs reject embedded credentials, query strings, and fragments', ()
     );
 
     const fragment = readExample();
-    fragment.public.services.map = 'https://example.invalid/public/map#scene';
+    fragment.public.allowedHosts = ['maps.example.com'];
+    fragment.public.services.map = 'https://maps.example.com/public/map#scene';
     assert.throws(
         () => validateManifest(fragment),
         error => error instanceof ManifestValidationError
             && error.field === 'public.services.map'
     );
+
+    const userinfoAllowlist = readExample();
+    userinfoAllowlist.public.allowedHosts = ['user@maps.example.com'];
+    assert.throws(
+        () => validateManifest(userinfoAllowlist),
+        error => error instanceof ManifestValidationError
+            && error.field === 'public.allowedHosts[0]'
+    );
+
+    for (const unsafeUrl of [
+        '/public/map?',
+        '/public/map#',
+        'https://maps.example.com\\@127.0.0.1/public/map'
+    ]) {
+        const manifest = readExample();
+        manifest.public.allowedHosts = ['maps.example.com'];
+        manifest.public.services.map = unsafeUrl;
+        assert.throws(
+            () => validateManifest(manifest),
+            error => error instanceof ManifestValidationError
+                && error.field === 'public.services.map',
+            `expected ${unsafeUrl} to be rejected`
+        );
+    }
 });
 
 test('safe loader returns structured offline state for missing manifests', () => {
@@ -265,6 +364,20 @@ test('safe loader returns normalized manifest and public config on success', () 
     assert.equal(result.manifest.services.terrain.path, null);
     assert.deepEqual(result.publicConfig.publicServices, { map: '/config/public-map-url' });
     assert.equal(result.publicConfig.datasets, undefined);
+});
+
+test('safe loader never projects a non-public absolute service URL', t => {
+    const manifest = readExample();
+    manifest.public.services.map = 'http://169.254.169.254/private-map';
+    const manifestPath = temporaryManifest(t, JSON.stringify(manifest));
+
+    const result = loadManifestSafe(manifestPath);
+
+    assert.equal(result.ok, false);
+    assert.equal(result.state, 'offline');
+    assert.equal(result.manifest, null);
+    assert.equal(result.publicConfig, null);
+    assert.equal(result.error.field, 'public.services.map');
 });
 
 test('safe loader reports malformed and incompatible files without throwing', t => {
