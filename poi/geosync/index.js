@@ -9,7 +9,9 @@ const { registerModels, getModels } = require('./models');
 const bus = require('./lib/eventBus');
 const memCache = require('./lib/memCache');
 const geo = require('./lib/geo');
-const { screenOrAdmin } = require('./lib/auth');
+const { requireAdmin, screenOrAdmin } = require('./lib/auth');
+const { wrap } = require('./lib/respond');
+const { createSuperMapGateway } = require('./integrations/supermap');
 const notifyBridge = require('./services/notifyBridge');
 const walkGraph = require('./services/walkGraph');
 const engine = require('./services/geosyncEngine');
@@ -290,6 +292,15 @@ function simRouter() {
     return router;
 }
 
+function mongoStatusOf(mongoose) {
+    const states = ['offline', 'online', 'connecting', 'disconnecting'];
+    const readyState = Number(mongoose?.connection?.readyState);
+    return {
+        state: states[readyState] || 'offline',
+        readyState: Number.isInteger(readyState) ? readyState : 0
+    };
+}
+
 // ===================== attach（唯一挂接点）=====================
 let attachmentResult = null;
 let attachmentError = null;
@@ -323,6 +334,9 @@ function attach({
     validateOnBoot();
     registerModels(mongoose, models);
     if (helpers.uploadDir) CONFIG.uploadDir = path.resolve(helpers.uploadDir);
+    const superMapGateway = options.superMapGateway || createSuperMapGateway({
+        logger: helpers.gisLogger || console
+    });
 
     try {
         // 宿主能力注入：微信模板/邮件/OCR（独立模式为空 → 自动降级）
@@ -339,29 +353,57 @@ function attach({
         app.use('/api/checkin', require('./routes/checkin'));
         app.use('/api/pairing', pairingRouter);
         app.use('/api/guide', guideRouter);
+        app.get('/api/admin/geosync/gis/status', requireAdmin, wrap(async (req, res) => {
+            const status = await superMapGateway.getStatus({
+                force: req.query.force === 'true' || req.query.refresh === 'true',
+                requestId: req.headers['x-request-id']
+            });
+            res.json({ success: true, code: 0, data: status, message: '' });
+        }));
         app.use('/api/admin/geosync', require('./routes/admin'));
         app.get('/api/screen/stream', screenOrAdmin, sseHandler);
         if (mountUploads) app.use('/uploads', express.static(CONFIG.uploadDir));
         if (CONFIG.simMode) app.use('/api/sim', simRouter());
 
         // 健康端点（08文档 §4）
-        app.get('/api/geosync/health', (req, res) => {
+        app.get('/api/geosync/health', wrap(async (req, res) => {
             const snap = crowdService.getHeatmapSnapshot();
-            res.json({
+            const mongo = mongoStatusOf(mongoose);
+            const gis = await superMapGateway.getStatus({ requestId: req.headers['x-request-id'] });
+            const diagnostics = superMapGateway.getDiagnostics();
+            const coreAvailable = mongo.state === 'online';
+            res.status(coreAvailable ? 200 : 503).json({
                 graphLoaded: walkGraph.isReady(),
                 jobsRunning: startBackground,
                 lastCiSlot: snap?.slot || null,
                 rainSource: CONFIG.features.rain ? 'minute' : CONFIG.features.weather ? 'hourly' : 'off',
                 llm: CONFIG.features.guide,
-                simMode: CONFIG.simMode
+                simMode: CONFIG.simMode,
+                mongo,
+                gis,
+                manifest: gis.manifest,
+                cache: {
+                    routeCount: diagnostics.routeCacheSize,
+                    lastInvalidationReason: diagnostics.lastInvalidationReason
+                },
+                lastSuccessfulGisAt: diagnostics.lastSuccessAt
             });
-        });
+        }));
 
         // client-config features 注入（前端降级链读取）
         app.get('/api/geosync/client-config', (req, res) => {
+            const gis = superMapGateway.getPublicConfig();
             res.json({
                 success: true, code: 0, message: '',
-                data: { scenicId: CONFIG.scenicId, scenicCenter: CONFIG.scenicCenter, features: CONFIG.features }
+                data: {
+                    scenicId: CONFIG.scenicId,
+                    scenicCenter: CONFIG.scenicCenter,
+                    features: {
+                        ...CONFIG.features,
+                        supermap: Boolean(gis.enabled && gis.features?.supermap)
+                    },
+                    gis
+                }
             });
         });
 
@@ -374,6 +416,12 @@ function attach({
         engine.init();
 
         const readiness = [];
+        readiness.push(superMapGateway.getStatus({ refresh: true }).then(status => {
+            if (status.state === 'offline') {
+                console.warn('[GeoSync] [GIS] offline at startup', status.error?.code || 'ISERVER_OFFLINE');
+            }
+            return status;
+        }));
         if (startBackground) {
             startSseLoops();
             startJobs();
@@ -390,6 +438,7 @@ function attach({
         attachmentResult = {
             attached: true,
             backgroundStarted: startBackground,
+            superMapGateway,
             readiness: Promise.allSettled(readiness)
         };
         console.log(`[GeoSync] attached — routes/socket ready, background=${startBackground}`);

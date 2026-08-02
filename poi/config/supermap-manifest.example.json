@@ -1,0 +1,81 @@
+{
+  "contractVersion": "1.0.0",
+  "dataVersion": "example-data-v1",
+  "scenicId": "example_scenic",
+  "crs": "EPSG:4326",
+  "center": [0, 0],
+  "extent": [-0.02, -0.02, 0.02, 0.02],
+  "services": {
+    "map": {
+      "enabled": true,
+      "path": "/services/example-map",
+      "operations": {
+        "status": { "method": "GET", "path": "/status" }
+      }
+    },
+    "data": {
+      "enabled": true,
+      "path": "/services/example-data",
+      "operations": {
+        "status": { "method": "GET", "path": "/status" },
+        "queryFeatures": { "method": "POST", "path": "/features/query" }
+      }
+    },
+    "network": {
+      "enabled": true,
+      "path": "/services/example-network",
+      "operations": {
+        "status": { "method": "GET", "path": "/status" },
+        "findPath": { "method": "POST", "path": "/routes/find" },
+        "findPathWithBarriers": { "method": "POST", "path": "/routes/find-with-barriers" }
+      }
+    },
+    "terrain": {
+      "enabled": false,
+      "operations": {}
+    },
+    "scene": {
+      "enabled": false,
+      "operations": {}
+    }
+  },
+  "datasets": {
+    "poi": {
+      "service": "data",
+      "name": "ExamplePoi@ExampleDatasource",
+      "fields": ["SmID", "poi_id", "name", "category", "capacity"],
+      "propertyMap": {
+        "poi_id": "poiId",
+        "name": "name",
+        "category": "category",
+        "capacity": "capacity"
+      }
+    },
+    "walkEdge": {
+      "service": "data",
+      "name": "ExampleWalkEdge@ExampleDatasource",
+      "fields": ["SmID", "edge_id", "source_id", "accessible", "shade_ratio"],
+      "propertyMap": {
+        "edge_id": "edgeId",
+        "source_id": "sourceId",
+        "accessible": "accessible",
+        "shade_ratio": "shadeRatio"
+      }
+    }
+  },
+  "limits": {
+    "maxFeatures": 500
+  },
+  "public": {
+    "features": {
+      "supermap": true,
+      "threeD": false,
+      "replay": false,
+      "rain": false,
+      "guide": false
+    },
+    "services": {
+      "map": "/config/public-map-url"
+    }
+  }
+}

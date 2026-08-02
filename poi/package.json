@@ -10,7 +10,7 @@
     "test": "node --test geosync/test/unit/*.test.js test/*.test.js",
     "test:geosync": "node --test geosync/test/unit/*.test.js",
     "test:integration": "node --test test/*.test.js",
-    "check:syntax": "node --check server.js && node --check init-admin.js && node --check geosync/index.js && node --check geosync/standalone.js && node --check geosync/jobs/index.js && node --check geosync/sim/crowd-sim.js && node --check test/single-service.test.js"
+    "check:syntax": "node --check server.js && node --check init-admin.js && node --check geosync/index.js && node --check geosync/standalone.js && node --check geosync/jobs/index.js && node --check geosync/sim/crowd-sim.js && node --check geosync/integrations/supermap/index.js && node --check geosync/integrations/supermap/gateway.js && node --check geosync/integrations/supermap/httpClient.js && node --check geosync/integrations/supermap/manifest.js && node --check geosync/integrations/supermap/normalizers.js && node --check geosync/integrations/supermap/mockHttpClient.js && node --check geosync/integrations/supermap/errors.js && node --check test/single-service.test.js"
   },
   "dependencies": {
     "@alicloud/ocr-api20210707": "^3.1.3",
