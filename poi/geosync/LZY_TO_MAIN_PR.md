@@ -41,8 +41,30 @@ GeoSync is attached through dependency injection before static files and before
 - Add authenticated GIS status and route-test administration endpoints.
 - Persist closure metadata, route provenance, barrier proposal metadata, and
   proposal lifecycle records.
+- Extend the existing host POI schema before model compilation with validated
+  WGS84 GeoJSON, structured visit metadata, deferred GIS references, and the
+  required geospatial/review indexes without replacing the legacy collection.
+- Add a dry-run-first, conditional, idempotent POI geo/visit migration with
+  concurrent-change protection and explicit deferred-authority counts.
 - Add a dry-run-first, conditional, idempotent SuperMap WalkEdge `sourceRef`
   migration using explicit authoritative mappings only.
+- Track MongoDB, graph, POI-index, and scheduler readiness independently. Health
+  returns 503 for pending/failed core startup but remains 200 when only GIS is
+  degraded or offline.
+- Remove the scheduled empty `trailMining` placeholder and report actual primary,
+  non-primary, or explicitly disabled job state.
+- Restrict itinerary proposal/progress Socket payloads to documented public
+  fields; full OpenIDs, tokens, raw proposals, routes, and barrier mappings stay
+  internal.
+- Remove the plaintext `init-admin.js` path and disconnected `AdminUser` model;
+  administrator identity is environment/session based.
+- Harden production delivery so Nginx proxies public files through the Node
+  allowlist instead of exposing `/opt/poi`, aligns TLS preflight paths with the
+  active Let's Encrypt configuration, fixes the deployment directory contract,
+  and enforces Node.js 20 or newer.
+- Complete the placeholder-only environment template for background jobs,
+  reroute/alert notification channels, tuning, optional providers, upload paths,
+  and development-only simulation controls.
 - Preserve the existing POI endpoints and single-process startup behavior.
 
 ## API and Event Contracts
@@ -72,6 +94,10 @@ Allowed proposal lifecycle statuses are `shown`, `accepted`, `rejected`,
 - Route and stop schemas persist geometry, distance, duration, GIS provenance,
   segments, snap metadata, accessibility verification, and `pathGeometry`.
 - WalkEdge persists `sourceRef`, `closedReason`, and `closedAt`.
+- The host POI model adds optional `geo`, `visitMeta`, `gateNodeId`, and
+  `superMapRef`. `visitMeta.openHours` follows the established planner/data-model
+  array contract of validated `{start, end}` `HH:mm` windows; the conflicting
+  single-String documentation example is not used.
 - Barrier proposals and reroute log entries persist proposal/event IDs, edge ID,
   barrier fingerprint, lifecycle status, and decision metadata.
 - `.env.example` contains placeholder-only SuperMap configuration; blank
@@ -79,7 +105,7 @@ Allowed proposal lifecycle statuses are `shown`, `accepted`, `rejected`,
   bounded user, administrator, and screen session lifetimes.
 - `poi/config/supermap-manifest.example.json` is a placeholder contract only.
 
-The migration mapping format is an explicit JSON array of:
+The WalkEdge migration mapping format is an explicit JSON array of:
 
 ```text
 {edgeId, datasetName, smId, sourceId?, dataVersion}
@@ -87,6 +113,9 @@ The migration mapping format is an explicit JSON array of:
 
 Dry-run is the default. Apply mode requires both `--apply` and an explicitly
 configured `MONGO_URI`. No GIS identifiers or versions are derived from edge IDs.
+The POI migration follows the same dry-run-first policy, reports
+`total/success/skipped/failed` plus deferred `gateNodeId` and `superMapRef`
+counts, and refuses to overwrite a record changed after planning.
 
 ## Verification Commands
 
@@ -104,15 +133,17 @@ Evidence captured on August 2, 2026:
 
 - `check:syntax`: passed.
 - Legacy root GeoSync suite before removal: 67 passed, 0 failed.
-- GeoSync unit suite: 302 passed, 0 failed.
-- Single-service integration suite: 3 passed, 0 failed.
-- Combined unit and integration suite: 305 passed, 0 failed.
+- GeoSync unit suite: 327 passed, 0 failed.
+- Integration suite: 13 passed, 0 failed.
+- Combined unit and integration suite: 340 passed, 0 failed.
 - Production dependency audit: failed with 14 package findings, including 4
   high, 10 moderate, 0 low, and 0 critical.
 
 ## Security Review
 
 - No default administrator token remains.
+- No plaintext administrator initializer or disconnected administrator database
+  model remains.
 - Production requires signed user identity; legacy `X-Open-Id` compatibility is
   available only when explicitly enabled outside production.
 - User and administrator sessions are signed, expiring, and transported through
@@ -154,14 +185,22 @@ Evidence captured on August 2, 2026:
   administrator tokens, and MongoDB URI.
 - Dataset/field allowlists and bounded feature counts are manifest-controlled.
 - Request IDs and GIS logs are sanitized; raw upstream responses are not logged.
+- Nginx cannot serve `.env`, application source, package metadata, GeoSync
+  internals, or PM2 logs directly; only the dedicated uploads alias bypasses Node.
+- The development-only standalone entry logs connection state and sanitized error
+  codes without printing the MongoDB endpoint or query options.
 - Accessible routing cannot use unverified local fallback.
 - Migration output omits credentials, MongoDB URI, and raw database errors.
+- Public itinerary Socket events use explicit allowlists and omit full OpenIDs,
+  capacity token IDs, raw proposal payloads, raw routes, and barrier mappings.
 
 ## Degradation and Recovery
 
 - Missing or incompatible manifest: main service starts, GIS is `offline`.
 - Partial GIS service availability: health remains HTTP 200 with GIS `degraded`
-  when MongoDB is online.
+  when MongoDB and required startup components are ready.
+- Pending/failed graph or POI-index initialization: health is HTTP 503 with
+  component-level status; actual scheduler state is reported separately.
 - Timeout with route cache: `source=cache`, `degraded=true`.
 - Trusted normal/shade local route: `source=local-fallback`, `degraded=true`.
 - Unverified accessible local route: explicit `8204` failure.
@@ -225,9 +264,11 @@ health interpretation, error handling, and application rollback.
   boundaries, so remediation or an approved time-bounded exception is required
   before production release. Do not apply forced or major upgrades without
   focused compatibility work and the full regression.
-- `git ls-remote` and `git push --dry-run origin LZY` succeeded on August 2, 2026.
-  The `gh` executable is unavailable, so automated PR creation remains blocked;
-  use an approved GitHub web/API workflow if it is not installed before delivery.
+- The final verified branch was pushed to `origin/LZY` on August 2, 2026, and
+  GitHub Pull Request #1 was opened from `LZY` to `main` through an approved API
+  workflow. The `gh` executable remains unavailable, but it is no longer a
+  delivery blocker. This pull request must remain the review and merge boundary;
+  do not push or merge `main` directly.
 
 ## Rollback Plan
 
@@ -255,4 +296,9 @@ health interpretation, error handling, and application rollback.
   reviewer authorization, query/body credential rejection, and signed Socket
   room derivation without query-only identity fallback.
 - Verify migration apply remains explicit, conditional, idempotent, and sanitized.
+- Verify host POI schema/index compatibility, strict opening-hour validation, and
+  concurrent-change-safe POI migration behavior.
+- Verify health distinguishes core readiness from GIS degradation and reports
+  actual scheduler state without an empty scheduled job.
+- Verify proposal/progress Socket payloads contain only documented public fields.
 - Verify the final combined regression is green after all concurrent edits stop.

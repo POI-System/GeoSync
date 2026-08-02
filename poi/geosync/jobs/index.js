@@ -200,7 +200,8 @@ async function spotScoreDaily() {
     const todayStr = geo.dateStrOf(today);
 
     for (const spot of spots) {
-        const result = sunlight.computeWindows(spot, today, null); // TODO(P5)：接天气后传 {cloudy}
+        // Null keeps the documented no-weather correction without provider context.
+        const result = sunlight.computeWindows(spot, today, null);
         spot.goldenWindows = result.windows.map(w => ({
             date: todayStr, start: w.start, end: w.end, light: w.light,
             trueSunset: w.trueSunset || undefined
@@ -373,30 +374,51 @@ async function minuteSweep() {
 }
 
 // ===== 注册 =====
-function startJobs() {
+function startJobs(options = {}) {
+    const env = options.env || process.env;
+    const scheduler = options.scheduler || cron;
+    const crowd = options.crowdService || crowdService;
+    const logger = options.logger || console;
+    const setTimeoutFn = options.setTimeoutFn || setTimeout;
     // PM2 cluster 下仅实例0跑 cron（01文档 §7）
-    const inst = process.env.NODE_APP_INSTANCE;
+    const inst = env.NODE_APP_INSTANCE;
     if (inst !== undefined && inst !== '0') {
-        console.log('[GeoSync] [JOBS] non-primary instance, cron disabled');
-        return;
+        logger.log('[GeoSync] [JOBS] non-primary instance, cron disabled');
+        return {
+            enabled: false,
+            running: false,
+            reason: 'non-primary-instance',
+            instance: String(inst),
+            scheduledJobs: []
+        };
     }
-    cron.schedule('*/10 * * * *', () => runJob('ciAggregate', ciAggregate));
-    cron.schedule('*/10 * * * *', () => runJob('rainPoll', () => rainService.poll()));
-    cron.schedule('*/10 * * * *', () => runJob('pairingScan', async () => {
+
+    const scheduledJobs = [];
+    const schedule = (name, expression, fn) => {
+        scheduler.schedule(expression, fn);
+        scheduledJobs.push(name);
+    };
+    schedule('ciAggregate', '*/10 * * * *', () => runJob('ciAggregate', ciAggregate));
+    schedule('rainPoll', '*/10 * * * *', () => runJob('rainPoll', () => rainService.poll()));
+    schedule('pairingScan', '*/10 * * * *', () => runJob('pairingScan', async () => {
         const n = await pairingService.scan();
         if (n) console.log(`[JOB] pairingScan created ${n} pairings`);
     }));
-    cron.schedule('30 3 * * *', () => runJob('spotScoreDaily', spotScoreDaily));
-    cron.schedule('0 4 * * *', () => runJob('rhoCalibrate', rhoCalibrate));
-    cron.schedule('* * * * *', () => runJob('minuteSweep', minuteSweep));
-    // trailMining（0 2 * * *）：P5 实现，先注册占位
-    cron.schedule('0 2 * * *', () => runJob('trailMining', async () => {
-        // TODO(P5)：05文档 §trailMining —— 轨迹地图匹配 + 无障碍实证 + DBSCAN 修路
-    }));
-    crowdService.startFlushLoop();
+    schedule('spotScoreDaily', '30 3 * * *', () => runJob('spotScoreDaily', spotScoreDaily));
+    schedule('rhoCalibrate', '0 4 * * *', () => runJob('rhoCalibrate', rhoCalibrate));
+    schedule('minuteSweep', '* * * * *', () => runJob('minuteSweep', minuteSweep));
+    crowd.startFlushLoop();
     // 启动即跑一轮聚合（避免冷启动 heatmap 空窗）
-    setTimeout(() => runJob('ciAggregate', ciAggregate), 5000);
-    console.log('[GeoSync] [JOBS] cron started');
+    const warmupTimer = setTimeoutFn(() => runJob('ciAggregate', ciAggregate), 5000);
+    warmupTimer?.unref?.();
+    logger.log('[GeoSync] [JOBS] cron started');
+    return {
+        enabled: true,
+        running: true,
+        reason: null,
+        instance: inst === undefined ? null : String(inst),
+        scheduledJobs
+    };
 }
 
 module.exports = {

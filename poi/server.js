@@ -11,6 +11,7 @@ const multer = require('multer');
 const nodemailer = require('nodemailer');
 const { Server } = require('socket.io');
 const geosync = require('./geosync');
+const { addHostPoiGeoSyncFields } = require('./geosync/services/hostPoiSchema');
 const { OAuthStateStore } = require('./geosync/services/oauthState');
 const { serializePublicPoi } = require('./geosync/services/publicPoiProjection');
 const { createHostSocketRoomSync } = require('./geosync/services/hostSocketRooms');
@@ -198,12 +199,6 @@ const oauthIssueLimiter = createFixedWindowRateLimiter({
     maxAttempts: 20
 });
 
-const adminUserSchema = new mongoose.Schema({
-    username: { type: String, required: true, unique: true, trim: true },
-    password: { type: String, required: true }
-});
-const AdminUser = mongoose.model('AdminUser', adminUserSchema);
-
 const poiSchema = new mongoose.Schema({
     poiName: { type: String, required: true, trim: true },
     category: { type: String, default: '待分类', trim: true },
@@ -216,6 +211,7 @@ const poiSchema = new mongoose.Schema({
     rejectReason: { type: String, default: '' },
     createTime: { type: Date, default: Date.now }
 });
+addHostPoiGeoSyncFields(poiSchema);
 const POI = mongoose.model('POI', poiSchema);
 
 const notificationSchema = new mongoose.Schema({
@@ -905,13 +901,17 @@ async function broadcastNotification({ audience = 'all', title, content, type = 
     const created = await Notification.insertMany(docs, { ordered: false });
     const notifications = created.map(serializeNotification);
     publishAnnouncementRefresh(io, notifications, targetAudience);
-    await Promise.allSettled(uniqueOpenIds.map(openId =>
+    const deliveries = await Promise.allSettled(uniqueOpenIds.map(openId =>
         sendTemplate(openId, CONFIG.wechat.templates.adminNotice, buildTemplateData({
             title: title || '管理员公告',
             content,
             time: formatDateTime(new Date())
         }))
     ));
+    const failedDeliveries = deliveries.filter(result => result.status === 'rejected').length;
+    if (failedDeliveries) {
+        console.warn(`[Template] ${failedDeliveries}/${deliveries.length} announcement deliveries failed`);
+    }
     return { audience: targetAudience, count: notifications.length, notifications };
 }
 

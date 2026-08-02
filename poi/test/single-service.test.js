@@ -122,10 +122,18 @@ test('POI server contains one production runtime and attaches GeoSync before lis
     );
 
     const requireAt = source.indexOf("require('./geosync')");
+    const poiSchemaExtensionAt = source.indexOf('addHostPoiGeoSyncFields(poiSchema)');
+    const poiModelAt = source.indexOf("mongoose.model('POI', poiSchema)");
     const attachAt = source.indexOf('geosync.attach({');
     const staticAt = source.indexOf('app.use(express.static(__dirname');
     const listenAt = source.indexOf('server.listen(');
     assert.ok(requireAt >= 0, 'GeoSync must be loaded from poi/geosync');
+    assert.ok(
+        poiSchemaExtensionAt > requireAt && poiModelAt > poiSchemaExtensionAt,
+        'the host POI schema must receive GeoSync fields before model compilation'
+    );
+    assert.doesNotMatch(source, /mongoose\.model\(['"]AdminUser['"]|adminUserSchema/,
+        'the runtime must not compile a disconnected administrator credential store');
     assert.ok(attachAt > requireAt, 'GeoSync must be attached after it is loaded');
     assert.ok(attachAt < staticAt, 'GeoSync API routes must be mounted before static files');
     assert.ok(attachAt < listenAt, 'GeoSync must be attached before server.listen');
@@ -136,7 +144,7 @@ test('POI server contains one production runtime and attaches GeoSync before lis
     );
     assert.match(
         geosyncSource,
-        /app\.get\('\/api\/geosync\/health', wrap\(async/,
+        /app\.get\('\/api\/geosync\/health', wrap\(createHealthHandler\(/,
         'GeoSync health must use the async route error boundary'
     );
 });

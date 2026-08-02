@@ -64,7 +64,8 @@ router.get('/:id/golden', wrap(async (req, res) => {
     const spot = await PhotoSpot.findById(req.params.id).lean();
     if (!spot || spot.status !== 'approved') throw new BizError(4101, '机位不存在或未过审', 404);
 
-    const result = sunlight.computeWindows(spot, new Date(), null); // TODO(P5)：天气修正
+    // Null keeps the documented no-weather correction without provider context.
+    const result = sunlight.computeWindows(spot, new Date(), null);
     if (!result.windows.length && !result.cloudy) {
         return fail(res, 400, 4102, '今日无光位窗口');
     }

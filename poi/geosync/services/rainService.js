@@ -1,6 +1,6 @@
 'use strict';
-// v2.1 创新点③ 降雨临近预报事件源 + 04文档 §3.3。
-// 彩云天气 API 对接为 TODO 接口位，判定逻辑已完整实现（可用 mock 数据测试）。
+// Minutely rain events use the configured provider probability-array contract.
+// No unconfigured hourly source is invented when that provider is unavailable.
 
 const axios = require('axios');
 const { CONFIG } = require('../config');
@@ -8,11 +8,10 @@ const { getModels } = require('../models');
 const bus = require('../lib/eventBus');
 
 let consecutiveFails = 0;
-let silencedDate = null; // 连续误报当日静默
 
 /**
  * 拉取未来2h逐分钟降雨概率曲线。
- * TODO(P4)：按所选供应商响应结构调整解析。彩云 v2.6 minutely 示例：
+ * Configured-provider example:
  *   GET {RAIN_API_URL}/{lng},{lat}/minutely → result.minutely.probability [每分钟0~1 ×120]
  */
 async function fetchMinutely() {
@@ -51,8 +50,6 @@ function judge(probCurve, currentState) {
 // jobs/rainPoll 每10min调用
 async function poll() {
     const { GeoSetting } = getModels();
-    const today = new Date().toDateString();
-    if (silencedDate === today) return;
 
     let curve = null;
     try {
@@ -60,9 +57,12 @@ async function poll() {
         consecutiveFails = 0;
     } catch (e) {
         consecutiveFails++;
-        console.error(`[GeoSync] [RAIN] fetch failed (${consecutiveFails}):`, e.message);
-        if (consecutiveFails >= 3) {
-            // TODO(P4)：降级到小时级天气 API 粗判（10.2 降级矩阵）
+        const code = /^[A-Z0-9_:-]{1,64}$/.test(String(e?.code || ''))
+            ? e.code
+            : 'RAIN_FETCH_FAILED';
+        console.error(`[GeoSync] [RAIN] fetch failed (${consecutiveFails}):`, code);
+        if (consecutiveFails === 3) {
+            console.error('[GeoSync] [RAIN] minutely source unavailable; no hourly fallback configured');
         }
         return;
     }

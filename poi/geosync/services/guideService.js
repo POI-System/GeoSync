@@ -23,7 +23,7 @@ async function getGuide(poiId, daypart = null) {
     const { AiGuideCache, ExternalPoi } = getModels();
     const season = seasonOf();
     const dp = daypart || daypartOf();
-    const weatherKind = 'any'; // TODO(P6)：接天气 API 后细分 sunny/rainy/cloudy
+    const weatherKind = 'any'; // Cache remains weather-neutral without provider context.
 
     const cached = await AiGuideCache.findOneAndUpdate(
         { poiId, season, daypart: dp, weatherKind },

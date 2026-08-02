@@ -15,7 +15,7 @@ const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/poi';
 
 async function main() {
     await mongoose.connect(MONGO_URI);
-    console.log('[GeoSync] [DB] connected', MONGO_URI.replace(/\/\/[^@]*@/, '//***@'));
+    console.log('[GeoSync] [DB] connected');
 
     const app = express();
     app.use(express.json({ limit: '1mb' }));
@@ -37,6 +37,9 @@ async function main() {
 }
 
 main().catch(e => {
-    console.error('[GeoSync] boot failed:', e);
+    const code = /^[A-Z0-9_:-]{1,64}$/.test(String(e?.code || ''))
+        ? e.code
+        : 'STANDALONE_BOOT_FAILED';
+    console.error('[GeoSync] boot failed:', code);
     process.exit(1);
 });

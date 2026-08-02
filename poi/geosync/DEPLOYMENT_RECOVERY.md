@@ -60,16 +60,33 @@ files and before `server.listen(...)`. GeoSync reuses the host POI, user model,
 authentication identity, Mongoose instance, Socket.io instance, mail/template
 helpers, and OCR helper.
 
+The reviewed production topology is fixed at `/opt/poi`; `deploy.sh`, PM2, and
+Nginx intentionally use the same path. Do not override the deployment directory
+without updating and reviewing all three configurations together. Deployment
+enforces Node.js 20 or newer and validates the same Let's Encrypt certificate and
+key paths loaded by `nginx.conf` before reloading Nginx.
+
+Nginx serves only `/uploads/` directly from its dedicated alias. All pages and
+other public assets are proxied to Node so the server's extension allowlist and
+backend-file denial remain authoritative. `/opt/poi` must never be configured as
+an Nginx document root; `.env`, source, packages, GeoSync internals, and logs must
+remain unreachable over HTTP.
+
 `poi/geosync/standalone.js` is not the production entry point. It may be used for
 isolated development only. Do not run it beside `poi/server.js` in production.
 
 `poi/geosync` is the only tracked GeoSync implementation. The obsolete tracked
 root `geosync/` copy was removed only after its original suite passed 67/67 and
-the migrated single-service tree passed the final 305/305 regression.
+the migrated single-service tree passed the final regression recorded in the
+pull request.
 
 Background jobs are enabled unless `GEOSYNC_BACKGROUND_ENABLED=false`. Production
-normally leaves them enabled. The health response exposes `jobsRunning` so an
-operator can verify the selected mode.
+normally leaves them enabled. Graph and POI-index initialization are core startup
+work and run independently of that cron toggle. Health remains HTTP 503 while
+either component is pending or after either component fails. `jobsRunning`
+reflects the scheduler's actual result, while the `jobs` object distinguishes a
+running primary instance, intentional `background-disabled`, and intentional
+`non-primary-instance` disablement.
 
 ## 3. Configuration and Secret Handling
 
@@ -78,11 +95,16 @@ values. Supply production values through the deployment secret/configuration
 system. Never commit `.env`, a populated manifest, passwords, tokens, private
 service URLs, licenses, or migration mapping files.
 
+The template includes background-mode, notification, provider, tuning, upload,
+and simulator controls. Blank optional provider values disable their feature.
+`SIM_MODE=true` remains development-only and is rejected during production boot.
+
 Core production configuration includes:
 
 - `MONGO_URI`: the shared POI/GeoSync MongoDB database.
-- `ADMIN_USERNAME`, `ADMIN_PASSWORD`, and `ADMIN_TOKEN`: all must be configured
-  for administrator login and protected GeoSync administration endpoints.
+- `ADMIN_USERNAME` and `ADMIN_PASSWORD`: required for administrator login.
+- `ADMIN_TOKEN`: optional. When supplied it must be a separate strong opaque
+  Bearer credential; it is never accepted in query strings or request bodies.
 - `AUTH_SESSION_SECRET`: an independent random secret containing at least 32
   bytes. Keep the repository template blank, do not reuse an API credential, and
   inject the production value through the deployment secret manager.
@@ -120,6 +142,27 @@ Core production configuration includes:
   `*`, plus out-of-range numeric values, fall back to `loopback`; do not rely on
   them as configuration. Trusting arbitrary upstream addresses would let clients
   spoof forwarding headers and evade per-network throttles.
+
+The obsolete `poi/init-admin.js` plaintext database initializer and its
+disconnected `AdminUser` model have been removed. Administrator credentials now
+come only from the deployment secret system and signed session flow. Rotate them
+through the secret system and restart the service; do not recreate a plaintext
+administrator collection or commit credential bootstrap scripts.
+
+### Host POI Schema Contract
+
+The existing host `POI` model remains the authoritative `pois` collection. The
+GeoSync extension is applied before model compilation and adds optional WGS84
+GeoJSON `geo`, structured `visitMeta`, `gateNodeId`, and `superMapRef` fields
+without replacing the legacy collection or review workflow.
+
+`visitMeta.openHours` uses the existing planner-compatible contract from the POI
+data-model specification: an array of `{start, end}` windows. The single `String`
+example in the backend-interface document conflicts with that established
+contract and is not used. Each present window requires zero-padded, valid
+24-hour `HH:mm` values; incomplete entries and values such as `24:00` are
+rejected. An optional `geo` value, when present, must contain a complete WGS84
+`Point` with `[lng, lat]` coordinates.
 
 SuperMap server-side configuration includes:
 
@@ -304,14 +347,54 @@ release commit, manifest `dataVersion`, mapping file checksum, operator, and
 timestamp in the deployment change record. Do not put the backup or mapping file
 inside the Git repository.
 
-Create indexes only under the deployment change procedure:
+Set `MONGO_URI` through the deployment secret system, then create indexes only
+under the deployment change procedure:
 
 ```powershell
-& 'D:\nodejs\node.exe' geosync\scripts\init-indexes.js
+& 'D:\nodejs\npm.cmd' run init:indexes
 ```
 
-The legacy `migrate-poi-geo.js` script is apply-only. It must not be used against
-production until a separately reviewed dry-run and recovery procedure exists.
+The index runner refuses to connect without an explicit `MONGO_URI`, disables
+implicit `autoIndex` and `autoCreate`, and deliberately creates the host POI
+`geo` 2dsphere index plus the `{status, visitMeta.tags}` review/tag index. The
+deployment script runs this gate before reloading the application.
+
+### Host POI GeoSync Migration
+
+The POI migration backfills only derivable `geo` and `visitMeta` values. Dry-run
+is the default and requires an explicitly configured `MONGO_URI`:
+
+```powershell
+& 'D:\nodejs\npm.cmd' run migrate:poi-geo:dry-run
+```
+
+Review `total`, `success`, `skipped`, `failed`, `gateNodeIdDeferred`,
+`superMapRefDeferred`, and every sanitized per-POI error. `success` in dry-run is
+the number of records that would be updated. The tool never invents
+`gateNodeId`, dataset names, `smId`, or `dataVersion`; deferred counts must be
+resolved from authoritative GIS data through the separate mapping workflow.
+
+After backup, review, and explicit database-change approval, apply with:
+
+```powershell
+& 'D:\nodejs\npm.cmd' run migrate:poi-geo:apply
+```
+
+Apply uses conditional snapshots of every field being changed and of source
+fields such as `location` and `category`. A concurrent edit is reported as
+`CONCURRENT_CHANGE` rather than overwritten. Rerunning after success is
+idempotent and should report `success=0`, `skipped=total`, and `failed=0` for the
+derivable fields. Exit codes are:
+
+- `0`: no failures.
+- `1`: runtime or database failure.
+- `2`: CLI or required-input failure.
+- `3`: processing completed with one or more per-POI failures.
+
+Recovery uses the verified pre-migration MongoDB snapshot. Because the migration
+is additive and conditional, partial success should normally be handled by
+repairing invalid or concurrently changed records and rerunning; do not delete
+new fields broadly or fabricate deferred authoritative mappings.
 
 ## 6. SuperMap WalkEdge sourceRef Migration
 
@@ -398,10 +481,11 @@ Health status interpretation:
 
 | Condition | HTTP | GIS state | Operator meaning |
 |---|---:|---|---|
-| MongoDB online and all required GIS services online | 200 | `online` | Core and GIS available |
-| MongoDB online and only part of GIS is available | 200 | `degraded` | Core stays available; inspect service states |
-| MongoDB online and GIS disabled/unavailable | 200 | `offline` | Core stays available; GIS requests may degrade or fail |
-| MongoDB connecting/offline/disconnecting | 503 | any | Service is not ready for traffic |
+| MongoDB, graph, and POI index ready; required GIS services online | 200 | `online` | Core and GIS available |
+| Core ready and only part of GIS is available | 200 | `degraded` | Core stays available; inspect service states |
+| Core ready and GIS disabled/unavailable | 200 | `offline` | Core stays available; GIS requests may degrade or fail |
+| MongoDB connecting or core startup pending | 503 | any | Keep traffic out until readiness settles |
+| MongoDB offline/disconnecting or graph/POI-index/job startup failed | 503 | any | Core is not ready; inspect `startup.components` and sanitized logs |
 
 For route smoke tests, exercise `normal`, `accessible`, and `shade`. A successful
 route must contain canonical WGS84 GeoJSON `LineString` geometry, meters, seconds,
@@ -425,6 +509,8 @@ and representative raw responses.
 | Contract/dataVersion mismatch | HTTP/code `8205`; cache must not be trusted | Align manifest, network publication, and sourceRef mapping |
 | Invalid upstream geometry | HTTP/code `8206` | Capture a sanitized representative response for adapter work |
 | MongoDB unavailable | Health HTTP 503 | Remove traffic, restore database connectivity, then recheck |
+| Graph or POI index startup pending/failed | Health HTTP 503 with component state | Repair database/index data or startup configuration, restart, and wait for readiness |
+| Jobs requested but scheduler failed | Health HTTP 503 and `jobs.state=failed` | Repair scheduler startup; non-primary/background-disabled states are intentional and named |
 | `AUTH_SESSION_SECRET` missing or unsafe | Session issuance/authentication fails closed; login may return HTTP 503 | Inject an independent random secret of at least 32 bytes and restart |
 | `SCREEN_TOKEN` missing or unsafe | Opaque `X-Screen-Token` access is rejected; the signed administrator-issued screen session remains available | Configure a distinct strong token only if non-cookie header access is operationally required |
 | Signed screen session expired | Screen-only request returns HTTP 403 | Authenticate as an administrator and issue a new bounded screen session; do not reuse or extend the expired cookie client-side |
@@ -481,12 +567,11 @@ Real iServer integration remains blocked until all of the following are supplied
 - The authoritative WalkEdge `edgeId` to `datasetName + smId` mapping with the
   matching `dataVersion`.
 
-As of August 2, 2026, `git ls-remote` and `git push --dry-run origin LZY` both
-succeeded, so GitHub network access and push authentication are currently
-available. The GitHub CLI (`gh`) is not installed, so automated PR creation from
-this environment is blocked. The final push must wait for an explicit commit and
-the final green combined regression. Create the `LZY` to `main` PR through an
-approved GitHub web/API workflow if `gh` remains unavailable.
+As of August 2, 2026, the final verified branch was pushed to `origin/LZY` and
+GitHub Pull Request #1 was opened from `LZY` to `main` through an approved API
+workflow. The GitHub CLI (`gh`) remains unavailable, but it is no longer a
+delivery blocker. Do not push or merge `main` directly; the open pull request
+must remain the review and merge boundary.
 
 Production dependency remediation also remains open. The active application
 dependency graph has 14 findings, including 4 high-severity findings in

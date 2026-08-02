@@ -111,7 +111,9 @@ async function runCli({
     stdout = process.stdout,
     stderr = process.stderr,
     fileSystem = fs,
-    mongooseInstance = mongoose
+    mongooseInstance = mongoose,
+    registerModelsFn = registerModels,
+    runMigrationFn = runSuperMapRefMigration
 } = {}) {
     let connected = false;
     try {
@@ -129,12 +131,18 @@ async function runCli({
         }
 
         const mappings = readMappings(args.mappingPath, fileSystem);
+        if (typeof mongooseInstance.set === 'function') {
+            mongooseInstance.set('autoIndex', false);
+            mongooseInstance.set('autoCreate', false);
+        }
         await mongooseInstance.connect(explicitUri || DEFAULT_DRY_RUN_URI, {
-            serverSelectionTimeoutMS: 5000
+            serverSelectionTimeoutMS: 5000,
+            autoIndex: false,
+            autoCreate: false
         });
         connected = true;
-        const { WalkEdge } = registerModels(mongooseInstance);
-        const result = await runSuperMapRefMigration({
+        const { WalkEdge } = registerModelsFn(mongooseInstance);
+        const result = await runMigrationFn({
             WalkEdge,
             mappings,
             apply: args.apply

@@ -197,25 +197,15 @@ async function serialize(it) {
             ? serializedRouteFields(it.route)
             : aggregateRouteFromStops(it.stops, it.preferences),
         currentStopId: cur?._id || null,
-        pendingProposal: it.pendingProposal?.proposalId ? {
-            proposalId: it.pendingProposal.proposalId,
-            type: it.pendingProposal.type,
-            reason: it.pendingProposal.reason,
-            gainMin: it.pendingProposal.gainMin,
-            expireAt: it.pendingProposal.expireAt,
-            diff: buildDiff(it)
-        } : null,
+        pendingProposal: it.pendingProposal?.proposalId
+            ? engine.publicProposalView(
+                it.pendingProposal,
+                engine.proposalDiff(it, it.pendingProposal)
+            )
+            : null,
         savedMinutesTotal: it.savedMinutesTotal,
         rerouteCount: it.rerouteCount
     };
-}
-
-function buildDiff(it) {
-    const newStops = engine.applyProposal(it, it.pendingProposal);
-    return newStops ? {
-        before: it.stops.map(s => String(s.poiId)),
-        after: newStops.filter(s => s.state !== 'skipped').map(s => String(s.poiId))
-    } : null;
 }
 
 // POST /plan
@@ -572,7 +562,10 @@ router.post('/:id/nl-edit', wrap(async (req, res) => {
         { new: true }
     );
     if (!updated) return fail(res, 409, 1203, '行程已变化，请刷新');
-    ok(res, { version: updated.version, pendingProposal: { ...proposal, parsedOps: ops } });
+    ok(res, {
+        version: updated.version,
+        pendingProposal: engine.publicProposalView(updated.pendingProposal || proposal, null)
+    });
 }));
 
 // GET /:id/poster
@@ -589,7 +582,7 @@ router.get('/:id/poster', wrap(async (req, res) => {
             savedMinutes: it.savedMinutesTotal,
             stops: it.stops.length
         },
-        posterUrl: null // TODO(P6)：服务端 canvas 合成
+        posterUrl: null // Server-side composite generation is outside the P0 contract.
     });
 }));
 

@@ -29,6 +29,12 @@ const { rebuildTimeline } = require('./services/itineraryTimeline');
 const { aggregateRouteFromStops } = require('./services/itineraryRouteData');
 const { createBarrierRerouteCoordinator } = require('./services/barrierReroute');
 const { bindOpsEvents } = require('./services/opsEvents');
+const {
+    createRuntimeReadiness,
+    createHealthHandler,
+    waitForMongoReady,
+    safeFailure
+} = require('./services/runtimeHealth');
 const { startJobs } = require('./jobs');
 
 // ===================== SSE 连接池（04文档 §2）=====================
@@ -139,9 +145,13 @@ function bridgeEvents(io) {
 
     // 改道提案 → 用户房间（离线降级在 notifyBridge 内）
     bus.on(bus.EVENTS.REROUTE_PROPOSED, async ({ itinerary, proposal }) => {
-        await notifyBridge.pushProposal(itinerary.openId, {
-            itineraryId: itinerary._id, version: itinerary.version, ...proposal
-        });
+        await notifyBridge.pushProposal(
+            itinerary.openId,
+            itinerary._id,
+            itinerary.version,
+            proposal,
+            engine.proposalDiff(itinerary, proposal)
+        );
         bus.emit(bus.EVENTS.OPS_PROPOSAL_STATUS, {
             itineraryId: itinerary._id,
             proposalId: proposal.proposalId,
@@ -165,7 +175,7 @@ function bridgeEvents(io) {
     });
 
     bus.on(bus.EVENTS.ITINERARY_PROGRESS, payload => {
-        io.to(`user:${payload.openId}`).emit('itinerary:progress', payload);
+        notifyBridge.pushProgress(payload.openId, payload);
     });
 
     // 打卡异步通过（人工审核）
@@ -324,15 +334,6 @@ function simRouter() {
     return router;
 }
 
-function mongoStatusOf(mongoose) {
-    const states = ['offline', 'online', 'connecting', 'disconnecting'];
-    const readyState = Number(mongoose?.connection?.readyState);
-    return {
-        state: states[readyState] || 'offline',
-        readyState: Number.isInteger(readyState) ? readyState : 0
-    };
-}
-
 // ===================== attach（唯一挂接点）=====================
 let attachmentResult = null;
 let attachmentError = null;
@@ -385,6 +386,7 @@ function attach({
         logger: helpers.gisLogger || options.superMap?.logger || console,
         localPathSource
     });
+    const runtimeReadiness = createRuntimeReadiness({ backgroundEnabled: startBackground });
     const routeBetween = options.routeBetween || createRouteBetween(superMapGateway, {
         scenicId: CONFIG.scenicId
     });
@@ -436,29 +438,14 @@ function attach({
         if (CONFIG.simMode) app.use('/api/sim', simRouter());
 
         // 健康端点（08文档 §4）
-        app.get('/api/geosync/health', wrap(async (req, res) => {
-            const snap = crowdService.getHeatmapSnapshot();
-            const mongo = mongoStatusOf(mongoose);
-            const gis = await superMapGateway.getStatus({ requestId: req.headers['x-request-id'] });
-            const diagnostics = superMapGateway.getDiagnostics();
-            const coreAvailable = mongo.state === 'online';
-            res.status(coreAvailable ? 200 : 503).json({
-                graphLoaded: walkGraph.isReady(),
-                jobsRunning: startBackground,
-                lastCiSlot: snap?.slot || null,
-                rainSource: CONFIG.features.rain ? 'minute' : CONFIG.features.weather ? 'hourly' : 'off',
-                llm: CONFIG.features.guide,
-                simMode: CONFIG.simMode,
-                mongo,
-                gis,
-                manifest: gis.manifest,
-                cache: {
-                    routeCount: diagnostics.routeCacheSize,
-                    lastInvalidationReason: diagnostics.lastInvalidationReason
-                },
-                lastSuccessfulGisAt: diagnostics.lastSuccessAt
-            });
-        }));
+        app.get('/api/geosync/health', wrap(createHealthHandler({
+            mongoose,
+            superMapGateway,
+            readiness: runtimeReadiness,
+            walkGraph,
+            crowdService,
+            config: CONFIG
+        })));
 
         // client-config features 注入（前端降级链读取）
         app.get('/api/geosync/client-config', (req, res) => {
@@ -485,25 +472,68 @@ function attach({
         initItineraryProgress();
         engine.init();
 
-        const readiness = [];
-        readiness.push(superMapGateway.getStatus({ refresh: true }).then(status => {
+        const gisReadiness = superMapGateway.getStatus({ refresh: true }).then(status => {
             if (status.state === 'offline') {
                 console.warn('[GeoSync] [GIS] offline at startup', status.error?.code || 'ISERVER_OFFLINE');
             }
             return status;
-        }));
+        }).catch(error => {
+            console.warn('[GeoSync] [GIS] startup status unavailable:',
+                safeFailure(error, 'GIS_STATUS_UNAVAILABLE').code);
+            return null;
+        });
+
+        const readinessTasks = [];
         if (startBackground) {
             startSseLoops();
-            startJobs();
-            readiness.push(walkGraph.loadIntoMemory().catch(e => {
-                console.error('[GeoSync] [GRAPH] load failed (planner 将返回 1201):', e.message);
-                throw e;
-            }));
-            readiness.push(crowdService.refreshPoiIndex().catch(e => {
-                console.error('[GeoSync] [POI] index load failed:', e.message);
-                throw e;
-            }));
+            try {
+                runtimeReadiness.setJobs(startJobs());
+            } catch (error) {
+                runtimeReadiness.failJobs(error);
+                readinessTasks.push(Promise.reject(error));
+            }
+        } else {
+            runtimeReadiness.setJobs({
+                enabled: false,
+                running: false,
+                reason: 'background-disabled',
+                scheduledJobs: []
+            });
         }
+
+        const mongoReadiness = waitForMongoReady(mongoose);
+        readinessTasks.push(runtimeReadiness.track('graph', async () => {
+            await mongoReadiness;
+            await walkGraph.loadIntoMemory();
+            return walkGraph.isReady();
+        }, {
+            assertReady: ready => ready === true,
+            notReadyCode: 'GRAPH_EMPTY',
+            notReadyMessage: 'Walk graph contains no usable nodes'
+        }).catch(error => {
+            console.error('[GeoSync] [GRAPH] load failed (planner will return 1201):',
+                safeFailure(error, 'GRAPH_STARTUP_FAILED').code);
+            throw error;
+        }));
+        readinessTasks.push(runtimeReadiness.track('poiIndex', async () => {
+            await mongoReadiness;
+            await crowdService.refreshPoiIndex();
+            return crowdService.getPoiIndex().length;
+        }, {
+            details: count => ({ count })
+        }).catch(error => {
+            console.error('[GeoSync] [POI] index load failed:',
+                safeFailure(error, 'POI_INDEX_STARTUP_FAILED').code);
+            throw error;
+        }));
+        const readiness = Promise.all(readinessTasks).then(() => runtimeReadiness.snapshot({
+            graphReady: walkGraph.isReady(),
+            poiIndexCount: crowdService.getPoiIndex().length
+        }));
+        void readiness.catch(error => {
+            console.error('[GeoSync] core startup readiness failed:',
+                safeFailure(error, 'CORE_STARTUP_FAILED').code);
+        });
 
         attachmentResult = {
             attached: true,
@@ -511,7 +541,9 @@ function attach({
             superMapGateway,
             routeBetween,
             barrierReroute,
-            readiness: Promise.allSettled(readiness)
+            runtimeReadiness,
+            readiness,
+            gisReadiness
         };
         console.log(`[GeoSync] attached — routes/socket ready, background=${startBackground}`);
         return attachmentResult;

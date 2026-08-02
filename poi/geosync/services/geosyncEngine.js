@@ -64,7 +64,7 @@ async function safeEvaluate(it, trigger, extra = null) {
     try {
         await evaluate(it, trigger, extra);
     } catch (e) {
-        console.error('[GeoSync] [ENGINE] evaluate failed:', e.message);
+        console.error('[GeoSync] [ENGINE] evaluate failed:', e?.name || 'Error');
     }
 }
 
@@ -142,7 +142,7 @@ async function evaluate(it, trigger, extra = null) {
         return;
     }
     bus.emit(bus.EVENTS.REROUTE_PROPOSED, { itinerary: updated, proposal });
-    console.log(`[GeoSync] [ENGINE] proposal ${proposal.proposalId} (${proposal.type}, +${proposal.gainMin}min) → ${it.openId}`);
+    console.log(`[GeoSync] [ENGINE] proposal ${proposal.proposalId} (${proposal.type}, +${proposal.gainMin}min) itinerary=${it._id}`);
 }
 
 async function selectCandidate(candidates, threshold, release = antiHerding.releaseTokens) {
@@ -372,6 +372,37 @@ function applyProposal(itinerary, proposal) {
     }
 }
 
+function proposalDiff(itinerary, proposal = itinerary?.pendingProposal) {
+    if (!itinerary || !proposal) return null;
+    const newStops = applyProposal(itinerary, proposal);
+    return newStops ? {
+        before: (itinerary.stops || []).map(stop => String(stop.poiId)),
+        after: newStops
+            .filter(stop => stop.state !== 'skipped')
+            .map(stop => String(stop.poiId))
+    } : null;
+}
+
+function normalizePublicDiff(value) {
+    if (!value || !Array.isArray(value.before) || !Array.isArray(value.after)) return null;
+    return {
+        before: value.before.map(String),
+        after: value.after.map(String)
+    };
+}
+
+function publicProposalView(proposal, diff = undefined) {
+    const source = proposal?.toObject ? proposal.toObject() : proposal || {};
+    return {
+        proposalId: source.proposalId,
+        type: source.type,
+        reason: source.reason,
+        gainMin: source.gainMin,
+        expireAt: source.expireAt,
+        diff: normalizePublicDiff(diff === undefined ? source.diff : diff)
+    };
+}
+
 // 重排后按原停留时长顺延时刻表（保持 done/skipped 时刻不动）
 function retime(stops) {
     let t = null;
@@ -391,5 +422,12 @@ function retime(stops) {
 }
 
 module.exports = {
-    init, evaluate, safeEvaluate, applyProposal, affectedItineraries, selectCandidate
+    init,
+    evaluate,
+    safeEvaluate,
+    applyProposal,
+    proposalDiff,
+    publicProposalView,
+    affectedItineraries,
+    selectCandidate
 };
