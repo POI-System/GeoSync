@@ -1,0 +1,12 @@
+{
+  "name": "评审演示日",
+  "durationVirtualMin": 480,
+  "events": [
+    { "atMin": 10, "type": "surge", "poiName": "玻璃栈道", "users": 80,
+      "note": "向该点直接投放80个即时agent制造尖峰" },
+    { "atMin": 40, "type": "rain", "startInMin": 25, "durationMin": 40,
+      "note": "注入假降雨事件（SIM_MODE 下开放）" },
+    { "atMin": 90, "type": "closeEdge", "edgeId": "e_017",
+      "note": "调用管理端封路接口，验证秒级传导" }
+  ]
+}

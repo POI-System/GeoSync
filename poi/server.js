@@ -10,6 +10,7 @@ const http = require('http');
 const multer = require('multer');
 const nodemailer = require('nodemailer');
 const { Server } = require('socket.io');
+const geosync = require('./geosync');
 
 const Ocr20191230 = require('@alicloud/ocr20191230');
 const OcrApi20210707 = require('@alicloud/ocr-api20210707');
@@ -21,7 +22,7 @@ const CONFIG = {
     host: process.env.HOST || '127.0.0.1',
     publicHost: process.env.PUBLIC_HOST || 'http://localhost:3000',
     mongoUri: process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/poi_db',
-    adminToken: process.env.ADMIN_TOKEN || 'super-admin-token',
+    adminToken: String(process.env.ADMIN_TOKEN || '').trim(),
     admin: {
         username: process.env.ADMIN_USERNAME || '',
         password: process.env.ADMIN_PASSWORD || ''
@@ -367,6 +368,16 @@ async function recognizeUploadedImageText(file) {
     return extractOcrText(resp);
 }
 
+async function recognizeGeoSyncPhoto(photoUrl) {
+    if (!ocrEnabled || typeof photoUrl !== 'string') return '';
+    const match = /^\/uploads\/([A-Za-z0-9._-]+)$/.exec(photoUrl);
+    if (!match) return '';
+    const filename = path.basename(match[1]);
+    const filePath = path.join(uploadDir, filename);
+    if (!fs.existsSync(filePath)) return '';
+    return recognizeUploadedImageText({ filename, path: filePath });
+}
+
 function parseCoordinate(value) {
     const n = Number.parseFloat(value);
     return Number.isFinite(n) ? n : null;
@@ -480,7 +491,7 @@ function getAdminToken(req) {
 }
 
 function requireAdmin(req, res, next) {
-    if (getAdminToken(req) !== CONFIG.adminToken) {
+    if (!CONFIG.adminToken || getAdminToken(req) !== CONFIG.adminToken) {
         return res.status(403).json({ success: false, message: '管理员权限无效' });
     }
     next();
@@ -527,6 +538,18 @@ function createMailer() {
         port: CONFIG.smtp.port,
         secure: CONFIG.smtp.secure,
         auth: { user: CONFIG.smtp.user, pass: CONFIG.smtp.pass }
+    });
+}
+
+async function sendGeoSyncMail(to, subject, body) {
+    if (!isEmail(to)) return;
+    const mailer = createMailer();
+    if (!mailer) return;
+    return mailer.sendMail({
+        from: CONFIG.smtp.from,
+        to,
+        subject: String(subject || '').slice(0, 160),
+        text: String(body || '')
     });
 }
 
@@ -763,7 +786,7 @@ app.post('/api/admin/login', async (req, res) => {
         if (!username || !password) {
             return res.status(400).json({ success: false, message: '参数不足' });
         }
-        if (!CONFIG.admin.username || !CONFIG.admin.password) {
+        if (!CONFIG.admin.username || !CONFIG.admin.password || !CONFIG.adminToken) {
             return res.status(500).json({ success: false, message: '管理员账号未配置' });
         }
         const envAdminMatched = username === CONFIG.admin.username && password === CONFIG.admin.password;
@@ -1680,7 +1703,7 @@ io.on('connection', async (socket) => {
 
     
     socket.on('super_publish_notice', async (d) => {
-        if (!socket.openId || !d || d.adminToken !== CONFIG.adminToken) return;
+        if (!CONFIG.adminToken || !socket.openId || !d || d.adminToken !== CONFIG.adminToken) return;
         const text = normalizeSocketString(d.text, 500);
         if (!text) return;
 
@@ -1697,6 +1720,23 @@ io.on('connection', async (socket) => {
     });
 });
 
+geosync.attach({
+    app,
+    io,
+    mongoose,
+    models: { POI, User },
+    helpers: {
+        sendTemplate,
+        sendMail: sendGeoSyncMail,
+        ocr: recognizeGeoSyncPhoto,
+        uploadDir
+    },
+    options: {
+        startBackground: String(process.env.GEOSYNC_BACKGROUND_ENABLED || 'true').toLowerCase() !== 'false',
+        mountUploads: false
+    }
+});
+
 app.use('/uploads', express.static(uploadDir));
 app.use((req, res, next) => {
     if (req.path === '/' || req.path.endsWith('.html')) {
@@ -1706,6 +1746,16 @@ app.use((req, res, next) => {
         res.set('Surrogate-Control', 'no-store');
     }
     next();
+});
+const publicStaticExtensions = new Set([
+    '.html', '.css', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp',
+    '.ico', '.woff', '.woff2', '.ttf', '.webmanifest'
+]);
+app.use((req, res, next) => {
+    if (req.path === '/' || publicStaticExtensions.has(path.extname(req.path).toLowerCase())) {
+        return next();
+    }
+    return res.status(404).end();
 });
 app.use(express.static(__dirname, {
     etag: false,
