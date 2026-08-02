@@ -162,6 +162,14 @@ test('single POI process serves old and GeoSync endpoints without exposing backe
         assert.equal(adminResponse.status, 403);
         const gisAdminResponse = await fetch(`${base}/api/admin/geosync/gis/status`);
         assert.equal(gisAdminResponse.status, 403);
+        const gisRouteTestResponse = await fetch(`${base}/api/admin/geosync/gis/route-test`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+                start: [120, 30], end: [120.001, 30.001], mode: 'normal'
+            })
+        });
+        assert.equal(gisRouteTestResponse.status, 403);
         const loginResponse = await fetch(`${base}/api/admin/login`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },

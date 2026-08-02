@@ -250,31 +250,82 @@ async function rhoCalibrate() {
     console.log(`[JOB] rhoCalibrate ρ=${rho.toFixed(3)}`);
 }
 
+async function expirePendingProposals(deps = {}) {
+    const Itinerary = deps.Itinerary || getModels().Itinerary;
+    const releaseTokens = deps.releaseTokens || antiHerding.releaseTokens;
+    const eventBus = deps.bus || bus;
+    const clock = deps.clock || (() => new Date());
+    const logger = deps.logger || console;
+    const now = new Date(clock());
+    const expired = await Itinerary.find({
+        state: 'active',
+        'pendingProposal.expireAt': { $lte: now }
+    }).limit(500).lean();
+    let expiredCount = 0;
+    for (const it of expired) {
+        const proposal = it.pendingProposal;
+        const proposalId = proposal?.proposalId;
+        if (!proposalId) continue;
+        const payload = proposal.payload || {};
+        const eventId = proposal.eventId || payload.eventId || null;
+        const edgeId = proposal.edgeId || payload.edgeId || null;
+        const barrierFingerprint = proposal.barrierFingerprint || payload.barrierFingerprint || null;
+        const updated = await Itinerary.findOneAndUpdate(
+            {
+                _id: it._id,
+                version: it.version,
+                state: 'active',
+                'pendingProposal.proposalId': proposalId,
+                'pendingProposal.expireAt': { $lte: now }
+            },
+            {
+                $set: { pendingProposal: null },
+                $inc: { version: 1 },
+                $push: {
+                    rerouteLog: {
+                        at: now,
+                        type: proposal.type,
+                        reason: proposal.reason,
+                        savedMin: 0,
+                        accepted: false,
+                        status: 'expired',
+                        proposalId,
+                        eventId,
+                        edgeId,
+                        barrierFingerprint
+                    }
+                }
+            },
+            { new: true }
+        );
+        if (!updated) continue;
+
+        expiredCount++;
+        try {
+            await releaseTokens(proposal.tokenIds || [], it._id);
+        } catch (error) {
+            logger.error(`[JOB] proposal token release failed (${it._id}):`, error.message);
+        }
+        eventBus.emit(eventBus.EVENTS.REROUTE_DECIDED, {
+            openId: updated.openId || it.openId,
+            itineraryId: updated._id || it._id,
+            proposalId,
+            status: 'expired',
+            accepted: false,
+            version: updated.version,
+            at: now,
+            eventId
+        });
+    }
+    return { scanned: expired.length, expired: expiredCount };
+}
+
 // ===== 分钟 sweep（04文档 §3.9）=====
 async function minuteSweep() {
     const { Itinerary, StaySample, Pairing } = getModels();
     // 过期提案清理 + token 回滚
     const now = new Date();
-    const expired = await Itinerary.find({
-        'pendingProposal.expireAt': { $lte: now }
-    }).limit(500).lean();
-    for (const it of expired) {
-        const proposalId = it.pendingProposal?.proposalId;
-        const updated = await Itinerary.findOneAndUpdate(
-            {
-                _id: it._id,
-                'pendingProposal.proposalId': proposalId,
-                'pendingProposal.expireAt': { $lte: now }
-            },
-            { $set: { pendingProposal: null }, $inc: { version: 1 } }
-        );
-        if (updated) {
-            await antiHerding.releaseTokens(
-                it.pendingProposal?.tokenIds || [], it._id
-            ).catch(error => console.error(
-                `[JOB] proposal token release failed (${it._id}):`, error.message));
-        }
-    }
+    await expirePendingProposals({ Itinerary, clock: () => now });
     const tokenStats = await antiHerding.reconcileTokens(now).catch(error => {
         console.error('[JOB] capacity token reconcile failed:', error.message);
         return null;
@@ -348,4 +399,13 @@ function startJobs() {
     console.log('[GeoSync] [JOBS] cron started');
 }
 
-module.exports = { startJobs, ciAggregate, ciForecast, spotScoreDaily, rhoCalibrate, minuteSweep, computeSpotScore };
+module.exports = {
+    startJobs,
+    ciAggregate,
+    ciForecast,
+    spotScoreDaily,
+    rhoCalibrate,
+    minuteSweep,
+    expirePendingProposals,
+    computeSpotScore
+};

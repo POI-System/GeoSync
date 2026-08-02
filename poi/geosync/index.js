@@ -24,6 +24,10 @@ const rainService = require('./services/rainService');
 const antiHerding = require('./services/antiHerding');
 const forecastService = require('./services/forecastService');
 const { createItineraryRuntime } = require('./services/itineraryRuntime');
+const { rebuildTimeline } = require('./services/itineraryTimeline');
+const { aggregateRouteFromStops } = require('./services/itineraryRouteData');
+const { createBarrierRerouteCoordinator } = require('./services/barrierReroute');
+const { bindOpsEvents } = require('./services/opsEvents');
 const { startJobs } = require('./jobs');
 
 // ===================== SSE 连接池（04文档 §2）=====================
@@ -110,6 +114,7 @@ function bindSocket(io, getSocketIdentity) {
 function bridgeEvents(io) {
     const scenicRoom = `scenic:${CONFIG.scenicId}`;
     const adminRoom = `admin:${CONFIG.scenicId}`;
+    bindOpsEvents({ bus, io, scenicId: CONFIG.scenicId });
 
     // CI 快照帧（jobs/ciAggregate 完成后发）→ SSE heatmap
     bus.on(bus.EVENTS.CI_UPDATED, snap => sseSend('heatmap', snap));
@@ -136,6 +141,26 @@ function bridgeEvents(io) {
     bus.on(bus.EVENTS.REROUTE_PROPOSED, async ({ itinerary, proposal }) => {
         await notifyBridge.pushProposal(itinerary.openId, {
             itineraryId: itinerary._id, version: itinerary.version, ...proposal
+        });
+        bus.emit(bus.EVENTS.OPS_PROPOSAL_STATUS, {
+            itineraryId: itinerary._id,
+            proposalId: proposal.proposalId,
+            status: 'shown',
+            version: itinerary.version,
+            at: new Date().toISOString(),
+            eventId: proposal.payload?.eventId
+        });
+    });
+
+    bus.on(bus.EVENTS.REROUTE_DECIDED, payload => {
+        const status = payload.status || (payload.accepted === true ? 'accepted' : 'rejected');
+        bus.emit(bus.EVENTS.OPS_PROPOSAL_STATUS, {
+            itineraryId: payload.itineraryId,
+            proposalId: payload.proposalId,
+            status,
+            version: payload.version,
+            at: payload.at || new Date().toISOString(),
+            eventId: payload.eventId
         });
     });
 
@@ -171,7 +196,13 @@ function bridgeEvents(io) {
 
     // 封路/恢复 → scenic + admin
     const emitGraph = status => p => {
-        const payload = { edgeId: p.edgeId, status };
+        const payload = {
+            eventId: p.eventId || null,
+            edgeId: p.edgeId,
+            status: p.status || status,
+            reason: p.reason || null,
+            at: p.acceptedAt || new Date().toISOString()
+        };
         io.to(scenicRoom).emit('graph:update', payload);
         io.to(adminRoom).emit('graph:update', payload);
     };
@@ -346,10 +377,24 @@ function attach({
     const routeBetween = options.routeBetween || createRouteBetween(superMapGateway, {
         scenicId: CONFIG.scenicId
     });
+    const barrierReroute = createBarrierRerouteCoordinator({
+        models: getModels(),
+        gateway: superMapGateway,
+        walkGraph,
+        rebuildTimeline,
+        aggregateRouteFromStops,
+        routeBetween,
+        releaseProposalTokens: (tokenIds, itineraryId) =>
+            antiHerding.releaseTokens(tokenIds, itineraryId),
+        eventBus: bus
+    });
+    bus.on(bus.EVENTS.EDGE_CLOSED, payload => barrierReroute.enqueueGraphEvent(payload));
+    bus.on(bus.EVENTS.EDGE_OPENED, payload => barrierReroute.enqueueGraphEvent(payload));
     app.locals.geosync = {
         ...(app.locals.geosync || {}),
         superMapGateway,
-        routeBetween
+        routeBetween,
+        barrierReroute
     };
 
     try {
@@ -454,6 +499,7 @@ function attach({
             backgroundStarted: startBackground,
             superMapGateway,
             routeBetween,
+            barrierReroute,
             readiness: Promise.allSettled(readiness)
         };
         console.log(`[GeoSync] attached — routes/socket ready, background=${startBackground}`);

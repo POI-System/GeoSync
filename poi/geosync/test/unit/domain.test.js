@@ -112,6 +112,13 @@ test('applyProposal drop 标记跳过', () => {
     const out = engine.applyProposal(it, { type: 'drop', payload: { stopId: 's3' } });
     assert.strictEqual(out[3].state, 'skipped');
     assert.strictEqual(out[3].capacityTokenId, null);
+
+    const barrierSource = mkStops();
+    const barrier = engine.applyProposal({ stops: barrierSource }, {
+        type: 'barrierReroute', payload: { eventId: 'graph-event-1' }
+    });
+    assert.deepStrictEqual(barrier.map(stop => stop._id), barrierSource.map(stop => stop._id));
+    assert.notStrictEqual(barrier[0], barrierSource[0]);
 });
 
 test('applyProposal rainShift 只重排可变站点，不跨过 arrived', () => {

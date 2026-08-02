@@ -18,6 +18,8 @@ const EVENTS = {
     STAY_OVERTIME: 'itinerary:stayOvertime',
     REROUTE_PROPOSED: 'reroute:proposed',
     REROUTE_DECIDED: 'reroute:decided',
+    OPS_IMPACT: 'ops:impact',
+    OPS_PROPOSAL_STATUS: 'ops:proposalStatus',
     PAIRING_PROPOSED: 'pairing:proposed',
     CHECKIN_VERIFIED: 'checkin:verified',
     ALERT_CROWD: 'alert:crowd',
@@ -34,12 +36,14 @@ module.exports = {
         setImmediate(() => bus.emit(event, payload)); // 异步派发，生产者不被消费者阻塞
     },
     on(event, handler) {
-        bus.on(event, async payload => {
+        const listener = async payload => {
             try {
                 await handler(payload);
             } catch (e) {
                 console.error(`[GeoSync] [BUS] handler for ${event} failed:`, e.message);
             }
-        });
+        };
+        bus.on(event, listener);
+        return () => bus.off(event, listener);
     }
 };

@@ -2,9 +2,10 @@
 // 03文档 §9：管理端 /api/admin/geosync/*（requireAdmin）。
 
 const express = require('express');
+const crypto = require('crypto');
 const { CONFIG } = require('../config');
 const { getModels } = require('../models');
-const { ok, fail, wrap, BizError } = require('../lib/respond');
+const { ok, accepted, fail, wrap, BizError } = require('../lib/respond');
 const { requireAdmin } = require('../lib/auth');
 const memCache = require('../lib/memCache');
 const geo = require('../lib/geo');
@@ -15,6 +16,56 @@ const walkGraph = require('../services/walkGraph');
 
 const router = express.Router();
 router.use(requireAdmin);
+
+function gatewayOf(req) {
+    const gateway = req?.app?.locals?.geosync?.superMapGateway;
+    if (!gateway
+        || typeof gateway.findPath !== 'function'
+        || typeof gateway.findPathWithBarriers !== 'function') {
+        throw new BizError(8201, 'GIS route provider is unavailable', 503);
+    }
+    return gateway;
+}
+
+function sanitizeCloseReason(value) {
+    return String(value || '')
+        .replace(/[\u0000-\u001f\u007f]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 100);
+}
+
+function canonicalSourceRef(value) {
+    const datasetName = typeof value?.datasetName === 'string' ? value.datasetName.trim() : '';
+    const smId = Number(value?.smId);
+    if (!datasetName || !Number.isInteger(smId) || smId < 0) return null;
+    return { datasetName, smId };
+}
+
+function graphEventId() {
+    return `closure_${crypto.randomBytes(8).toString('hex')}`;
+}
+
+// POST /gis/route-test — 管理端 GIS 冒烟，不进入游客行程流程。
+router.post('/gis/route-test', wrap(async (req, res) => {
+    const gateway = gatewayOf(req);
+    const barriers = req.body?.barriers ?? [];
+    const input = {
+        start: req.body?.start,
+        end: req.body?.end,
+        mode: req.body?.mode,
+        barriers,
+        scenicId: CONFIG.scenicId
+    };
+    const requestId = req.headers?.['x-request-id'];
+    if (requestId !== undefined && requestId !== null && String(requestId).trim()) {
+        input.requestId = String(requestId).trim();
+    }
+    const result = Array.isArray(barriers) && barriers.length > 0
+        ? await gateway.findPathWithBarriers(input)
+        : await gateway.findPath(input);
+    ok(res, result);
+}));
 
 // ===================== 9.1 大屏与回放 =====================
 
@@ -31,7 +82,17 @@ router.get('/dashboard', wrap(async (req, res) => {
     let accepted = 0, total = 0, savedSum = 0;
     for (const it of doneToday) {
         savedSum += it.savedMinutesTotal || 0;
-        for (const l of it.rerouteLog || []) { total++; if (l.accepted) accepted++; }
+        for (const log of it.rerouteLog || []) {
+            if (log.status === 'accepted') {
+                total++;
+                accepted++;
+            } else if (log.status === 'rejected') {
+                total++;
+            } else if (!log.status && typeof log.accepted === 'boolean') {
+                total++;
+                if (log.accepted) accepted++;
+            }
+        }
     }
     const snap = crowdService.getHeatmapSnapshot();
     const top10 = (snap?.items || [])
@@ -157,17 +218,53 @@ router.patch('/graph/edge/:edgeId', wrap(async (req, res) => {
 router.post('/graph/edge/:edgeId/:op(close|open)', wrap(async (req, res) => {
     const { WalkEdge } = getModels();
     const closing = req.params.op === 'close';
+    const reason = closing ? sanitizeCloseReason(req.body?.reason) : null;
+    if (closing && !reason) return fail(res, 400, 1101, '关闭原因不能为空');
+
+    const acceptedAt = new Date();
+    const targetStatus = closing ? 'closed' : 'open';
+    const sourceStatus = closing ? 'open' : 'closed';
     const edge = await WalkEdge.findOneAndUpdate(
-        { edgeId: req.params.edgeId },
+        { edgeId: req.params.edgeId, status: sourceStatus },
         closing
-            ? { $set: { status: 'closed', closedReason: String(req.body?.reason || '').slice(0, 100), closedAt: new Date() } }
+            ? { $set: { status: targetStatus, closedReason: reason, closedAt: acceptedAt } }
             : { $set: { status: 'open' }, $unset: { closedReason: 1, closedAt: 1 } },
         { new: true }
     );
-    if (!edge) return fail(res, 404, 8101, '边不存在');
-    await walkGraph.loadIntoMemory();
-    bus.emit(closing ? bus.EVENTS.EDGE_CLOSED : bus.EVENTS.EDGE_OPENED, { edgeId: edge.edgeId });
-    ok(res, { edgeId: edge.edgeId, status: edge.status });
+    if (!edge) {
+        const current = await WalkEdge.findOne({ edgeId: req.params.edgeId });
+        if (!current) return fail(res, 404, 8101, '边不存在');
+        if (current.status === targetStatus) {
+            return ok(res, { accepted: false, edgeId: current.edgeId, status: current.status });
+        }
+        return fail(res, 409, 8102, '路段当前状态不允许该操作');
+    }
+
+    const eventId = graphEventId();
+    let cacheInvalidated = true;
+    try {
+        const gateway = req?.app?.locals?.geosync?.superMapGateway;
+        if (!gateway || typeof gateway.invalidateRouteCache !== 'function') {
+            throw new Error('Gateway route-cache invalidation is unavailable');
+        }
+        await gateway.invalidateRouteCache(`graph-${targetStatus}:${edge.edgeId}:${eventId}`);
+    } catch (error) {
+        cacheInvalidated = false;
+        console.error('[GeoSync] [GRAPH] route-cache invalidation failed:', error.message);
+    }
+
+    const payload = {
+        eventId,
+        scenicId: String(edge.scenicId || CONFIG.scenicId),
+        edgeId: edge.edgeId,
+        status: edge.status,
+        reason,
+        sourceRef: canonicalSourceRef(edge.sourceRef),
+        acceptedAt: acceptedAt.toISOString(),
+        cacheInvalidated
+    };
+    bus.emit(closing ? bus.EVENTS.EDGE_CLOSED : bus.EVENTS.EDGE_OPENED, payload);
+    accepted(res, 0, payload);
 }));
 
 // GET /graph/candidates — 众包修路候选

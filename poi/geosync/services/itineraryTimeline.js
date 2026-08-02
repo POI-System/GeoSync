@@ -20,7 +20,7 @@ class TimelineRebuildError extends Error {
 
 /**
  * Rebuild route geometry and ETA for the mutable remainder of an itinerary.
- * Injected routeBetween receives (fromPoi, toPoi, mode) and may be async.
+ * Injected routeBetween receives (fromPoi, toPoi, mode, routeContext) and may be async.
  */
 async function rebuildTimeline({
     itinerary,
@@ -28,7 +28,8 @@ async function rebuildTimeline({
     proposal = null,
     now = new Date(),
     loadPois = defaultLoadPois,
-    routeBetween = defaultRouteBetween
+    routeBetween = defaultRouteBetween,
+    routeContext = {}
 }) {
     if (!itinerary || !Array.isArray(proposedStops)) {
         throw new TimelineRebuildError('INVALID_INPUT', 'itinerary and proposedStops are required');
@@ -64,7 +65,7 @@ async function rebuildTimeline({
         }
 
         const poi = requirePoi(poiMap, stop.poiId);
-        const route = await resolveRoute(routeBetween, cursorPoi, poi, mode, stop);
+        const route = await resolveRoute(routeBetween, cursorPoi, poi, mode, stop, routeContext);
         const arrive = new Date(cursorAt.getTime() + route.durationSec * 1000);
         const usePoiStay = replaceStopId && idOf(stop._id || stop.stopId) === replaceStopId;
         const leave = new Date(arrive.getTime() + stayDurationMs(stop, poi, itinerary.preferences, usePoiStay));
@@ -114,10 +115,10 @@ function defaultRouteBetween(fromPoi, toPoi, mode) {
     return walkGraph.walkSecBetween(fromPoi, toPoi, mode);
 }
 
-async function resolveRoute(routeBetween, fromPoi, toPoi, mode, stop) {
+async function resolveRoute(routeBetween, fromPoi, toPoi, mode, stop, routeContext) {
     let route;
     try {
-        route = await routeBetween(fromPoi, toPoi, mode);
+        route = await routeBetween(fromPoi, toPoi, mode, routeContext);
     } catch (error) {
         if (error instanceof SuperMapError) throw error;
         throw new TimelineRebuildError('ROUTE_FAILED', `route calculation failed for stop ${idOf(stop._id || stop.stopId)}`, {

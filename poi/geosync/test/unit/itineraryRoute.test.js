@@ -4,6 +4,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const modelModule = require('../../models');
+const bus = require('../../lib/eventBus');
+const barrierReroute = require('../../services/barrierReroute');
 
 let currentItinerary;
 let updateResult;
@@ -11,6 +13,8 @@ let updateCalls;
 let calls;
 let rebuildImpl;
 let rebuildArgs;
+let decisionEvents;
+let barrierSnapshotImpl;
 
 const injectedRouteBetween = async () => ({
     durationSec: 60,
@@ -49,7 +53,7 @@ const ExternalPoi = {
 };
 
 const originalGetModels = modelModule.getModels;
-modelModule.getModels = () => ({ Itinerary, ExternalPoi, PhotoSpot: {} });
+modelModule.getModels = () => ({ Itinerary, ExternalPoi, PhotoSpot: {}, WalkEdge: {} });
 
 const antiHerding = require('../../services/antiHerding');
 const engine = require('../../services/geosyncEngine');
@@ -64,7 +68,9 @@ const originals = {
     releaseTokens: antiHerding.releaseTokens,
     applyProposal: engine.applyProposal,
     rebuildArrivalIndex: forecast.rebuildArrivalIndex,
-    rebuildTimeline: timeline.rebuildTimeline
+    rebuildTimeline: timeline.rebuildTimeline,
+    loadClosedBarrierSnapshot: barrierReroute.loadClosedBarrierSnapshot,
+    busEmit: bus.emit
 };
 
 antiHerding.claimTokens = async () => {
@@ -81,6 +87,10 @@ antiHerding.releaseTokens = async () => calls.push('release');
 engine.applyProposal = itinerary => itinerary.stops.map(stop => ({ ...stop }));
 forecast.rebuildArrivalIndex = async () => calls.push('arrival-index');
 timeline.rebuildTimeline = (...args) => rebuildImpl(...args);
+barrierReroute.loadClosedBarrierSnapshot = (...args) => barrierSnapshotImpl(...args);
+bus.emit = (event, payload) => {
+    if (event === bus.EVENTS.REROUTE_DECIDED) decisionEvents.push(payload);
+};
 
 delete require.cache[require.resolve('../../routes/itinerary')];
 const router = require('../../routes/itinerary');
@@ -98,6 +108,8 @@ test.after(() => {
     engine.applyProposal = originals.applyProposal;
     forecast.rebuildArrivalIndex = originals.rebuildArrivalIndex;
     timeline.rebuildTimeline = originals.rebuildTimeline;
+    barrierReroute.loadClosedBarrierSnapshot = originals.loadClosedBarrierSnapshot;
+    bus.emit = originals.busEmit;
 });
 
 function reset() {
@@ -105,6 +117,12 @@ function reset() {
     updateCalls = [];
     updateResult = undefined;
     rebuildArgs = null;
+    decisionEvents = [];
+    barrierSnapshotImpl = async () => ({
+        barriers: [],
+        edgeIds: [],
+        fingerprint: 'sha256:empty'
+    });
     currentItinerary = {
         _id: 'itinerary-1',
         openId: 'user-1',
@@ -116,7 +134,10 @@ function reset() {
         pendingProposal: {
             proposalId: 'proposal-1',
             type: 'replace',
-            payload: { stopId: 'stop-1', newPoiId: 'poi-new', capacityTokenId: 'token-new' },
+            payload: {
+                stopId: 'stop-1', newPoiId: 'poi-new', capacityTokenId: 'token-new',
+                eventId: 'edge-event-1', edgeId: 'edge-closed', barrierFingerprint: 'barriers-v1'
+            },
             gainMin: 8,
             tokenIds: ['token-new'],
             expireAt: new Date(Date.now() + 60000)
@@ -165,13 +186,13 @@ function response() {
     };
 }
 
-async function decide() {
+async function decide(decision = 'accept') {
     const req = {
         method: 'POST',
-        originalUrl: '/api/itinerary/itinerary-1/proposal/proposal-1/accept',
+        originalUrl: `/api/itinerary/itinerary-1/proposal/proposal-1/${decision}`,
         openId: 'user-1',
         params: {
-            id: 'itinerary-1', proposalId: 'proposal-1', decision: 'accept'
+            id: 'itinerary-1', proposalId: 'proposal-1', decision
         },
         body: { version: 4 },
         app: { locals: { geosync: { routeBetween: injectedRouteBetween } } }
@@ -207,6 +228,70 @@ test('proposal acceptance claims, rebuilds, commits, indexes, then finalizes', a
     assert.equal(res.body.data.route.distanceM, 80);
     assert.equal(res.body.data.stops[0].durationSec, 60);
     assert.equal(res.body.data.stops[0].pathGeometry, 'encoded-route');
+    assert.deepStrictEqual(updateCalls[0].update.$push.rerouteLog, {
+        at: updateCalls[0].update.$push.rerouteLog.at,
+        type: 'replace',
+        reason: undefined,
+        savedMin: 8,
+        accepted: true,
+        status: 'accepted',
+        proposalId: 'proposal-1',
+        eventId: 'edge-event-1',
+        edgeId: 'edge-closed',
+        barrierFingerprint: 'barriers-v1'
+    });
+    assert.deepStrictEqual(decisionEvents, [{
+        openId: 'user-1',
+        itineraryId: 'itinerary-1',
+        proposalId: 'proposal-1',
+        status: 'accepted',
+        accepted: true,
+        version: 5,
+        at: decisionEvents[0].at,
+        eventId: 'edge-event-1'
+    }]);
+    assert.equal(new Date(decisionEvents[0].at).toISOString(), decisionEvents[0].at);
+});
+
+test('barrier acceptance reloads the current full barrier set before rebuilding and committing', async () => {
+    reset();
+    currentItinerary.scenicId = 'scenic-test';
+    currentItinerary.pendingProposal.type = 'barrierReroute';
+    currentItinerary.pendingProposal.tokenIds = [];
+    currentItinerary.pendingProposal.payload = {
+        eventId: 'edge-event-1',
+        edgeId: 'edge-closed',
+        barrierFingerprint: 'stale-fingerprint',
+        barriers: [{ edgeId: 'stale-edge' }]
+    };
+    barrierSnapshotImpl = async ({ scenicId }) => {
+        assert.equal(scenicId, 'scenic-test');
+        return {
+            barriers: [{
+                edgeId: 'edge-closed',
+                sourceRef: { datasetName: 'WalkEdge@Test', smId: 9 }
+            }],
+            edgeIds: ['edge-closed'],
+            fingerprint: 'fresh-fingerprint'
+        };
+    };
+
+    const res = await decide();
+
+    assert.equal(res.statusCode, 200);
+    assert.deepStrictEqual(rebuildArgs.routeContext, {
+        barriers: [{
+            edgeId: 'edge-closed',
+            sourceRef: { datasetName: 'WalkEdge@Test', smId: 9 }
+        }],
+        requestId: 'edge-event-1',
+        eventId: 'edge-event-1',
+        barrierFingerprint: 'fresh-fingerprint'
+    });
+    assert.equal(updateCalls[0].update.$push.rerouteLog.status, 'accepted');
+    assert.equal(updateCalls[0].update.$push.rerouteLog.barrierFingerprint, 'fresh-fingerprint');
+    assert.equal(updateCalls[0].update.$set.route.segments[0].edgeId, 'edge-1');
+    assert.equal(decisionEvents[0].eventId, 'edge-event-1');
 });
 
 test('aggregate route does not promote mixed verified and unknown accessibility evidence', async () => {
@@ -270,4 +355,26 @@ test('proposal CAS conflict rolls back the claim and leaves post-commit work unt
     assert.deepEqual(calls, ['claim', 'rebuild', 'claim-check', 'cas', 'rollback']);
     assert.equal(calls.includes('arrival-index'), false);
     assert.equal(calls.includes('finalize'), false);
+    assert.equal(decisionEvents.length, 0);
+});
+
+test('proposal rejection uses active-state CAS and emits committed lifecycle metadata', async () => {
+    reset();
+    const res = await decide('reject');
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(updateCalls.length, 1);
+    assert.equal(updateCalls[0].filter.state, 'active');
+    assert.equal(updateCalls[0].update.$push.rerouteLog.status, 'rejected');
+    assert.equal(updateCalls[0].update.$push.rerouteLog.proposalId, 'proposal-1');
+    assert.deepStrictEqual(decisionEvents, [{
+        openId: 'user-1',
+        itineraryId: 'itinerary-1',
+        proposalId: 'proposal-1',
+        status: 'rejected',
+        accepted: false,
+        version: 5,
+        at: decisionEvents[0].at,
+        eventId: 'edge-event-1'
+    }]);
 });

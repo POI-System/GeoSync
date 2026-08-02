@@ -162,6 +162,24 @@ function registerModels(mongoose, injectedModels = {}) {
         pathGeometry: { type: String, default: '' }
     }); // 保留自动 _id 作为 stopId
 
+    const rerouteLogSchema = new Schema({
+        at: Date,
+        type: String,
+        reason: String,
+        fromPoi: ObjectId,
+        toPoi: ObjectId,
+        savedMin: Number,
+        accepted: Boolean,
+        proposalId: String,
+        eventId: String,
+        edgeId: String,
+        barrierFingerprint: String,
+        status: {
+            type: String,
+            enum: ['shown', 'accepted', 'rejected', 'expired', 'failed']
+        }
+    }, { _id: false });
+
     const itinerarySchema = new Schema({
         scenicId: { type: String, default: 'default' },
         openId: { type: String, required: true, index: true },
@@ -190,7 +208,10 @@ function registerModels(mongoose, injectedModels = {}) {
         pendingProposal: {
             type: new Schema({
                 proposalId: String,
-                type: { type: String, enum: ['swap', 'replace', 'delay', 'drop', 'rainShift', 'nlEdit'] },
+                type: {
+                    type: String,
+                    enum: ['swap', 'replace', 'delay', 'drop', 'rainShift', 'nlEdit', 'barrierReroute']
+                },
                 payload: Object,
                 reason: String,
                 gainMin: Number,
@@ -199,11 +220,7 @@ function registerModels(mongoose, injectedModels = {}) {
             }, { _id: false }),
             default: null
         },
-        rerouteLog: [{
-            at: Date, type: String, reason: String,
-            fromPoi: ObjectId, toPoi: ObjectId,
-            savedMin: Number, accepted: Boolean
-        }],
+        rerouteLog: { type: [rerouteLogSchema], default: [] },
         savedMinutesTotal: { type: Number, default: 0 },
         createTime: { type: Date, default: Date.now }
     });
@@ -217,6 +234,7 @@ function registerModels(mongoose, injectedModels = {}) {
         }
     );
     itinerarySchema.index({ state: 1, scenicId: 1 });
+    itinerarySchema.index({ scenicId: 1, state: 1, 'route.segments.edgeId': 1 });
     itinerarySchema.index({ 'stops.photoSpotId': 1, state: 1 });
     itinerarySchema.index({ 'pendingProposal.expireAt': 1 });
 
@@ -338,6 +356,7 @@ function registerModels(mongoose, injectedModels = {}) {
     }, { collection: 'walkgraph_edges' });
     walkEdgeSchema.index({ from: 1 });
     walkEdgeSchema.index({ status: 1 });
+    walkEdgeSchema.index({ scenicId: 1, status: 1 });
 
     const accessibleEvidenceSchema = new Schema({
         edgeId: String, userIdHash: String, date: String,

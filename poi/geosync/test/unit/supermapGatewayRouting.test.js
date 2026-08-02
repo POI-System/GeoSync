@@ -225,7 +225,14 @@ test('findPathWithBarriers requires barriers and sends sorted unique normalized 
         fixtures: {
             findPathWithBarriers: request => {
                 transportRequest = request;
-                return routeResponse();
+                return routeResponse({
+                    segments: [{
+                        edgeId: 'EDGE_3',
+                        distanceM: 842,
+                        durationSec: 662,
+                        sourceRef: { datasetName: WALK_EDGE_DATASET, smId: 3 }
+                    }]
+                });
             }
         }
     });
@@ -254,6 +261,61 @@ test('findPathWithBarriers requires barriers and sends sorted unique normalized 
         { edgeId: 'EDGE_2', sourceRef: sourceRef2 }
     ]);
     assert.equal(result.gis.source, 'iserver');
+});
+
+test('barrier routes reject responses that still traverse a requested closed edge', async () => {
+    const sourceRef = { datasetName: WALK_EDGE_DATASET, smId: 1 };
+    const { gateway } = createHarness({ fixtures: { findPathWithBarriers: routeResponse() } });
+
+    await assert.rejects(
+        gateway.findPathWithBarriers(routeInput({
+            barriers: [{ edgeId: 'EDGE_1', sourceRef }]
+        })),
+        error => error.code === 8205
+            && error.httpStatus === 409
+            && error.category === 'contract'
+    );
+    assert.equal(gateway.getDiagnostics().routeCacheSize, 0);
+});
+
+test('barrier routes also reject matching canonical source references and missing provenance', async t => {
+    const barrier = {
+        edgeId: 'EDGE_1',
+        sourceRef: { datasetName: WALK_EDGE_DATASET, smId: 1 }
+    };
+
+    await t.test('matching sourceRef under a different edgeId', async () => {
+        const { gateway } = createHarness({
+            fixtures: {
+                findPathWithBarriers: routeResponse({
+                    segments: [{
+                        edgeId: 'EDGE_DIFFERENT',
+                        distanceM: 842,
+                        durationSec: 662,
+                        sourceRef: barrier.sourceRef
+                    }]
+                })
+            }
+        });
+
+        await assert.rejects(
+            gateway.findPathWithBarriers(routeInput({ barriers: [barrier] })),
+            error => error.code === 8205 && error.category === 'contract'
+        );
+        assert.equal(gateway.getDiagnostics().routeCacheSize, 0);
+    });
+
+    await t.test('empty segment provenance', async () => {
+        const { gateway } = createHarness({
+            fixtures: { findPathWithBarriers: routeResponse({ segments: [] }) }
+        });
+
+        await assert.rejects(
+            gateway.findPathWithBarriers(routeInput({ barriers: [barrier] })),
+            error => error.code === 8205 && error.category === 'contract'
+        );
+        assert.equal(gateway.getDiagnostics().routeCacheSize, 0);
+    });
 });
 
 test('route responses reject excessive snap distance, data-version mismatch, and invalid geometry', async t => {

@@ -27,11 +27,6 @@ function init() {
         const its = await Itinerary.find({ state: 'active' });
         for (const it of its) await safeEvaluate(it, 'rain', payload);
     });
-    bus.on(bus.EVENTS.EDGE_CLOSED, async () => {
-        const { Itinerary } = getModels();
-        const its = await Itinerary.find({ state: 'active' });
-        for (const it of its) await safeEvaluate(it, 'edgeClosed');
-    });
     bus.on(bus.EVENTS.POSITION_REPORTED, async p => {
         const { Itinerary } = getModels();
         const it = await Itinerary.findOne({ openId: p.openId, state: 'active' });
@@ -370,6 +365,8 @@ function applyProposal(itinerary, proposal) {
             mutableIndices.forEach((index, i) => { stops[index] = reordered[i]; });
             return retime(stops);
         }
+        case 'barrierReroute':
+            return stops;
         default:
             return null;
     }

@@ -395,6 +395,28 @@ function normalizeRoutePayload(payload, input, manifest, context, options = {}) 
         allowMissingSourceRef: options.source === 'local-fallback',
         reversed: Boolean(geometryMeta.reversed)
     });
+    if (input.barriers.length) {
+        if (!segments.length) {
+            throw contractError('障碍路径响应缺少可验证的路段来源', {
+                ...context,
+                category: 'contract'
+            });
+        }
+        const blockedEdgeIds = new Set(input.barriers.map(barrier => barrier.edgeId));
+        const blockedSourceRefs = new Set(input.barriers.map(barrier =>
+            `${barrier.sourceRef.datasetName}\u0000${barrier.sourceRef.smId}`));
+        const blockedSegment = segments.find(segment =>
+            blockedEdgeIds.has(segment.edgeId)
+            || (segment.sourceRef && blockedSourceRefs.has(
+                `${segment.sourceRef.datasetName}\u0000${segment.sourceRef.smId}`
+            )));
+        if (blockedSegment) {
+            throw contractError('路径响应仍包含请求中声明的障碍路段', {
+                ...context,
+                category: 'contract'
+            });
+        }
+    }
     const distanceM = nonNegativeNumber(payload.distanceM, 'distanceM', context);
     const durationSec = nonNegativeNumber(payload.durationSec, 'durationSec', context);
     const geometry = geometryMeta.geometry;

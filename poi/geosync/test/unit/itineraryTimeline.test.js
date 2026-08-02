@@ -193,6 +193,49 @@ test('rebuilds every mutable segment with route ETA, geometry, and original stay
     assert.deepStrictEqual(rebuilt.map(item => item.state), ['approaching', 'pending']);
 });
 
+test('forwards the exact route context to every mutable route leg', async () => {
+    const barriers = Object.freeze([
+        Object.freeze({
+            edgeId: 'closed-edge',
+            sourceRef: Object.freeze({ datasetName: 'walk-network', smId: 7 })
+        })
+    ]);
+    const routeContext = Object.freeze({
+        barriers,
+        eventId: 'edge-event-1',
+        requestId: 'reroute-request-1',
+        barrierFingerprint: 'barriers-v1'
+    });
+    const contexts = [];
+
+    await rebuildTimeline({
+        itinerary: { startLocation: [118, 32], preferences: {} },
+        proposedStops: [
+            stop('a', 'poi-a', 'pending', NOW, 10),
+            stop('b', 'poi-b', 'pending', NOW, 10)
+        ],
+        now: NOW,
+        loadPois: loader([poi('poi-a'), poi('poi-b')]),
+        routeContext,
+        routeBetween: async (from, to, mode, context) => {
+            contexts.push(context);
+            return { walkSec: 60, pathGeometry: `${from._id || from._timelineAnchor}-${to._id}`, fallback: false };
+        }
+    });
+
+    assert.equal(contexts.length, 2);
+    for (const context of contexts) assert.strictEqual(context, routeContext);
+    assert.deepStrictEqual(contexts[0], {
+        barriers: [{
+            edgeId: 'closed-edge',
+            sourceRef: { datasetName: 'walk-network', smId: 7 }
+        }],
+        eventId: 'edge-event-1',
+        requestId: 'reroute-request-1',
+        barrierFingerprint: 'barriers-v1'
+    });
+});
+
 test('an arrived stop owns current progress while all future stops remain pending', async () => {
     const rebuilt = await rebuildTimeline({
         itinerary: { startLocation: [118, 32], preferences: {} },

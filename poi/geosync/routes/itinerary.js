@@ -16,6 +16,14 @@ const forecast = require('../services/forecastService');
 const guideService = require('../services/guideService');
 const { createItineraryRuntime } = require('../services/itineraryRuntime');
 const { rebuildTimeline, TimelineRebuildError } = require('../services/itineraryTimeline');
+const {
+    serializedRouteFields,
+    aggregateRouteFromStops
+} = require('../services/itineraryRouteData');
+const {
+    loadClosedBarrierSnapshot,
+    routeAvoidsBarriers
+} = require('../services/barrierReroute');
 const geo = require('../lib/geo');
 
 const router = express.Router();
@@ -76,148 +84,73 @@ function routeBetweenOf(req) {
     return routeBetween;
 }
 
-function toPlain(value) {
-    return value?.toObject ? value.toObject() : value;
-}
-
-function serializedGeometry(value) {
-    const geometry = toPlain(value);
-    if (geometry?.type !== 'LineString' || !Array.isArray(geometry.coordinates)) return null;
-    const coordinates = geometry.coordinates
-        .filter(position => Array.isArray(position) && position.length === 2 && position.every(Number.isFinite))
-        .map(position => [position[0], position[1]]);
-    return coordinates.length >= 2 ? { type: 'LineString', coordinates } : null;
-}
-
-function serializedGis(value) {
-    const gis = toPlain(value);
-    if (!gis || typeof gis !== 'object') return null;
-    return {
-        source: gis.source || null,
-        mode: gis.mode || null,
-        degraded: Boolean(gis.degraded),
-        requestId: gis.requestId || null,
-        durationMs: Number.isFinite(gis.durationMs) ? gis.durationMs : 0,
-        dataVersion: gis.dataVersion || null
-    };
-}
-
-function serializedSegments(value) {
-    if (!Array.isArray(value)) return [];
-    return value.map(item => {
-        const segment = toPlain(item) || {};
-        const sourceRef = toPlain(segment.sourceRef);
-        return {
-            edgeId: segment.edgeId || '',
-            distanceM: Number.isFinite(segment.distanceM) ? segment.distanceM : null,
-            durationSec: Number.isFinite(segment.durationSec) ? segment.durationSec : null,
-            ...(sourceRef ? {
-                sourceRef: {
-                    datasetName: sourceRef.datasetName || '',
-                    smId: Number.isFinite(sourceRef.smId) ? sourceRef.smId : null
-                }
-            } : {})
-        };
-    });
-}
-
-function serializedSnap(value) {
-    const snap = toPlain(value);
-    if (!snap || typeof snap !== 'object') return null;
-    return {
-        startDistanceM: Number.isFinite(snap.startDistanceM) ? snap.startDistanceM : null,
-        endDistanceM: Number.isFinite(snap.endDistanceM) ? snap.endDistanceM : null
-    };
-}
-
-function serializedRouteFields(value) {
-    const route = toPlain(value) || {};
-    const verifiedAccessible = route.verifiedAccessible === true || route.accessibleVerified === true
-        ? true
-        : route.verifiedAccessible === false || route.accessibleVerified === false
-            ? false
-            : null;
-    return {
-        geometry: serializedGeometry(route.geometry),
-        distanceM: Number.isFinite(route.distanceM) ? route.distanceM : null,
-        durationSec: Number.isFinite(route.durationSec) ? route.durationSec : null,
-        gis: serializedGis(route.gis),
-        segments: serializedSegments(route.segments),
-        snap: serializedSnap(route.snap),
-        verifiedAccessible,
-        pathGeometry: typeof route.pathGeometry === 'string' ? route.pathGeometry : ''
-    };
-}
-
-function routeMode(preferences = {}) {
-    if (preferences?.accessible) return 'accessible';
-    if (preferences?.shadeFirst) return 'shade';
-    return 'normal';
-}
-
-function aggregateRouteFromStops(stops, preferences, fallback = null) {
-    const legs = (stops || [])
-        .filter(stop => !['skipped', 'rerouted'].includes(stop.state))
-        .map(serializedRouteFields)
-        .filter(route => route.geometry
-            && Number.isFinite(route.distanceM)
-            && Number.isFinite(route.durationSec));
-    if (!legs.length) return fallback ? serializedRouteFields(fallback) : null;
-
-    const coordinates = [];
-    const segments = [];
-    for (const leg of legs) {
-        for (const position of leg.geometry.coordinates) {
-            const previous = coordinates[coordinates.length - 1];
-            if (!previous || previous[0] !== position[0] || previous[1] !== position[1]) {
-                coordinates.push([...position]);
-            }
-        }
-        segments.push(...leg.segments);
-    }
-    const gisEntries = legs.map(leg => leg.gis).filter(Boolean);
-    const firstGis = gisEntries[0];
-    const source = gisEntries.some(gis => gis.source === 'local-fallback')
-        ? 'local-fallback'
-        : gisEntries.some(gis => gis.source === 'cache')
-            ? 'cache'
-            : firstGis?.source || null;
-    const versions = [...new Set(gisEntries.map(gis => gis.dataVersion).filter(Boolean))];
-    const firstSnap = legs[0].snap;
-    const lastSnap = legs[legs.length - 1].snap;
-    const verificationValues = legs.map(leg => leg.verifiedAccessible);
-    const verifiedAccessible = verificationValues.every(value => value === true)
-        ? true
-        : verificationValues.some(value => value === false)
-            ? false
-            : null;
-    return {
-        geometry: { type: 'LineString', coordinates },
-        distanceM: legs.reduce((sum, leg) => sum + leg.distanceM, 0),
-        durationSec: legs.reduce((sum, leg) => sum + leg.durationSec, 0),
-        gis: firstGis ? {
-            ...firstGis,
-            source,
-            mode: routeMode(preferences),
-            degraded: gisEntries.some(gis => gis.degraded || gis.source !== 'iserver'),
-            durationMs: gisEntries.reduce((sum, gis) => sum + gis.durationMs, 0),
-            dataVersion: versions.length === 1 ? versions[0] : null
-        } : null,
-        segments,
-        snap: firstSnap || lastSnap ? {
-            startDistanceM: firstSnap?.startDistanceM ?? null,
-            endDistanceM: lastSnap?.endDistanceM ?? null
-        } : null,
-        verifiedAccessible,
-        pathGeometry: geo.encodePolyline(coordinates)
-    };
-}
-
 function tokenIdsOf(itinerary) {
     return [...new Set([
         ...(itinerary.pendingProposal?.tokenIds || []),
         ...(itinerary.stops || []).map(stop => stop.capacityTokenId).filter(Boolean)
     ].map(String))];
+}
+
+function proposalEventId(proposal) {
+    const eventId = proposal?.payload?.eventId;
+    return eventId === undefined || eventId === null || !String(eventId).trim()
+        ? null
+        : String(eventId).trim();
+}
+
+function proposalEdgeId(proposal) {
+    const edgeId = proposal?.payload?.edgeId;
+    return edgeId === undefined || edgeId === null || !String(edgeId).trim()
+        ? null
+        : String(edgeId).trim();
+}
+
+function proposalBarrierFingerprint(proposal) {
+    const fingerprint = proposal?.payload?.barrierFingerprint;
+    return fingerprint === undefined || fingerprint === null || !String(fingerprint).trim()
+        ? null
+        : String(fingerprint).trim();
+}
+
+function proposalWithBarrierSnapshot(proposal, snapshot) {
+    if (!snapshot) return proposal;
+    const plain = proposal?.toObject ? proposal.toObject() : proposal;
+    return {
+        ...plain,
+        payload: {
+            ...(plain?.payload || {}),
+            barrierFingerprint: snapshot.fingerprint,
+            barrierEdgeIds: [...snapshot.edgeIds]
+        }
+    };
+}
+
+function rerouteLogEntry(proposal, status, at, savedMin, accepted) {
+    return {
+        at,
+        type: proposal.type,
+        reason: proposal.reason,
+        savedMin,
+        accepted,
+        status,
+        proposalId: proposal.proposalId,
+        eventId: proposalEventId(proposal),
+        edgeId: proposalEdgeId(proposal),
+        barrierFingerprint: proposalBarrierFingerprint(proposal)
+    };
+}
+
+function emitProposalDecision(itinerary, proposal, status, at) {
+    bus.emit(bus.EVENTS.REROUTE_DECIDED, {
+        openId: itinerary.openId,
+        itineraryId: itinerary._id,
+        proposalId: proposal.proposalId,
+        status,
+        accepted: status === 'accepted',
+        version: itinerary.version,
+        at: at.toISOString(),
+        eventId: proposalEventId(proposal)
+    });
 }
 
 // ---- 序列化 ----
@@ -427,7 +360,7 @@ router.post('/:id/stops/:stopId/skip', wrap(async (req, res) => {
 
 // POST /:id/proposal/:proposalId/accept|reject
 router.post('/:id/proposal/:proposalId/:decision(accept|reject)', wrap(async (req, res) => {
-    const { Itinerary } = getModels();
+    const { Itinerary, WalkEdge } = getModels();
     const version = Number(req.body?.version);
     const it = await Itinerary.findOne({ _id: req.params.id, openId: req.openId });
     if (!it) return fail(res, 404, 1204, '行程不存在');
@@ -446,6 +379,26 @@ router.post('/:id/proposal/:proposalId/:decision(accept|reject)', wrap(async (re
 
     if (accepted) {
         const routeBetween = routeBetweenOf(req);
+        let barrierSnapshot = null;
+        let routeContext = {};
+        if (pp.type === 'barrierReroute') {
+            try {
+                barrierSnapshot = await loadClosedBarrierSnapshot({
+                    WalkEdge,
+                    scenicId: String(it.scenicId || CONFIG.scenicId)
+                });
+            } catch (error) {
+                return fail(res, 409, 8205, '当前封路数据缺少可验证的 GIS 映射');
+            }
+            const eventId = proposalEventId(pp) || `proposal-${pp.proposalId}`;
+            routeContext = {
+                barriers: barrierSnapshot.barriers,
+                requestId: eventId,
+                eventId,
+                barrierFingerprint: barrierSnapshot.fingerprint
+            };
+        }
+        const lifecycleProposal = proposalWithBarrierSnapshot(pp, barrierSnapshot);
         const claimId = 'c_' + crypto.randomBytes(8).toString('hex');
         const claimed = await antiHerding.claimTokens(pp.tokenIds, it._id, now, claimId);
         if (!claimed) {
@@ -465,7 +418,8 @@ router.post('/:id/proposal/:proposalId/:decision(accept|reject)', wrap(async (re
                 proposedStops,
                 proposal: pp,
                 now,
-                routeBetween
+                routeBetween,
+                routeContext
             });
         } catch (error) {
             await antiHerding.rollbackClaimedTokens(pp.tokenIds, it._id, claimId);
@@ -475,6 +429,13 @@ router.post('/:id/proposal/:proposalId/:decision(accept|reject)', wrap(async (re
             throw error;
         }
         const newRoute = aggregateRouteFromStops(newStops, it.preferences, it.route);
+        if (barrierSnapshot && !routeAvoidsBarriers(
+            { stops: newStops, route: newRoute },
+            barrierSnapshot.barriers
+        )) {
+            await antiHerding.rollbackClaimedTokens(pp.tokenIds, it._id, claimId);
+            return fail(res, 409, 8205, '重建路线仍包含当前关闭路段');
+        }
 
         const commitNow = new Date();
         const claimStillActive = await antiHerding.claimedTokensActive(
@@ -500,10 +461,9 @@ router.post('/:id/proposal/:proposalId/:decision(accept|reject)', wrap(async (re
                     $set: { stops: newStops, route: newRoute, pendingProposal: null },
                     $inc: { version: 1, rerouteCount: 1, savedMinutesTotal: pp.gainMin || 0 },
                     $push: {
-                        rerouteLog: {
-                            at: commitNow, type: pp.type, reason: pp.reason,
-                            savedMin: pp.gainMin, accepted: true
-                        }
+                        rerouteLog: rerouteLogEntry(
+                            lifecycleProposal, 'accepted', commitNow, pp.gainMin || 0, true
+                        )
                     }
                 },
                 { new: true }
@@ -539,12 +499,7 @@ router.post('/:id/proposal/:proposalId/:decision(accept|reject)', wrap(async (re
             await antiHerding.finalizeClaimedTokens(pp.tokenIds, it._id, claimId).catch(error =>
                 console.error('[GeoSync] [ITINERARY] token finalize failed:', error.message));
         }
-        bus.emit(bus.EVENTS.REROUTE_DECIDED, {
-            openId: updated.openId,
-            itineraryId: updated._id,
-            proposalId: pp.proposalId,
-            accepted: true
-        });
+        emitProposalDecision(updated, lifecycleProposal, 'accepted', commitNow);
         emitProgress(updated);
         return ok(res, await serialize(updated));
     }
@@ -554,25 +509,23 @@ router.post('/:id/proposal/:proposalId/:decision(accept|reject)', wrap(async (re
             _id: it._id,
             openId: req.openId,
             version,
+            state: 'active',
             'pendingProposal.proposalId': pp.proposalId,
             'pendingProposal.expireAt': { $gt: now }
         },
         {
             $set: { pendingProposal: null },
             $inc: { version: 1 },
-            $push: { rerouteLog: { at: new Date(), type: pp.type, reason: pp.reason, savedMin: 0, accepted: false } }
+            $push: {
+                rerouteLog: rerouteLogEntry(pp, 'rejected', now, 0, false)
+            }
         },
         { new: true }
     );
     if (!updated) return fail(res, 409, 1203, '行程版本已过期，请刷新');
     await bestEffort('rejected proposal token release failed', () =>
         antiHerding.releaseTokens(pp.tokenIds, it._id));
-    bus.emit(bus.EVENTS.REROUTE_DECIDED, {
-        openId: updated.openId,
-        itineraryId: updated._id,
-        proposalId: pp.proposalId,
-        accepted: false
-    });
+    emitProposalDecision(updated, pp, 'rejected', now);
     ok(res, { version: updated.version });
 }));
 

@@ -3,7 +3,6 @@
 
 const { haversine, encodePolyline } = require('../lib/geo');
 const { getModels } = require('../models');
-const bus = require('../lib/eventBus');
 
 const WALK_SPEED = 1.4; // m/s，可采纳启发式用
 const MAX_SNAP_DISTANCE_M = 200;
@@ -48,9 +47,6 @@ async function loadIntoMemory() {
     loaded = g.nodes.size > 0;
     console.log(`[GeoSync] [GRAPH] loaded ${nodes.length} nodes / ${edges.length} edges`);
 }
-
-bus.on(bus.EVENTS.EDGE_CLOSED, () => loadIntoMemory());
-bus.on(bus.EVENTS.EDGE_OPENED, () => loadIntoMemory());
 
 function isReady() { return loaded; }
 
