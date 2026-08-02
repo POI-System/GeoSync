@@ -63,6 +63,10 @@ helpers, and OCR helper.
 `poi/geosync/standalone.js` is not the production entry point. It may be used for
 isolated development only. Do not run it beside `poi/server.js` in production.
 
+`poi/geosync` is the only tracked GeoSync implementation. The obsolete tracked
+root `geosync/` copy was removed only after its original suite passed 67/67 and
+the migrated single-service tree passed the final 305/305 regression.
+
 Background jobs are enabled unless `GEOSYNC_BACKGROUND_ENABLED=false`. Production
 normally leaves them enabled. The health response exposes `jobsRunning` so an
 operator can verify the selected mode.

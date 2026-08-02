@@ -18,6 +18,8 @@ GeoSync is attached through dependency injection before static files and before
 ## Main Changes
 
 - Attach `poi/geosync` to `poi/server.js` as the single production service.
+- Remove the obsolete tracked root `geosync/` duplicate after its original
+  regression suite and the migrated single-service tree both passed.
 - Reuse the host POI/User models, Mongoose connection, authentication identity,
   Socket.io instance, mail/template helpers, OCR helper, uploads, and static host.
 - Add a dependency-injected `SuperMapGateway` as the only business-layer iServer
@@ -101,6 +103,7 @@ Run from `D:\poi项目\poi` after all changes are stable:
 Evidence captured on August 2, 2026:
 
 - `check:syntax`: passed.
+- Legacy root GeoSync suite before removal: 67 passed, 0 failed.
 - GeoSync unit suite: 302 passed, 0 failed.
 - Single-service integration suite: 3 passed, 0 failed.
 - Combined unit and integration suite: 305 passed, 0 failed.
