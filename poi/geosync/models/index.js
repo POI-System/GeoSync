@@ -11,6 +11,55 @@ const pointSchema = new Schema({
     coordinates: { type: [Number], required: true } // [lng, lat]
 }, { _id: false });
 
+const lineStringSchema = new Schema({
+    type: { type: String, enum: ['LineString'], required: true },
+    coordinates: { type: [[Number]], required: true }
+}, { _id: false });
+
+const routeSourceRefSchema = new Schema({
+    datasetName: String,
+    smId: Number
+}, { _id: false });
+
+const walkEdgeSourceRefSchema = new Schema({
+    datasetName: String,
+    smId: Number,
+    sourceId: String,
+    dataVersion: String
+}, { _id: false });
+
+const routeSegmentSchema = new Schema({
+    edgeId: String,
+    distanceM: { type: Number, min: 0 },
+    durationSec: { type: Number, min: 0 },
+    sourceRef: { type: routeSourceRefSchema, default: null }
+}, { _id: false });
+
+const routeSnapSchema = new Schema({
+    startDistanceM: { type: Number, min: 0 },
+    endDistanceM: { type: Number, min: 0 }
+}, { _id: false });
+
+const routeGisSchema = new Schema({
+    source: { type: String, enum: ['iserver', 'cache', 'local-fallback'] },
+    mode: { type: String, enum: ['normal', 'accessible', 'shade'] },
+    degraded: Boolean,
+    requestId: String,
+    durationMs: { type: Number, min: 0 },
+    dataVersion: String
+}, { _id: false });
+
+const routeSchema = new Schema({
+    geometry: { type: lineStringSchema, default: null },
+    distanceM: { type: Number, min: 0, default: null },
+    durationSec: { type: Number, min: 0, default: null },
+    gis: { type: routeGisSchema, default: null },
+    segments: { type: [routeSegmentSchema], default: [] },
+    snap: { type: routeSnapSchema, default: null },
+    verifiedAccessible: { type: Boolean, default: null },
+    pathGeometry: { type: String, default: '' }
+}, { _id: false });
+
 function registerModels(mongoose, injectedModels = {}) {
     if (M) return M;
     const { ObjectId } = Schema.Types;
@@ -103,6 +152,13 @@ function registerModels(mongoose, injectedModels = {}) {
             enum: ['pending', 'approaching', 'arrived', 'done', 'skipped', 'rerouted'],
             default: 'pending'
         },
+        geometry: { type: lineStringSchema, default: null },
+        distanceM: { type: Number, min: 0, default: null },
+        durationSec: { type: Number, min: 0, default: null },
+        gis: { type: routeGisSchema, default: null },
+        segments: { type: [routeSegmentSchema], default: [] },
+        snap: { type: routeSnapSchema, default: null },
+        verifiedAccessible: { type: Boolean, default: null },
         pathGeometry: { type: String, default: '' }
     }); // 保留自动 _id 作为 stopId
 
@@ -121,6 +177,7 @@ function registerModels(mongoose, injectedModels = {}) {
             noDisturb: { type: Boolean, default: false }
         },
         stops: [stopSchema],
+        route: { type: routeSchema, default: null },
         startLocation: { type: pointSchema, default: null },
         version: { type: Number, default: 1 },
         state: {
@@ -275,6 +332,7 @@ function registerModels(mongoose, injectedModels = {}) {
         accessibleVerified: { type: Boolean, default: false },
         status: { type: String, enum: ['open', 'closed', 'candidate'], default: 'open' },
         source: { type: String, enum: ['manual', 'crowd', 'import'], default: 'manual' },
+        sourceRef: { type: walkEdgeSourceRefSchema, default: null },
         closedReason: String,
         closedAt: Date
     }, { collection: 'walkgraph_edges' });

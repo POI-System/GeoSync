@@ -14,6 +14,7 @@ const { wrap } = require('./lib/respond');
 const { createSuperMapGateway } = require('./integrations/supermap');
 const notifyBridge = require('./services/notifyBridge');
 const walkGraph = require('./services/walkGraph');
+const { createLocalPathSource, createRouteBetween } = require('./services/gisRouting');
 const engine = require('./services/geosyncEngine');
 const checkinService = require('./services/checkinService');
 const horizonBuilder = require('./services/horizonBuilder');
@@ -334,9 +335,22 @@ function attach({
     validateOnBoot();
     registerModels(mongoose, models);
     if (helpers.uploadDir) CONFIG.uploadDir = path.resolve(helpers.uploadDir);
+    const localPathSource = options.localPathSource === undefined
+        ? createLocalPathSource(walkGraph)
+        : options.localPathSource;
     const superMapGateway = options.superMapGateway || createSuperMapGateway({
-        logger: helpers.gisLogger || console
+        ...(options.superMap || {}),
+        logger: helpers.gisLogger || options.superMap?.logger || console,
+        localPathSource
     });
+    const routeBetween = options.routeBetween || createRouteBetween(superMapGateway, {
+        scenicId: CONFIG.scenicId
+    });
+    app.locals.geosync = {
+        ...(app.locals.geosync || {}),
+        superMapGateway,
+        routeBetween
+    };
 
     try {
         // 宿主能力注入：微信模板/邮件/OCR（独立模式为空 → 自动降级）
@@ -439,6 +453,7 @@ function attach({
             attached: true,
             backgroundStarted: startBackground,
             superMapGateway,
+            routeBetween,
             readiness: Promise.allSettled(readiness)
         };
         console.log(`[GeoSync] attached — routes/socket ready, background=${startBackground}`);

@@ -4,16 +4,30 @@ const crypto = require('node:crypto');
 const {
     ContractMismatchError,
     IServerUnavailableError,
+    RouteSnapError,
+    NoRouteError,
     toSuperMapError
 } = require('./errors');
 const { loadManifestSafe } = require('./manifest');
-const { normalizeGeoJsonGeometry } = require('./normalizers');
+const {
+    normalizeGeoJsonGeometry,
+    normalizeRouteGeometry,
+    normalizeRouteGeometryWithMeta
+} = require('./normalizers');
+const {
+    RouteCache,
+    buildRouteRequestSignature
+} = require('./routeCache');
+const { encodePolyline } = require('../../lib/geo');
 
 const STATUS_VALUES = new Set(['online', 'degraded', 'offline']);
 const REQUIRED_STATUS_SERVICES = ['map', 'data', 'network'];
 const OPTIONAL_STATUS_SERVICES = ['terrain', 'scene'];
 const MAX_FILTER_CLAUSES = 50;
 const MAX_FILTER_LENGTH = 4096;
+const ROUTE_MODES = new Set(['normal', 'accessible', 'shade']);
+const MAX_BARRIERS = 500;
+const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const FILTER_OPERATORS = Object.freeze({
     eq: '=',
     ne: '<>',
@@ -185,6 +199,296 @@ function normalizeFeature(feature, index, datasetKey, dataset, fields, context) 
     };
 }
 
+function normalizeRouteCoordinate(value, field, manifest, bufferDeg, context) {
+    if (!Array.isArray(value) || value.length !== 2 || !value.every(Number.isFinite)) {
+        throw contractError(`${field} 必须是有限数字组成的 [lng, lat]`, context);
+    }
+    const coordinate = [value[0], value[1]];
+    if (coordinate[0] < -180 || coordinate[0] > 180 || coordinate[1] < -90 || coordinate[1] > 90) {
+        throw contractError(`${field} 超出 EPSG:4326 范围`, context);
+    }
+    const extent = manifest?.extent;
+    if (extent && (
+        coordinate[0] < extent[0] - bufferDeg
+        || coordinate[1] < extent[1] - bufferDeg
+        || coordinate[0] > extent[2] + bufferDeg
+        || coordinate[1] > extent[3] + bufferDeg
+    )) {
+        throw contractError(`${field} 超出景区允许范围`, context);
+    }
+    return coordinate;
+}
+
+function normalizeNodeId(value, field, context) {
+    if (value === undefined || value === null || value === '') return null;
+    const nodeId = String(value).trim();
+    if (!SAFE_IDENTIFIER.test(nodeId)) throw contractError(`${field} 无效`, context);
+    return nodeId;
+}
+
+function normalizeBarrierSourceRef(value, manifest, field, context) {
+    if (!isPlainObject(value)) throw contractError(`${field} 必须是对象`, context);
+    const datasetName = String(value.datasetName || '').trim();
+    const smId = Number(value.smId);
+    const datasetNames = new Set(Object.values(manifest?.datasets || {}).map(dataset => dataset.name));
+    if (!datasetName || !datasetNames.has(datasetName)) {
+        throw contractError(`${field}.datasetName 不在 manifest 白名单中`, context);
+    }
+    if (!Number.isInteger(smId) || smId < 0) throw contractError(`${field}.smId 必须是非负整数`, context);
+    return { datasetName, smId };
+}
+
+function normalizeBarriers(value, manifest, required, context) {
+    const barriers = value === undefined || value === null ? [] : value;
+    if (!Array.isArray(barriers)) throw contractError('barriers 必须是数组', context);
+    if (required && barriers.length === 0) throw contractError('findPathWithBarriers 要求非空 barriers', context);
+    if (barriers.length > MAX_BARRIERS) throw contractError(`barriers 不能超过 ${MAX_BARRIERS} 项`, context);
+
+    const byEdgeId = new Map();
+    for (let index = 0; index < barriers.length; index++) {
+        const barrier = barriers[index];
+        if (!isPlainObject(barrier)) throw contractError(`barriers[${index}] 必须是对象`, context);
+        const edgeId = String(barrier.edgeId || '').trim();
+        if (!SAFE_IDENTIFIER.test(edgeId)) throw contractError(`barriers[${index}].edgeId 无效`, context);
+        const normalized = {
+            edgeId,
+            sourceRef: normalizeBarrierSourceRef(
+                barrier.sourceRef,
+                manifest,
+                `barriers[${index}].sourceRef`,
+                context
+            )
+        };
+        const previous = byEdgeId.get(edgeId);
+        if (previous && JSON.stringify(previous.sourceRef) !== JSON.stringify(normalized.sourceRef)) {
+            throw contractError(`barrier ${edgeId} 的 sourceRef 冲突`, context);
+        }
+        byEdgeId.set(edgeId, normalized);
+    }
+    return [...byEdgeId.values()].sort((left, right) => left.edgeId.localeCompare(right.edgeId));
+}
+
+function normalizeRouteInput(input, manifest, options = {}) {
+    const context = options.context || {};
+    const scenicId = input.scenicId === undefined || input.scenicId === null || input.scenicId === ''
+        ? manifest?.scenicId || ''
+        : String(input.scenicId).trim();
+    if (manifest && scenicId !== manifest.scenicId) {
+        throw contractError('scenicId 与 manifest 不一致', { ...context, category: 'contract' });
+    }
+    const mode = input.mode === undefined || input.mode === null || input.mode === ''
+        ? 'normal'
+        : String(input.mode).trim().toLowerCase();
+    if (!ROUTE_MODES.has(mode)) throw contractError('mode 只允许 normal、accessible 或 shade', context);
+    const bufferDeg = Math.max(0, Number(options.boundsBufferDeg) || 0);
+    const start = normalizeRouteCoordinate(input.start, 'start', manifest, bufferDeg, context);
+    const end = normalizeRouteCoordinate(input.end, 'end', manifest, bufferDeg, context);
+    const barriers = normalizeBarriers(input.barriers, manifest, Boolean(options.requireBarriers), context);
+    return {
+        start,
+        end,
+        mode,
+        scenicId,
+        barriers,
+        startNodeId: normalizeNodeId(input.startNodeId, 'startNodeId', context),
+        endNodeId: normalizeNodeId(input.endNodeId, 'endNodeId', context)
+    };
+}
+
+function nonNegativeNumber(value, field, context) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+        throw contractError(`${field} 必须是非负有限数字`, { ...context, category: 'contract' });
+    }
+    return value;
+}
+
+function normalizeRouteSegments(value, manifest, context, options = {}) {
+    const segments = value === undefined || value === null ? [] : value;
+    if (!Array.isArray(segments) || segments.length > 5000) {
+        throw contractError('segments 结构或数量无效', { ...context, category: 'contract' });
+    }
+    const datasetNames = new Set(Object.values(manifest?.datasets || {}).map(dataset => dataset.name));
+    const normalized = segments.map((segment, index) => {
+        if (!isPlainObject(segment)) throw contractError(`segments[${index}] 必须是对象`, context);
+        const edgeId = String(segment.edgeId || '').trim();
+        if (!SAFE_IDENTIFIER.test(edgeId)) throw contractError(`segments[${index}].edgeId 无效`, context);
+        let sourceRef;
+        if (segment.sourceRef !== undefined && segment.sourceRef !== null) {
+            if (!isPlainObject(segment.sourceRef)) throw contractError(`segments[${index}].sourceRef 无效`, context);
+            const datasetName = String(segment.sourceRef.datasetName || '').trim();
+            const smId = Number(segment.sourceRef.smId);
+            if (!datasetName || (datasetNames.size && !datasetNames.has(datasetName))) {
+                throw contractError(`segments[${index}].sourceRef.datasetName 无效`, context);
+            }
+            if (!Number.isInteger(smId) || smId < 0) {
+                throw contractError(`segments[${index}].sourceRef.smId 无效`, context);
+            }
+            sourceRef = { datasetName, smId };
+        } else if (!options.allowMissingSourceRef) {
+            throw contractError(`segments[${index}].sourceRef 缺失`, context);
+        }
+        return {
+            edgeId,
+            distanceM: nonNegativeNumber(segment.distanceM, `segments[${index}].distanceM`, context),
+            durationSec: nonNegativeNumber(segment.durationSec, `segments[${index}].durationSec`, context),
+            ...(sourceRef ? { sourceRef } : {})
+        };
+    });
+    return options.reversed ? normalized.reverse() : normalized;
+}
+
+function normalizeRouteSnap(value, input, context, maxSnapDistanceM) {
+    if (!isPlainObject(value)) throw contractError('snap 必须是对象', { ...context, category: 'contract' });
+    const startDistanceM = nonNegativeNumber(value.startDistanceM, 'snap.startDistanceM', context);
+    const endDistanceM = nonNegativeNumber(value.endDistanceM, 'snap.endDistanceM', context);
+    if (startDistanceM > maxSnapDistanceM || endDistanceM > maxSnapDistanceM) {
+        throw new RouteSnapError(undefined, {
+            ...context,
+            category: 'snap',
+            retryable: false
+        });
+    }
+    const startNodeId = normalizeNodeId(value.startNodeId, 'snap.startNodeId', context) || input.startNodeId;
+    const endNodeId = normalizeNodeId(value.endNodeId, 'snap.endNodeId', context) || input.endNodeId;
+    if (!startNodeId || !endNodeId) {
+        throw contractError('snap 必须包含起终点吸附节点标识', { ...context, category: 'contract' });
+    }
+    return {
+        public: { startDistanceM, endDistanceM },
+        startNodeId,
+        endNodeId
+    };
+}
+
+function normalizeRoutePayload(payload, input, manifest, context, options = {}) {
+    if (payload === null || payload === undefined || payload?.routeFound === false || payload?.available === false) {
+        throw new NoRouteError(undefined, { ...context, category: 'no-route', retryable: false });
+    }
+    if (!isPlainObject(payload)) throw contractError('iServer 路径响应必须是对象', { ...context, category: 'contract' });
+    const declaredVersion = payload.dataVersion || payload.gis?.dataVersion;
+    if (!declaredVersion) {
+        throw contractError('iServer 路径响应缺少 dataVersion', { ...context, category: 'contract' });
+    }
+    if (declaredVersion !== manifest.dataVersion) {
+        throw contractError('iServer 路径数据版本与 manifest 不一致', { ...context, category: 'contract' });
+    }
+    const geometryMeta = normalizeRouteGeometryWithMeta
+        ? normalizeRouteGeometryWithMeta(payload.geometry, {
+            start: input.start,
+            end: input.end,
+            extent: manifest.extent,
+            operation: context.operation,
+            requestId: context.requestId
+        })
+        : {
+            geometry: normalizeRouteGeometry(payload.geometry, {
+                start: input.start,
+                end: input.end,
+                extent: manifest.extent,
+                operation: context.operation,
+                requestId: context.requestId
+            }),
+            reversed: false
+        };
+    const snap = normalizeRouteSnap(payload.snap, input, context, options.maxSnapDistanceM);
+    const segments = normalizeRouteSegments(payload.segments, manifest, context, {
+        allowMissingSourceRef: options.source === 'local-fallback',
+        reversed: Boolean(geometryMeta.reversed)
+    });
+    const distanceM = nonNegativeNumber(payload.distanceM, 'distanceM', context);
+    const durationSec = nonNegativeNumber(payload.durationSec, 'durationSec', context);
+    const geometry = geometryMeta.geometry;
+    const verifiedAccessible = payload.verifiedAccessible === true || payload.accessibleVerified === true;
+    return {
+        route: {
+            distanceM,
+            durationSec,
+            geometry,
+            segments,
+            snap: snap.public,
+            pathGeometry: encodePolyline(geometry.coordinates),
+            walkSec: durationSec,
+            coords: geometry.coordinates,
+            fallback: options.source === 'local-fallback',
+            verifiedAccessible,
+            accessibleVerified: verifiedAccessible
+        },
+        startNodeId: snap.startNodeId,
+        endNodeId: snap.endNodeId,
+        verifiedAccessible
+    };
+}
+
+function withRouteGis(route, metadata) {
+    return {
+        ...route,
+        geometry: { type: route.geometry.type, coordinates: route.geometry.coordinates.map(point => [...point]) },
+        segments: route.segments.map(segment => ({
+            ...segment,
+            ...(segment.sourceRef ? { sourceRef: { ...segment.sourceRef } } : {})
+        })),
+        snap: { ...route.snap },
+        coords: route.geometry.coordinates.map(point => [...point]),
+        walkSec: route.durationSec,
+        fallback: metadata.source === 'local-fallback',
+        gis: {
+            source: metadata.source,
+            mode: metadata.mode,
+            degraded: metadata.source !== 'iserver',
+            requestId: metadata.requestId,
+            durationMs: metadata.durationMs,
+            dataVersion: metadata.dataVersion
+        }
+    };
+}
+
+function routeCacheLike(value) {
+    return value
+        && typeof value.get === 'function'
+        && typeof value.set === 'function'
+        && typeof value.clear === 'function'
+        && typeof value.getDiagnostics === 'function';
+}
+
+function localPathSourceLike(value) {
+    return typeof value === 'function'
+        || Boolean(value && (
+            typeof value.findPath === 'function'
+            || typeof value.findPathWithBarriers === 'function'
+        ));
+}
+
+function routeCacheIdentity(input, dataVersion, snap = {}) {
+    return {
+        dataVersion,
+        mode: input.mode,
+        start: input.start,
+        end: input.end,
+        barriers: input.barriers,
+        startNodeId: snap.startNodeId,
+        endNodeId: snap.endNodeId
+    };
+}
+
+function canUseDegradation(error) {
+    if (![8201, 8202].includes(error?.code)) return false;
+    if (['auth', 'cancelled', 'configuration', 'parameter', 'contract', 'rate-limit'].includes(error.category)) {
+        return false;
+    }
+    return error.retryable === true
+        || (error.code === 8202 && error.category === 'timeout-budget');
+}
+
+function localPayloadOf(value) {
+    if (!isPlainObject(value)) return value;
+    if (!isPlainObject(value.route)) return value;
+    return {
+        ...value.route,
+        ...(value.verifiedAccessible === true ? { verifiedAccessible: true } : {}),
+        ...(value.accessibleVerified === true ? { accessibleVerified: true } : {})
+    };
+}
+
 function normalizeManifestFailure(error) {
     return {
         ok: false,
@@ -206,7 +510,7 @@ function assertSuccessfulResponse(response, context) {
     }
     if (status < 200 || status >= 300) {
         const error = new Error('iServer returned a non-success HTTP status');
-        error.response = { status };
+        error.response = { status, data: response?.data };
         error.request = { sent: true };
         throw error;
     }
@@ -236,6 +540,14 @@ class SuperMapGateway {
         if (options.manifestLoader !== undefined && typeof options.manifestLoader !== 'function') {
             throw new TypeError('SuperMapGateway manifestLoader must be a function');
         }
+        if (options.routeCache !== undefined && !routeCacheLike(options.routeCache)) {
+            throw new TypeError('SuperMapGateway routeCache must implement get, set, clear, and getDiagnostics');
+        }
+        if (options.localPathSource !== undefined
+            && options.localPathSource !== null
+            && !localPathSourceLike(options.localPathSource)) {
+            throw new TypeError('SuperMapGateway localPathSource must be a function or route source object');
+        }
 
         this.enabled = options.enabled !== false;
         this.manifestPath = options.manifestPath || '';
@@ -246,7 +558,18 @@ class SuperMapGateway {
         this.logger = options.logger || console;
         this.healthTimeoutMs = finitePositive(options.healthTimeoutMs, 2000);
         this.queryTimeoutMs = finitePositive(options.queryTimeoutMs, 5000);
+        this.routeTimeoutMs = finitePositive(options.routeTimeoutMs, 5000);
         this.statusCacheMs = Math.max(0, Number(options.statusCacheMs) || 0);
+        this.boundsBufferDeg = Math.max(0, Number(options.boundsBufferDeg) || 0);
+        this.maxSnapDistanceM = finitePositive(options.maxSnapDistanceM, 200);
+        this.fallbackEnabled = options.fallbackEnabled !== false;
+        this.localPathSource = options.localPathSource || null;
+        this.routeCache = options.routeCache || new RouteCache({
+            store: options.routeCacheStore,
+            aliasStore: options.routeAliasStore,
+            clock: options.routeCacheClock || this.clock,
+            ttlMs: finitePositive(options.routeCacheTtlMs, 60_000)
+        });
         this.manifestResult = null;
         this.statusCache = null;
         this.diagnostics = {
@@ -264,12 +587,31 @@ class SuperMapGateway {
 
     _loadManifest(refresh = false) {
         if (this.manifestResult && !refresh) return this.manifestResult;
+        const previousDataVersion = this.manifestResult?.manifest?.dataVersion || null;
         try {
             this.manifestResult = this.manifestLoader(this.manifestPath);
         } catch (error) {
             this.manifestResult = normalizeManifestFailure(error);
         }
+        const nextDataVersion = this.manifestResult?.manifest?.dataVersion || null;
+        if (previousDataVersion && nextDataVersion && previousDataVersion !== nextDataVersion) {
+            this._invalidateRouteCache('manifest-data-version-changed');
+        }
         return this.manifestResult;
+    }
+
+    _invalidateRouteCache(reason) {
+        const cleared = this.routeCache.clear(reason);
+        const cacheDiagnostics = this.routeCache.getDiagnostics();
+        this.diagnostics.routeCacheSize = cacheDiagnostics.size;
+        this.diagnostics.lastInvalidationReason = cacheDiagnostics.lastInvalidationReason;
+        this.statusCache = null;
+        return {
+            cleared,
+            routeCacheSize: cacheDiagnostics.size,
+            lastInvalidationReason: cacheDiagnostics.lastInvalidationReason,
+            lastInvalidatedAt: cacheDiagnostics.lastInvalidatedAt
+        };
     }
 
     _manifestSummary(manifest) {
@@ -523,6 +865,288 @@ class SuperMapGateway {
         }
     }
 
+    _routeOperation(manifest, operationName, context) {
+        const service = manifest.services.network;
+        const operation = service?.operations?.[operationName];
+        if (!service?.enabled || !operation) {
+            throw contractError(`manifest 未提供可用的 ${operationName} 操作`, {
+                ...context,
+                category: 'contract'
+            });
+        }
+        return { service, operation };
+    }
+
+    _routeRequestData(input, manifest) {
+        return {
+            start: [...input.start],
+            end: [...input.end],
+            mode: input.mode,
+            scenicId: input.scenicId,
+            barriers: input.barriers.map(barrier => ({
+                edgeId: barrier.edgeId,
+                sourceRef: { ...barrier.sourceRef }
+            })),
+            dataVersion: manifest.dataVersion,
+            ...(input.startNodeId ? { startNodeId: input.startNodeId } : {}),
+            ...(input.endNodeId ? { endNodeId: input.endNodeId } : {})
+        };
+    }
+
+    _recordRouteSuccess({ route, input, operation, requestId, source, startedAt, dataVersion }) {
+        const finishedAt = this._now();
+        const durationMs = Math.max(0, finishedAt.getTime() - startedAt.getTime());
+        const cacheDiagnostics = this.routeCache.getDiagnostics();
+        this.diagnostics.lastSuccessAt = finishedAt.toISOString();
+        this.diagnostics.lastOperation = operation;
+        this.diagnostics.routeCacheSize = cacheDiagnostics.size;
+        this.diagnostics.lastInvalidationReason = cacheDiagnostics.lastInvalidationReason;
+        this.logger.info?.('[GeoSync] [GIS] operation completed', {
+            requestId,
+            operation,
+            mode: input.mode,
+            barrierCount: input.barriers.length,
+            source,
+            durationMs,
+            status: 'ok',
+            dataVersion,
+            degraded: source !== 'iserver'
+        });
+        return withRouteGis(route, {
+            source,
+            mode: input.mode,
+            requestId,
+            durationMs,
+            dataVersion
+        });
+    }
+
+    _logRouteFailure({ input, operation, requestId, error, startedAt, dataVersion, source = 'iserver' }) {
+        const finishedAt = this._now();
+        this.logger.warn?.('[GeoSync] [GIS] operation failed', {
+            requestId,
+            operation,
+            mode: input?.mode || null,
+            barrierCount: Array.isArray(input?.barriers) ? input.barriers.length : 0,
+            source,
+            durationMs: Math.max(0, finishedAt.getTime() - startedAt.getTime()),
+            status: 'failed',
+            code: error.code,
+            category: error.category,
+            dataVersion,
+            degraded: source !== 'iserver'
+        });
+    }
+
+    async _requestNetworkRoute({ input, manifest, operationName, context }) {
+        const { service, operation } = this._routeOperation(manifest, operationName, context);
+        const response = await this.httpClient.request({
+            operation: operationName,
+            method: operation.method,
+            path: joinPaths(service.path, operation.path),
+            requestId: context.requestId,
+            timeoutMs: this.routeTimeoutMs,
+            data: this._routeRequestData(input, manifest)
+        });
+        assertSuccessfulResponse(response, context);
+        const normalized = normalizeRoutePayload(response?.data, input, manifest, context, {
+            source: 'iserver',
+            maxSnapDistanceM: this.maxSnapDistanceM
+        });
+        const identity = routeCacheIdentity(input, manifest.dataVersion, normalized);
+        try {
+            this.routeCache.set(identity, normalized.route);
+        } catch (error) {
+            this.logger.warn?.('[GeoSync] [GIS] route cache write failed', {
+                requestId: context.requestId,
+                operation: operationName,
+                mode: input.mode,
+                barrierCount: input.barriers.length,
+                status: 'cache-write-failed',
+                dataVersion: manifest.dataVersion
+            });
+        }
+        return normalized.route;
+    }
+
+    _cachedRoute(input, manifest) {
+        const identity = routeCacheIdentity(input, manifest.dataVersion);
+        const signature = buildRouteRequestSignature(identity);
+        return this.routeCache.get(signature);
+    }
+
+    async _localRoute({ input, manifest, operationName, context }) {
+        if (!this.fallbackEnabled || !this.localPathSource) return null;
+        const source = this.localPathSource;
+        let resolver;
+        if (typeof source === 'function') resolver = source;
+        else if (operationName === 'findPathWithBarriers' && typeof source.findPathWithBarriers === 'function') {
+            resolver = source.findPathWithBarriers.bind(source);
+        } else if (typeof source.findPath === 'function') {
+            resolver = source.findPath.bind(source);
+        }
+        if (!resolver) return null;
+
+        const response = await resolver({
+            ...this._routeRequestData(input, manifest),
+            requestId: context.requestId
+        });
+        if (response === undefined || response === null) return null;
+        const payload = localPayloadOf(response);
+        const normalized = normalizeRoutePayload(payload, input, manifest, context, {
+            source: 'local-fallback',
+            maxSnapDistanceM: this.maxSnapDistanceM
+        });
+        if (input.mode === 'accessible' && !normalized.verifiedAccessible) {
+            throw new NoRouteError('无障碍本地降级路线缺少完整验证', {
+                ...context,
+                category: 'no-route',
+                retryable: false
+            });
+        }
+        return normalized.route;
+    }
+
+    async _findPath(input, options = {}) {
+        const operationName = options.requireBarriers ? 'findPathWithBarriers' : 'findPath';
+        if (!isPlainObject(input)) {
+            throw contractError(`${operationName} input 必须是对象`, {
+                operation: operationName,
+                requestId: requestIdOf(undefined, this.requestIdFactory),
+                category: 'parameter'
+            });
+        }
+        const requestId = requestIdOf(input.requestId, this.requestIdFactory);
+        const context = { operation: operationName, requestId };
+        const startedAt = this._now();
+        const refreshManifest = Boolean(input.refreshManifest);
+        if (refreshManifest) this.statusCache = null;
+        const manifestResult = this._loadManifest(refreshManifest);
+        if (!this.enabled) {
+            throw new IServerUnavailableError('SuperMapGateway 未启用', {
+                ...context,
+                category: 'configuration',
+                retryable: false
+            });
+        }
+        if (!manifestResult?.ok || !manifestResult.manifest) {
+            const status = this._offlineStatus(requestId, startedAt, manifestResult);
+            this.statusCache = null;
+            this.diagnostics.lastStatus = status;
+            throw manifestQueryError(manifestResult, context);
+        }
+
+        const manifest = manifestResult.manifest;
+        const normalizedInput = normalizeRouteInput(input, manifest, {
+            context,
+            requireBarriers: options.requireBarriers,
+            boundsBufferDeg: this.boundsBufferDeg
+        });
+        let networkError;
+        try {
+            const route = await this._requestNetworkRoute({
+                input: normalizedInput,
+                manifest,
+                operationName,
+                context
+            });
+            return this._recordRouteSuccess({
+                route,
+                input: normalizedInput,
+                operation: operationName,
+                requestId,
+                source: 'iserver',
+                startedAt,
+                dataVersion: manifest.dataVersion
+            });
+        } catch (error) {
+            networkError = toSuperMapError(error, context);
+            if (!canUseDegradation(networkError)) {
+                this._logRouteFailure({
+                    input: normalizedInput,
+                    operation: operationName,
+                    requestId,
+                    error: networkError,
+                    startedAt,
+                    dataVersion: manifest.dataVersion
+                });
+                throw networkError;
+            }
+        }
+
+        const cached = this._cachedRoute(normalizedInput, manifest);
+        if (cached) {
+            return this._recordRouteSuccess({
+                route: cached,
+                input: normalizedInput,
+                operation: operationName,
+                requestId,
+                source: 'cache',
+                startedAt,
+                dataVersion: manifest.dataVersion
+            });
+        }
+
+        try {
+            const localRoute = await this._localRoute({
+                input: normalizedInput,
+                manifest,
+                operationName,
+                context
+            });
+            if (localRoute) {
+                return this._recordRouteSuccess({
+                    route: localRoute,
+                    input: normalizedInput,
+                    operation: operationName,
+                    requestId,
+                    source: 'local-fallback',
+                    startedAt,
+                    dataVersion: manifest.dataVersion
+                });
+            }
+        } catch (error) {
+            const localError = toSuperMapError(error, context);
+            this._logRouteFailure({
+                input: normalizedInput,
+                operation: operationName,
+                requestId,
+                error: localError,
+                startedAt,
+                dataVersion: manifest.dataVersion,
+                source: 'local-fallback'
+            });
+            if (normalizedInput.mode === 'accessible' && localError.code === 8204) throw localError;
+        }
+
+        this._logRouteFailure({
+            input: normalizedInput,
+            operation: operationName,
+            requestId,
+            error: networkError,
+            startedAt,
+            dataVersion: manifest.dataVersion
+        });
+        throw networkError;
+    }
+
+    async findPath(input = {}) {
+        return this._findPath(input, { requireBarriers: false });
+    }
+
+    async findPathWithBarriers(input = {}) {
+        return this._findPath(input, { requireBarriers: true });
+    }
+
+    async normalizeGeometry(rawGeometry, context = {}) {
+        const normalizedContext = isPlainObject(context) ? context : {};
+        return normalizeRouteGeometry(rawGeometry, normalizedContext);
+    }
+
+    async invalidateRouteCache(reason = 'manual') {
+        return this._invalidateRouteCache(reason);
+    }
+
     getPublicConfig() {
         const result = this._loadManifest(false);
         return {
@@ -534,12 +1158,18 @@ class SuperMapGateway {
     }
 
     getDiagnostics() {
+        const cacheDiagnostics = this.routeCache.getDiagnostics();
+        this.diagnostics.routeCacheSize = cacheDiagnostics.size;
+        this.diagnostics.lastInvalidationReason = cacheDiagnostics.lastInvalidationReason;
         return {
             lastSuccessAt: this.diagnostics.lastSuccessAt,
             lastOperation: this.diagnostics.lastOperation,
             lastStatus: this.diagnostics.lastStatus ? { ...this.diagnostics.lastStatus } : null,
-            routeCacheSize: this.diagnostics.routeCacheSize,
-            lastInvalidationReason: this.diagnostics.lastInvalidationReason
+            routeCacheSize: cacheDiagnostics.size,
+            routeCacheAliasCount: cacheDiagnostics.aliasCount,
+            routeCacheTtlMs: cacheDiagnostics.ttlMs,
+            lastInvalidationReason: cacheDiagnostics.lastInvalidationReason,
+            lastInvalidatedAt: cacheDiagnostics.lastInvalidatedAt
         };
     }
 }

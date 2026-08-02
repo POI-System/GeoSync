@@ -16,6 +16,11 @@ function positiveNumber(value, fallback) {
     return Number.isFinite(number) && number > 0 ? number : fallback;
 }
 
+function nonNegativeNumber(value, fallback = 0) {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : fallback;
+}
+
 function manifestPathOf(value, cwd) {
     const configured = String(value || './config/supermap-manifest.json').trim();
     return path.resolve(cwd, configured);
@@ -75,7 +80,22 @@ function createSuperMapGateway(options = {}) {
         logger,
         healthTimeoutMs: positiveNumber(env.SUPERMAP_HEALTH_TIMEOUT_MS, 2000),
         queryTimeoutMs: positiveNumber(env.SUPERMAP_TIMEOUT_MS, 5000),
-        statusCacheMs: positiveNumber(options.statusCacheMs, 5000)
+        routeTimeoutMs: positiveNumber(options.routeTimeoutMs ?? env.SUPERMAP_TIMEOUT_MS, 5000),
+        statusCacheMs: positiveNumber(options.statusCacheMs, 5000),
+        routeCache: options.routeCache,
+        routeCacheStore: options.routeCacheStore,
+        routeAliasStore: options.routeAliasStore,
+        routeCacheClock: options.routeCacheClock,
+        routeCacheTtlMs: positiveNumber(
+            options.routeCacheTtlMs,
+            positiveNumber(env.SUPERMAP_CACHE_TTL_S, 60) * 1000
+        ),
+        localPathSource: options.localPathSource || options.localRouteSource,
+        fallbackEnabled: options.fallbackEnabled === undefined
+            ? booleanValue(env.SUPERMAP_FALLBACK_ENABLED, true)
+            : Boolean(options.fallbackEnabled),
+        maxSnapDistanceM: positiveNumber(options.maxSnapDistanceM, 200),
+        boundsBufferDeg: nonNegativeNumber(options.boundsBufferDeg, 0)
     });
 }
 
@@ -83,5 +103,6 @@ module.exports = {
     createSuperMapGateway,
     booleanValue,
     positiveNumber,
+    nonNegativeNumber,
     manifestPathOf
 };

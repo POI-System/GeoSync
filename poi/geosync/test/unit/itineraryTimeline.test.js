@@ -2,6 +2,11 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
+const { decodePolyline } = require('../../lib/geo');
+const {
+    IServerTimeoutError,
+    SuperMapError
+} = require('../../integrations/supermap/errors');
 const {
     rebuildTimeline,
     TimelineRebuildError,
@@ -121,8 +126,36 @@ test('anchor falls back from stale position to arrived, last done, then startLoc
 
 test('rebuilds every mutable segment with route ETA, geometry, and original stay duration', async () => {
     const routes = [
-        { walkSec: 120, pathGeometry: 'start-to-a', fallback: false },
-        { walkSec: 180, pathGeometry: 'a-to-b', fallback: false }
+        {
+            durationSec: 120,
+            walkSec: 9999,
+            distanceM: 140,
+            geometry: {
+                type: 'LineString',
+                coordinates: [[118, 32], [118.001, 32.001]]
+            },
+            segments: [{ edgeId: 'edge-a', distanceM: 140, durationSec: 120 }],
+            snap: { startDistanceM: 1, endDistanceM: 2 },
+            gis: {
+                source: 'iserver', mode: 'shade', degraded: false,
+                requestId: 'gis-a', durationMs: 10, dataVersion: 'v1'
+            }
+        },
+        {
+            durationSec: 180,
+            walkSec: 9999,
+            distanceM: 220,
+            geometry: {
+                type: 'LineString',
+                coordinates: [[118.001, 32.001], [118.002, 32.002]]
+            },
+            segments: [{ edgeId: 'edge-b', distanceM: 220, durationSec: 180 }],
+            snap: { startDistanceM: 3, endDistanceM: 4 },
+            gis: {
+                source: 'cache', mode: 'shade', degraded: true,
+                requestId: 'gis-b', durationMs: 5, dataVersion: 'v1'
+            }
+        }
     ];
     const calls = [];
     const rebuilt = await rebuildTimeline({
@@ -147,7 +180,16 @@ test('rebuilds every mutable segment with route ETA, geometry, and original stay
     assert.strictEqual(rebuilt[0].plannedLeave.toISOString(), '2026-07-21T09:12:00.000Z');
     assert.strictEqual(rebuilt[1].plannedArrive.toISOString(), '2026-07-21T09:15:00.000Z');
     assert.strictEqual(rebuilt[1].plannedLeave.toISOString(), '2026-07-21T09:35:00.000Z');
-    assert.deepStrictEqual(rebuilt.map(item => item.pathGeometry), ['start-to-a', 'a-to-b']);
+    assert.deepStrictEqual(rebuilt.map(item => item.durationSec), [120, 180]);
+    assert.deepStrictEqual(rebuilt.map(item => item.distanceM), [140, 220]);
+    assert.deepStrictEqual(rebuilt[0].geometry.coordinates, [[118, 32], [118.001, 32.001]]);
+    assert.deepStrictEqual(rebuilt.map(item => item.segments[0].edgeId), ['edge-a', 'edge-b']);
+    assert.deepStrictEqual(rebuilt[0].snap, { startDistanceM: 1, endDistanceM: 2 });
+    assert.strictEqual(rebuilt[1].gis.source, 'cache');
+    assert.deepStrictEqual(
+        decodePolyline(rebuilt[0].pathGeometry),
+        [[118, 32], [118.001, 32.001]]
+    );
     assert.deepStrictEqual(rebuilt.map(item => item.state), ['approaching', 'pending']);
 });
 
@@ -200,7 +242,7 @@ test('replace uses the new POI suggested stay with itinerary pace', async () => 
     assert.strictEqual(rebuilt[0].plannedLeave.toISOString(), '2026-07-21T09:40:00.000Z');
 });
 
-test('accessible mode rejects unavailable and fallback routes', async () => {
+test('accessible mode rejects unavailable and unverified fallback routes', async () => {
     const base = {
         itinerary: { startLocation: [118, 32], preferences: { accessible: true } },
         proposedStops: [stop('a', 'poi-a')],
@@ -208,12 +250,78 @@ test('accessible mode rejects unavailable and fallback routes', async () => {
         loadPois: loader([poi('poi-a')])
     };
 
-    for (const result of [null, { walkSec: 60, pathGeometry: 'direct', fallback: true }]) {
+    await assert.rejects(
+        rebuildTimeline({ ...base, routeBetween: async () => null }),
+        error => error instanceof TimelineRebuildError && error.code === 'ACCESSIBLE_ROUTE_UNAVAILABLE'
+    );
+
+    for (const result of [
+        { walkSec: 60, pathGeometry: 'direct', fallback: true },
+        {
+            durationSec: 60,
+            distanceM: 80,
+            geometry: { type: 'LineString', coordinates: [[118, 32], [118.001, 32.001]] },
+            gis: { source: 'local-fallback', requestId: 'accessible-request' }
+        }
+    ]) {
         await assert.rejects(
             rebuildTimeline({ ...base, routeBetween: async () => result }),
-            error => error instanceof TimelineRebuildError && error.code === 'ACCESSIBLE_ROUTE_UNAVAILABLE'
+            error => error instanceof SuperMapError
+                && error.code === 8204
+                && error.httpStatus === 422
+                && error.retryable === false
         );
     }
+});
+
+test('accessible mode preserves a verified local fallback route', async () => {
+    const rebuilt = await rebuildTimeline({
+        itinerary: { startLocation: [118, 32], preferences: { accessible: true } },
+        proposedStops: [stop('a', 'poi-a')],
+        now: NOW,
+        loadPois: loader([poi('poi-a', [118.001, 32.001])]),
+        routeBetween: async () => ({
+            durationSec: 60,
+            distanceM: 80,
+            geometry: {
+                type: 'LineString',
+                coordinates: [[118, 32], [118.001, 32.001]]
+            },
+            segments: [{ edgeId: 'verified-accessible-edge', distanceM: 80, durationSec: 60 }],
+            snap: { startDistanceM: 0, endDistanceM: 0 },
+            gis: {
+                source: 'local-fallback', mode: 'accessible', degraded: true,
+                requestId: 'accessible-verified', durationMs: 5, dataVersion: 'v1'
+            },
+            verifiedAccessible: true,
+            accessibleVerified: true
+        })
+    });
+
+    assert.equal(rebuilt[0].verifiedAccessible, true);
+    assert.equal(rebuilt[0].gis.source, 'local-fallback');
+    assert.deepStrictEqual(
+        decodePolyline(rebuilt[0].pathGeometry),
+        [[118, 32], [118.001, 32.001]]
+    );
+});
+
+test('typed SuperMap route failures are preserved without TimelineRebuildError wrapping', async () => {
+    const typed = new IServerTimeoutError(undefined, {
+        operation: 'findPath',
+        requestId: 'gis-timeout'
+    });
+
+    await assert.rejects(
+        rebuildTimeline({
+            itinerary: { startLocation: [118, 32], preferences: {} },
+            proposedStops: [stop('a', 'poi-a')],
+            now: NOW,
+            loadPois: loader([poi('poi-a')]),
+            routeBetween: async () => { throw typed; }
+        }),
+        error => error === typed
+    );
 });
 
 test('standard mode accepts an explicit fallback route', async () => {

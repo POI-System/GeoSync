@@ -1,6 +1,8 @@
 'use strict';
 // 03文档 §1：统一响应格式 {success, code, data, message} 与错误码。
 
+const { SuperMapError } = require('../integrations/supermap/errors');
+
 class BizError extends Error {
     constructor(code, message, httpStatus = 400) {
         super(message);
@@ -28,6 +30,9 @@ function wrap(handler) {
             await handler(req, res, next);
         } catch (e) {
             if (e instanceof BizError) {
+                return fail(res, e.httpStatus, e.code, e.message);
+            }
+            if (e instanceof SuperMapError) {
                 return fail(res, e.httpStatus, e.code, e.message);
             }
             console.error('[GeoSync] [ERROR]', req.method, req.originalUrl, e);

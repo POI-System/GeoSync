@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const normalizeGeometry = require('../../integrations/supermap/normalizers');
+const { normalizeRouteGeometry, normalizeRouteGeometryWithMeta } = normalizeGeometry;
 const { GeometryNormalizationError } = require('../../integrations/supermap/errors');
 
 function is8206(error) {
@@ -16,6 +17,8 @@ test('default and gateway-facing named exports share the same normalizer', () =>
     assert.strictEqual(normalizeGeometry.normalizeGeometry, normalizeGeometry);
     assert.strictEqual(normalizeGeometry.normalizeGeoJsonGeometry, normalizeGeometry);
     assert.strictEqual(normalizeGeometry.normalizeGeoJSONGeometry, normalizeGeometry);
+    assert.equal(typeof normalizeRouteGeometry, 'function');
+    assert.equal(typeof normalizeRouteGeometryWithMeta, 'function');
 });
 
 test('normalizes Points to EPSG:4326 pairs rounded to six decimals', () => {
@@ -170,5 +173,129 @@ test('errors carry sanitized operation and requestId context without raw geometr
     assert.equal(thrown.operation, 'findPath__unsafe');
     assert.equal(thrown.requestId, 'gis_request__42');
     assert.equal(JSON.stringify(thrown.toJSON()).includes('do-not-copy'), false);
+    assert.equal(JSON.stringify(thrown.toJSON()).includes('999'), false);
+});
+
+test('route normalizer accepts coordinate arrays, drops invalid points, rounds, and deduplicates', () => {
+    const input = [
+        [120.123456789, 30.123456789],
+        null,
+        [120.1234568, 30.1234568],
+        ['120.2', 30.2],
+        [999, 999],
+        [120.2, 30.2]
+    ];
+
+    assert.deepEqual(normalizeRouteGeometry(input), {
+        type: 'LineString',
+        coordinates: [[120.123457, 30.123457], [120.2, 30.2]]
+    });
+    assert.deepEqual(input[0], [120.123456789, 30.123456789]);
+});
+
+test('route normalizer corrects axis order using WGS84 validity', () => {
+    assert.deepEqual(normalizeRouteGeometry({
+        type: 'LineString',
+        coordinates: [[30, 120], [30.1, 120.1]]
+    }), {
+        type: 'LineString',
+        coordinates: [[120, 30], [120.1, 30.1]]
+    });
+});
+
+test('route normalizer uses extent context for ambiguous axis order', () => {
+    const result = normalizeRouteGeometry([
+        [30, 40],
+        [30.5, 40.5],
+        [31, 41]
+    ], {
+        extent: [39, 29, 42, 32]
+    });
+
+    assert.deepEqual(result.coordinates, [[40, 30], [40.5, 30.5], [41, 31]]);
+});
+
+test('route normalizer uses endpoint context for ambiguous axis order', () => {
+    const result = normalizeRouteGeometry([
+        [30, 40],
+        [30.5, 40.5],
+        [31, 41]
+    ], {
+        start: [40, 30],
+        end: [41, 31]
+    });
+
+    assert.deepEqual(result.coordinates, [[40, 30], [40.5, 30.5], [41, 31]]);
+});
+
+test('route normalizer reverses a valid route when endpoint scoring favors reverse direction', () => {
+    const result = normalizeRouteGeometry({
+        type: 'LineString',
+        coordinates: [[120.2, 30.2], [120.1, 30.1], [120, 30]]
+    }, {
+        start: [120, 30],
+        end: [120.2, 30.2]
+    });
+
+    assert.deepEqual(result.coordinates, [[120, 30], [120.1, 30.1], [120.2, 30.2]]);
+});
+
+test('route normalization metadata identifies axis correction and direction reversal', () => {
+    const axisResult = normalizeRouteGeometryWithMeta([
+        [30, 120],
+        [30.1, 120.1]
+    ]);
+    assert.deepEqual(axisResult, {
+        geometry: {
+            type: 'LineString',
+            coordinates: [[120, 30], [120.1, 30.1]]
+        },
+        reversed: false,
+        axisSwapped: true
+    });
+
+    const directionResult = normalizeRouteGeometryWithMeta([
+        [120.2, 30.2],
+        [120.1, 30.1],
+        [120, 30]
+    ], {
+        start: [120, 30],
+        end: [120.2, 30.2]
+    });
+    assert.deepEqual(directionResult, {
+        geometry: {
+            type: 'LineString',
+            coordinates: [[120, 30], [120.1, 30.1], [120.2, 30.2]]
+        },
+        reversed: true,
+        axisSwapped: false
+    });
+});
+
+test('route normalizer rejects unusable routes and sanitizes error context', () => {
+    for (const input of [
+        null,
+        { type: 'Point', coordinates: [120, 30] },
+        [[120, 30], [120.0000004, 30.0000004]],
+        [[999, 999], ['secret', 30]]
+    ]) {
+        assert.throws(() => normalizeRouteGeometry(input), is8206);
+    }
+
+    let thrown;
+    try {
+        normalizeRouteGeometry([[999, 999]], {
+            operation: 'findPath\r\nunsafe',
+            requestId: 'route request\r\n42',
+            extent: [120, 30, 119, 31]
+        });
+    } catch (error) {
+        thrown = error;
+    }
+
+    assert.equal(is8206(thrown), true);
+    assert.equal(thrown.operation, 'findPath__unsafe');
+    assert.equal(thrown.requestId, 'route_request__42');
+    assert.equal(JSON.stringify(thrown.toJSON()).includes('secret'), false);
     assert.equal(JSON.stringify(thrown.toJSON()).includes('999'), false);
 });

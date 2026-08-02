@@ -68,6 +68,151 @@ function startCoordinates(value) {
     return [value[0], value[1]];
 }
 
+function routeBetweenOf(req) {
+    const routeBetween = req?.app?.locals?.geosync?.routeBetween;
+    if (typeof routeBetween !== 'function') {
+        throw new BizError(8201, 'GIS route provider is unavailable', 503);
+    }
+    return routeBetween;
+}
+
+function toPlain(value) {
+    return value?.toObject ? value.toObject() : value;
+}
+
+function serializedGeometry(value) {
+    const geometry = toPlain(value);
+    if (geometry?.type !== 'LineString' || !Array.isArray(geometry.coordinates)) return null;
+    const coordinates = geometry.coordinates
+        .filter(position => Array.isArray(position) && position.length === 2 && position.every(Number.isFinite))
+        .map(position => [position[0], position[1]]);
+    return coordinates.length >= 2 ? { type: 'LineString', coordinates } : null;
+}
+
+function serializedGis(value) {
+    const gis = toPlain(value);
+    if (!gis || typeof gis !== 'object') return null;
+    return {
+        source: gis.source || null,
+        mode: gis.mode || null,
+        degraded: Boolean(gis.degraded),
+        requestId: gis.requestId || null,
+        durationMs: Number.isFinite(gis.durationMs) ? gis.durationMs : 0,
+        dataVersion: gis.dataVersion || null
+    };
+}
+
+function serializedSegments(value) {
+    if (!Array.isArray(value)) return [];
+    return value.map(item => {
+        const segment = toPlain(item) || {};
+        const sourceRef = toPlain(segment.sourceRef);
+        return {
+            edgeId: segment.edgeId || '',
+            distanceM: Number.isFinite(segment.distanceM) ? segment.distanceM : null,
+            durationSec: Number.isFinite(segment.durationSec) ? segment.durationSec : null,
+            ...(sourceRef ? {
+                sourceRef: {
+                    datasetName: sourceRef.datasetName || '',
+                    smId: Number.isFinite(sourceRef.smId) ? sourceRef.smId : null
+                }
+            } : {})
+        };
+    });
+}
+
+function serializedSnap(value) {
+    const snap = toPlain(value);
+    if (!snap || typeof snap !== 'object') return null;
+    return {
+        startDistanceM: Number.isFinite(snap.startDistanceM) ? snap.startDistanceM : null,
+        endDistanceM: Number.isFinite(snap.endDistanceM) ? snap.endDistanceM : null
+    };
+}
+
+function serializedRouteFields(value) {
+    const route = toPlain(value) || {};
+    const verifiedAccessible = route.verifiedAccessible === true || route.accessibleVerified === true
+        ? true
+        : route.verifiedAccessible === false || route.accessibleVerified === false
+            ? false
+            : null;
+    return {
+        geometry: serializedGeometry(route.geometry),
+        distanceM: Number.isFinite(route.distanceM) ? route.distanceM : null,
+        durationSec: Number.isFinite(route.durationSec) ? route.durationSec : null,
+        gis: serializedGis(route.gis),
+        segments: serializedSegments(route.segments),
+        snap: serializedSnap(route.snap),
+        verifiedAccessible,
+        pathGeometry: typeof route.pathGeometry === 'string' ? route.pathGeometry : ''
+    };
+}
+
+function routeMode(preferences = {}) {
+    if (preferences?.accessible) return 'accessible';
+    if (preferences?.shadeFirst) return 'shade';
+    return 'normal';
+}
+
+function aggregateRouteFromStops(stops, preferences, fallback = null) {
+    const legs = (stops || [])
+        .filter(stop => !['skipped', 'rerouted'].includes(stop.state))
+        .map(serializedRouteFields)
+        .filter(route => route.geometry
+            && Number.isFinite(route.distanceM)
+            && Number.isFinite(route.durationSec));
+    if (!legs.length) return fallback ? serializedRouteFields(fallback) : null;
+
+    const coordinates = [];
+    const segments = [];
+    for (const leg of legs) {
+        for (const position of leg.geometry.coordinates) {
+            const previous = coordinates[coordinates.length - 1];
+            if (!previous || previous[0] !== position[0] || previous[1] !== position[1]) {
+                coordinates.push([...position]);
+            }
+        }
+        segments.push(...leg.segments);
+    }
+    const gisEntries = legs.map(leg => leg.gis).filter(Boolean);
+    const firstGis = gisEntries[0];
+    const source = gisEntries.some(gis => gis.source === 'local-fallback')
+        ? 'local-fallback'
+        : gisEntries.some(gis => gis.source === 'cache')
+            ? 'cache'
+            : firstGis?.source || null;
+    const versions = [...new Set(gisEntries.map(gis => gis.dataVersion).filter(Boolean))];
+    const firstSnap = legs[0].snap;
+    const lastSnap = legs[legs.length - 1].snap;
+    const verificationValues = legs.map(leg => leg.verifiedAccessible);
+    const verifiedAccessible = verificationValues.every(value => value === true)
+        ? true
+        : verificationValues.some(value => value === false)
+            ? false
+            : null;
+    return {
+        geometry: { type: 'LineString', coordinates },
+        distanceM: legs.reduce((sum, leg) => sum + leg.distanceM, 0),
+        durationSec: legs.reduce((sum, leg) => sum + leg.durationSec, 0),
+        gis: firstGis ? {
+            ...firstGis,
+            source,
+            mode: routeMode(preferences),
+            degraded: gisEntries.some(gis => gis.degraded || gis.source !== 'iserver'),
+            durationMs: gisEntries.reduce((sum, gis) => sum + gis.durationMs, 0),
+            dataVersion: versions.length === 1 ? versions[0] : null
+        } : null,
+        segments,
+        snap: firstSnap || lastSnap ? {
+            startDistanceM: firstSnap?.startDistanceM ?? null,
+            endDistanceM: lastSnap?.endDistanceM ?? null
+        } : null,
+        verifiedAccessible,
+        pathGeometry: geo.encodePolyline(coordinates)
+    };
+}
+
 function tokenIdsOf(itinerary) {
     return [...new Set([
         ...(itinerary.pendingProposal?.tokenIds || []),
@@ -88,6 +233,7 @@ async function serialize(it) {
     const stops = it.stops.map(s => {
         const poi = poiMap.get(String(s.poiId));
         const f = forecast.getForecast(s.poiId);
+        const route = serializedRouteFields(s);
         return {
             stopId: s._id, poiId: s.poiId,
             poiName: poi?.poiName || '',
@@ -98,7 +244,14 @@ async function serialize(it) {
             capacityTokenId: s.capacityTokenId || null,
             state: s.state,
             ci: f ? { predictedAtArrive: f.p30 } : null,
-            pathGeometry: s.pathGeometry
+            geometry: route.geometry,
+            distanceM: route.distanceM,
+            durationSec: route.durationSec,
+            gis: route.gis,
+            segments: route.segments,
+            snap: route.snap,
+            verifiedAccessible: route.verifiedAccessible,
+            pathGeometry: route.pathGeometry
         };
     });
     const cur = it.stops.find(s => ['approaching', 'arrived'].includes(s.state)) ||
@@ -107,6 +260,9 @@ async function serialize(it) {
         itineraryId: it._id, version: it.version, state: it.state,
         date: it.date, preferences: it.preferences,
         stops,
+        route: it.route
+            ? serializedRouteFields(it.route)
+            : aggregateRouteFromStops(it.stops, it.preferences),
         currentStopId: cur?._id || null,
         pendingProposal: it.pendingProposal?.proposalId ? {
             proposalId: it.pendingProposal.proposalId,
@@ -143,11 +299,13 @@ router.post('/plan', wrap(async (req, res) => {
     }
     const { startLocation, startAt, hours, interests, pace, accessible, shadeFirst } = req.body || {};
     const origin = startCoordinates(startLocation) || CONFIG.scenicCenter;
+    const routeBetween = routeBetweenOf(req);
     const result = await planner.plan({
         startLocation: origin, startAt, hours: Number(hours),
         interests, pace, accessible: Boolean(accessible), shadeFirst: Boolean(shadeFirst),
-        openId: req.openId
-    });
+        openId: req.openId,
+        requestId: req.headers?.['x-request-id']
+    }, { routeBetween });
     let it;
     try {
         it = await Itinerary.create({
@@ -155,7 +313,8 @@ router.post('/plan', wrap(async (req, res) => {
             date: geo.dateStrOf(startAt || new Date()),
             startLocation: origin ? { type: 'Point', coordinates: origin } : null,
             preferences: { pace: pace || 'normal', interests: interests || [], hours: Number(hours), accessible: Boolean(accessible), shadeFirst: Boolean(shadeFirst) },
-            stops: result.stops
+            stops: result.stops,
+            route: result.route
         });
     } catch (error) {
         if (error?.code === 11000) {
@@ -286,6 +445,7 @@ router.post('/:id/proposal/:proposalId/:decision(accept|reject)', wrap(async (re
     const accepted = req.params.decision === 'accept';
 
     if (accepted) {
+        const routeBetween = routeBetweenOf(req);
         const claimId = 'c_' + crypto.randomBytes(8).toString('hex');
         const claimed = await antiHerding.claimTokens(pp.tokenIds, it._id, now, claimId);
         if (!claimed) {
@@ -304,7 +464,8 @@ router.post('/:id/proposal/:proposalId/:decision(accept|reject)', wrap(async (re
                 itinerary: it,
                 proposedStops,
                 proposal: pp,
-                now
+                now,
+                routeBetween
             });
         } catch (error) {
             await antiHerding.rollbackClaimedTokens(pp.tokenIds, it._id, claimId);
@@ -313,6 +474,7 @@ router.post('/:id/proposal/:proposalId/:decision(accept|reject)', wrap(async (re
             }
             throw error;
         }
+        const newRoute = aggregateRouteFromStops(newStops, it.preferences, it.route);
 
         const commitNow = new Date();
         const claimStillActive = await antiHerding.claimedTokensActive(
@@ -335,7 +497,7 @@ router.post('/:id/proposal/:proposalId/:decision(accept|reject)', wrap(async (re
                     'pendingProposal.expireAt': { $gt: commitNow }
                 },
                 {
-                    $set: { stops: newStops, pendingProposal: null },
+                    $set: { stops: newStops, route: newRoute, pendingProposal: null },
                     $inc: { version: 1, rerouteCount: 1, savedMinutesTotal: pp.gainMin || 0 },
                     $push: {
                         rerouteLog: {

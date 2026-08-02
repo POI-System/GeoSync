@@ -44,6 +44,116 @@ function samePosition(left, right) {
     return left[0] === right[0] && left[1] === right[1];
 }
 
+function isWgs84Position(value) {
+    return Array.isArray(value)
+        && value.length === 2
+        && value.every(Number.isFinite)
+        && value[0] >= -180
+        && value[0] <= 180
+        && value[1] >= -90
+        && value[1] <= 90;
+}
+
+function routeReferencePosition(value, context) {
+    if (value === undefined || value === null) return null;
+    if (!isWgs84Position(value)) fail(context);
+    return [roundSix(value[0]), roundSix(value[1])];
+}
+
+function routeExtent(value, context) {
+    if (value === undefined || value === null) return null;
+    if (
+        !Array.isArray(value)
+        || value.length !== 4
+        || !value.every(Number.isFinite)
+        || value[0] < -180
+        || value[2] > 180
+        || value[1] < -90
+        || value[3] > 90
+        || value[0] >= value[2]
+        || value[1] >= value[3]
+    ) {
+        fail(context);
+    }
+    return value.map(roundSix);
+}
+
+function planarDistanceSquared(left, right) {
+    const meanLatitude = (left[1] + right[1]) * Math.PI / 360;
+    const longitudeDelta = (left[0] - right[0]) * Math.cos(meanLatitude);
+    const latitudeDelta = left[1] - right[1];
+    return longitudeDelta * longitudeDelta + latitudeDelta * latitudeDelta;
+}
+
+function routeEndpointScore(coordinates, start, end) {
+    const first = coordinates[0];
+    const last = coordinates[coordinates.length - 1];
+    const forward = (start ? planarDistanceSquared(start, first) : 0)
+        + (end ? planarDistanceSquared(end, last) : 0);
+    const reverse = (start ? planarDistanceSquared(start, last) : 0)
+        + (end ? planarDistanceSquared(end, first) : 0);
+    return { forward, reverse, best: Math.min(forward, reverse) };
+}
+
+function routeExtentScore(coordinates, extent) {
+    if (!extent) return { outsideCount: 0, distance: 0 };
+    let outsideCount = 0;
+    let distance = 0;
+    for (const coordinate of coordinates) {
+        const clamped = [
+            Math.min(extent[2], Math.max(extent[0], coordinate[0])),
+            Math.min(extent[3], Math.max(extent[1], coordinate[1]))
+        ];
+        if (!samePosition(coordinate, clamped)) outsideCount++;
+        distance += planarDistanceSquared(coordinate, clamped);
+    }
+    return { outsideCount, distance };
+}
+
+function routeAxisCandidate(rawCoordinates, swapped, start, end, extent) {
+    const coordinates = [];
+    let validCount = 0;
+    for (const rawPosition of rawCoordinates) {
+        if (!Array.isArray(rawPosition) || rawPosition.length !== 2 || !rawPosition.every(Number.isFinite)) {
+            continue;
+        }
+        const candidate = swapped
+            ? [rawPosition[1], rawPosition[0]]
+            : [rawPosition[0], rawPosition[1]];
+        if (!isWgs84Position(candidate)) continue;
+        validCount++;
+        const rounded = [roundSix(candidate[0]), roundSix(candidate[1])];
+        if (!coordinates.length || !samePosition(coordinates[coordinates.length - 1], rounded)) {
+            coordinates.push(rounded);
+        }
+    }
+
+    if (coordinates.length < 2) return null;
+    return {
+        coordinates,
+        validCount,
+        extentScore: routeExtentScore(coordinates, extent),
+        endpointScore: routeEndpointScore(coordinates, start, end)
+    };
+}
+
+function routeCandidateIsBetter(candidate, current, hasExtent, hasEndpointContext) {
+    if (!current) return true;
+    if (hasExtent) {
+        if (candidate.extentScore.outsideCount !== current.extentScore.outsideCount) {
+            return candidate.extentScore.outsideCount < current.extentScore.outsideCount;
+        }
+        if (candidate.extentScore.distance !== current.extentScore.distance) {
+            return candidate.extentScore.distance < current.extentScore.distance;
+        }
+    }
+    if (hasEndpointContext && candidate.endpointScore.best !== current.endpointScore.best) {
+        return candidate.endpointScore.best < current.endpointScore.best;
+    }
+    if (candidate.validCount !== current.validCount) return candidate.validCount > current.validCount;
+    return candidate.coordinates.length > current.coordinates.length;
+}
+
 function arrayScope(value, state, context, operation) {
     if (!Array.isArray(value) || state.ancestors.has(value)) fail(context);
     state.ancestors.add(value);
@@ -149,8 +259,51 @@ function normalizeGeometry(rawGeometry, context = {}) {
     }
 }
 
+function normalizeRouteGeometryWithMeta(rawGeometry, context = {}) {
+    try {
+        const routeContext = isPlainObject(context) ? context : {};
+        const rawCoordinates = Array.isArray(rawGeometry)
+            ? rawGeometry
+            : isPlainObject(rawGeometry) && rawGeometry.type === 'LineString'
+                ? rawGeometry.coordinates
+                : null;
+        if (!Array.isArray(rawCoordinates)) fail(routeContext);
+
+        const start = routeReferencePosition(routeContext.start, routeContext);
+        const end = routeReferencePosition(routeContext.end, routeContext);
+        const extent = routeExtent(routeContext.extent, routeContext);
+        const canonical = routeAxisCandidate(rawCoordinates, false, start, end, extent);
+        const swapped = routeAxisCandidate(rawCoordinates, true, start, end, extent);
+        let selected = canonical;
+        let axisSwapped = false;
+        if (swapped && routeCandidateIsBetter(swapped, selected, Boolean(extent), Boolean(start || end))) {
+            selected = swapped;
+            axisSwapped = true;
+        }
+        if (!selected) fail(routeContext);
+
+        const coordinates = selected.coordinates.map(position => [...position]);
+        const reversed = selected.endpointScore.reverse < selected.endpointScore.forward;
+        if (reversed) coordinates.reverse();
+        return {
+            geometry: { type: 'LineString', coordinates },
+            reversed,
+            axisSwapped
+        };
+    } catch (error) {
+        if (error instanceof GeometryNormalizationError) throw error;
+        throw normalizationError(isPlainObject(context) ? context : {});
+    }
+}
+
+function normalizeRouteGeometry(rawGeometry, context = {}) {
+    return normalizeRouteGeometryWithMeta(rawGeometry, context).geometry;
+}
+
 module.exports = normalizeGeometry;
 module.exports.normalizeGeometry = normalizeGeometry;
 module.exports.normalizeGeoJsonGeometry = normalizeGeometry;
 module.exports.normalizeGeoJSONGeometry = normalizeGeometry;
+module.exports.normalizeRouteGeometry = normalizeRouteGeometry;
+module.exports.normalizeRouteGeometryWithMeta = normalizeRouteGeometryWithMeta;
 module.exports.SUPPORTED_TYPES = SUPPORTED_TYPES;

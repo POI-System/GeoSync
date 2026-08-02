@@ -10,6 +10,16 @@ let updateResult;
 let updateCalls;
 let calls;
 let rebuildImpl;
+let rebuildArgs;
+
+const injectedRouteBetween = async () => ({
+    durationSec: 60,
+    distanceM: 80,
+    geometry: { type: 'LineString', coordinates: [[118, 32], [118.001, 32.001]] },
+    segments: [],
+    snap: { startDistanceM: 0, endDistanceM: 0 },
+    gis: { source: 'iserver', mode: 'normal', degraded: false }
+});
 
 const Itinerary = {
     async findOne() {
@@ -94,6 +104,7 @@ function reset() {
     calls = [];
     updateCalls = [];
     updateResult = undefined;
+    rebuildArgs = null;
     currentItinerary = {
         _id: 'itinerary-1',
         openId: 'user-1',
@@ -116,13 +127,25 @@ function reset() {
             pathGeometry: ''
         }]
     };
-    rebuildImpl = async ({ proposedStops }) => {
+    rebuildImpl = async args => {
+        rebuildArgs = args;
+        const { proposedStops } = args;
         calls.push('rebuild');
         return proposedStops.map(stop => ({
             ...stop,
             poiId: 'poi-new',
             capacityTokenId: 'token-new',
-            state: 'approaching'
+            state: 'approaching',
+            geometry: { type: 'LineString', coordinates: [[118, 32], [118.001, 32.001]] },
+            distanceM: 80,
+            durationSec: 60,
+            gis: {
+                source: 'iserver', mode: 'normal', degraded: false,
+                requestId: 'gis-route', durationMs: 12, dataVersion: 'v1'
+            },
+            segments: [{ edgeId: 'edge-1', distanceM: 80, durationSec: 60 }],
+            snap: { startDistanceM: 1, endDistanceM: 2 },
+            pathGeometry: 'encoded-route'
         }));
     };
 }
@@ -150,7 +173,8 @@ async function decide() {
         params: {
             id: 'itinerary-1', proposalId: 'proposal-1', decision: 'accept'
         },
-        body: { version: 4 }
+        body: { version: 4 },
+        app: { locals: { geosync: { routeBetween: injectedRouteBetween } } }
     };
     const res = response();
     await decisionHandler(req, res, () => {});
@@ -171,6 +195,55 @@ test('proposal acceptance claims, rebuilds, commits, indexes, then finalizes', a
     assert.equal(updateCalls[0].filter.version, 4);
     assert.equal(updateCalls[0].filter['pendingProposal.proposalId'], 'proposal-1');
     assert.ok(updateCalls[0].filter['pendingProposal.expireAt'].$gt instanceof Date);
+    assert.equal(rebuildArgs.routeBetween, injectedRouteBetween);
+    assert.equal(updateCalls[0].filter.state, 'active');
+    assert.equal(updateCalls[0].update.$set.route.distanceM, 80);
+    assert.equal(updateCalls[0].update.$set.route.durationSec, 60);
+    assert.deepEqual(
+        updateCalls[0].update.$set.route.geometry.coordinates,
+        [[118, 32], [118.001, 32.001]]
+    );
+    assert.equal(updateCalls[0].update.$set.route.segments[0].edgeId, 'edge-1');
+    assert.equal(res.body.data.route.distanceM, 80);
+    assert.equal(res.body.data.stops[0].durationSec, 60);
+    assert.equal(res.body.data.stops[0].pathGeometry, 'encoded-route');
+});
+
+test('aggregate route does not promote mixed verified and unknown accessibility evidence', async () => {
+    reset();
+    currentItinerary.stops.push({
+        _id: 'stop-2', poiId: 'poi-next', state: 'pending',
+        plannedArrive: new Date(), plannedLeave: new Date(Date.now() + 1200000),
+        pathGeometry: ''
+    });
+    rebuildImpl = async ({ proposedStops }) => {
+        calls.push('rebuild');
+        return proposedStops.map((stop, index) => ({
+            ...stop,
+            geometry: {
+                type: 'LineString',
+                coordinates: index === 0
+                    ? [[118, 32], [118.001, 32.001]]
+                    : [[118.001, 32.001], [118.002, 32.002]]
+            },
+            distanceM: 80,
+            durationSec: 60,
+            gis: {
+                source: 'local-fallback', mode: 'accessible', degraded: true,
+                requestId: `gis-route-${index}`, durationMs: 12, dataVersion: 'v1'
+            },
+            segments: [{ edgeId: `edge-${index + 1}`, distanceM: 80, durationSec: 60 }],
+            snap: { startDistanceM: 0, endDistanceM: 0 },
+            ...(index === 0 ? { verifiedAccessible: true } : {}),
+            pathGeometry: `encoded-route-${index}`
+        }));
+    };
+
+    const res = await decide();
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(updateCalls[0].update.$set.route.verifiedAccessible, null);
+    assert.equal(res.body.data.route.verifiedAccessible, null);
 });
 
 test('route rebuild failure rolls back the claim without writing itinerary', async () => {

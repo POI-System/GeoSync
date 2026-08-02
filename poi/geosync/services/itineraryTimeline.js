@@ -1,6 +1,8 @@
 'use strict';
 
 const { getModels } = require('../models');
+const { NoRouteError, SuperMapError } = require('../integrations/supermap/errors');
+const { encodePolyline } = require('../lib/geo');
 const walkGraph = require('./walkGraph');
 
 const RECENT_POSITION_MAX_AGE_MS = 5 * 60000;
@@ -63,12 +65,19 @@ async function rebuildTimeline({
 
         const poi = requirePoi(poiMap, stop.poiId);
         const route = await resolveRoute(routeBetween, cursorPoi, poi, mode, stop);
-        const arrive = new Date(cursorAt.getTime() + route.walkSec * 1000);
+        const arrive = new Date(cursorAt.getTime() + route.durationSec * 1000);
         const usePoiStay = replaceStopId && idOf(stop._id || stop.stopId) === replaceStopId;
         const leave = new Date(arrive.getTime() + stayDurationMs(stop, poi, itinerary.preferences, usePoiStay));
 
         stop.plannedArrive = arrive;
         stop.plannedLeave = leave;
+        stop.durationSec = route.durationSec;
+        stop.distanceM = route.distanceM;
+        stop.geometry = route.geometry;
+        stop.segments = route.segments;
+        stop.snap = route.snap;
+        stop.gis = route.gis;
+        stop.verifiedAccessible = route.verifiedAccessible;
         stop.pathGeometry = route.pathGeometry;
         cursorPoi = poi;
         cursorAt = leave;
@@ -110,6 +119,7 @@ async function resolveRoute(routeBetween, fromPoi, toPoi, mode, stop) {
     try {
         route = await routeBetween(fromPoi, toPoi, mode);
     } catch (error) {
+        if (error instanceof SuperMapError) throw error;
         throw new TimelineRebuildError('ROUTE_FAILED', `route calculation failed for stop ${idOf(stop._id || stop.stopId)}`, {
             stopId: idOf(stop._id || stop.stopId),
             cause: error
@@ -119,24 +129,108 @@ async function resolveRoute(routeBetween, fromPoi, toPoi, mode, stop) {
     const legacyFallback = route?.fallback == null &&
         Array.isArray(route?.nodeIds) && route.nodeIds.length === 0 &&
         Number(route?.distanceM) > 0;
-    if (!route || (mode === 'accessible' && (route.fallback === true || legacyFallback))) {
+    if (!route) {
         const code = mode === 'accessible' ? 'ACCESSIBLE_ROUTE_UNAVAILABLE' : 'ROUTE_UNAVAILABLE';
         throw new TimelineRebuildError(code, `route unavailable for stop ${idOf(stop._id || stop.stopId)}`, {
             stopId: idOf(stop._id || stop.stopId), mode
         });
     }
-    if (!Number.isFinite(route.walkSec) || route.walkSec < 0) {
-        throw new TimelineRebuildError('INVALID_ROUTE', 'route walkSec must be a non-negative number', {
-            stopId: idOf(stop._id || stop.stopId)
+    const localFallback = route.fallback === true
+        || legacyFallback
+        || route.gis?.source === 'local-fallback';
+    const verifiedAccessible = route.verifiedAccessible === true || route.accessibleVerified === true;
+    if (mode === 'accessible' && localFallback && !verifiedAccessible) {
+        throw new NoRouteError(undefined, {
+            operation: 'findPath',
+            requestId: route.gis?.requestId,
+            category: 'no-route',
+            retryable: false
         });
     }
 
+    const stopId = idOf(stop._id || stop.stopId);
+    const durationSec = durationSecOf(route, stopId);
+    const distanceM = distanceMOf(route, stopId);
+    const geometry = geometryOf(route, stopId);
     const pathGeometry = typeof route.pathGeometry === 'string'
         ? route.pathGeometry
         : typeof route.polyline === 'string'
             ? route.polyline
-            : Array.isArray(route.coords) ? walkGraph.pathPolyline(route) : '';
-    return { walkSec: route.walkSec, pathGeometry };
+            : geometry ? encodePolyline(geometry.coordinates) : '';
+    return {
+        durationSec,
+        distanceM,
+        geometry,
+        segments: Array.isArray(route.segments)
+            ? route.segments.map(segment => ({ ...segment }))
+            : [],
+        snap: route.snap && typeof route.snap === 'object' ? { ...route.snap } : null,
+        gis: route.gis && typeof route.gis === 'object' ? { ...route.gis } : null,
+        verifiedAccessible,
+        pathGeometry
+    };
+}
+
+function durationSecOf(route, stopId) {
+    const durationSec = route.durationSec === undefined ? route.walkSec : route.durationSec;
+    if (!Number.isFinite(durationSec) || durationSec < 0) {
+        throw new TimelineRebuildError(
+            'INVALID_ROUTE',
+            'route durationSec must be a non-negative number',
+            { stopId }
+        );
+    }
+    return durationSec;
+}
+
+function distanceMOf(route, stopId) {
+    if (route.distanceM === undefined || route.distanceM === null) return null;
+    if (!Number.isFinite(route.distanceM) || route.distanceM < 0) {
+        throw new TimelineRebuildError(
+            'INVALID_ROUTE',
+            'route distanceM must be a non-negative number',
+            { stopId }
+        );
+    }
+    return route.distanceM;
+}
+
+function geometryOf(route, stopId) {
+    if (route.geometry !== undefined && route.geometry !== null) {
+        return normalizeLineString(route.geometry, stopId);
+    }
+    if (Array.isArray(route.coords) && route.coords.length >= 2) {
+        return normalizeLineString({ type: 'LineString', coordinates: route.coords }, stopId);
+    }
+    return null;
+}
+
+function normalizeLineString(geometry, stopId) {
+    if (geometry?.type !== 'LineString' || !Array.isArray(geometry.coordinates)) {
+        throw new TimelineRebuildError(
+            'INVALID_ROUTE',
+            'route geometry must be a GeoJSON LineString',
+            { stopId }
+        );
+    }
+    const coordinates = geometry.coordinates.map(position => {
+        if (!Array.isArray(position) || position.length !== 2 || !position.every(Number.isFinite)) {
+            throw new TimelineRebuildError(
+                'INVALID_ROUTE',
+                'route geometry contains an invalid coordinate',
+                { stopId }
+            );
+        }
+        return [position[0], position[1]];
+    });
+    if (coordinates.length < 2) {
+        throw new TimelineRebuildError(
+            'INVALID_ROUTE',
+            'route geometry must contain at least two coordinates',
+            { stopId }
+        );
+    }
+    return { type: 'LineString', coordinates };
 }
 
 function selectAnchor({ itinerary, stops, poiMap, now }) {
