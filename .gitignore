@@ -13,6 +13,8 @@
 **/logs/
 **/coverage/
 **/.cache/
+**/test-results/
+**/playwright-report/
 **/*.log
 npm-debug.log*
 yarn-debug.log*

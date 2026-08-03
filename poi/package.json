@@ -16,6 +16,9 @@
     "test": "node geosync/scripts/run-tests.js all",
     "test:geosync": "node geosync/scripts/run-tests.js unit",
     "test:integration": "node geosync/scripts/run-tests.js integration",
+    "test:tour": "playwright test --config test/tour/playwright.config.js",
+    "check:tour-offline": "node scripts/check-tour-offline.js",
+    "vendor:sync": "node scripts/sync-tour-vendor.js",
     "audit:prod": "npm audit --omit=dev --audit-level=high",
     "check:syntax": "node --check server.js && node --check geosync/index.js && node --check geosync/standalone.js && node --check geosync/lib/sessionAuth.js && node --check geosync/lib/socketRoomAuth.js && node --check geosync/jobs/index.js && node --check geosync/routes/itinerary.js && node --check geosync/routes/photospots.js && node --check geosync/sim/crowd-sim.js && node --check geosync/scripts/cleanup-legacy-adminusers.js && node --check geosync/scripts/hash-admin-password.js && node --check geosync/scripts/init-indexes.js && node --check geosync/scripts/migrate-poi-geo.js && node --check geosync/scripts/migrate-supermap-refs.js && node --check geosync/scripts/run-tests.js && node --check geosync/integrations/supermap/index.js && node --check geosync/integrations/supermap/gateway.js && node --check geosync/integrations/supermap/httpClient.js && node --check geosync/integrations/supermap/manifest.js && node --check geosync/integrations/supermap/normalizers.js && node --check geosync/integrations/supermap/mockHttpClient.js && node --check geosync/integrations/supermap/routeCache.js && node --check geosync/integrations/supermap/errors.js && node --check geosync/services/adminPassword.js && node --check geosync/services/adminSessionRevocation.js && node --check geosync/services/barrierReroute.js && node --check geosync/services/fixedWindowRateLimiter.js && node --check geosync/services/geosyncEngine.js && node --check geosync/services/gisRouting.js && node --check geosync/services/gracefulShutdown.js && node --check geosync/services/guideService.js && node --check geosync/services/hostAuth.js && node --check geosync/services/hostNotificationPolicy.js && node --check geosync/services/hostPoiSchema.js && node --check geosync/services/hostSocketRooms.js && node --check geosync/services/itineraryRouteData.js && node --check geosync/services/itineraryTimeline.js && node --check geosync/services/mongoStartup.js && node --check geosync/services/notifyBridge.js && node --check geosync/services/oauthFlowQuota.js && node --check geosync/services/oauthState.js && node --check geosync/services/opsEvents.js && node --check geosync/services/planner.js && node --check geosync/services/poiGeoMigration.js && node --check geosync/services/publicPoiProjection.js && node --check geosync/services/rainService.js && node --check geosync/services/runtimeHealth.js && node --check geosync/services/supermapRefMigration.js && node --check geosync/services/walkGraph.js && node --check test/geosync-workflows.test.js && node --check test/health-readiness.test.js && node --check test/nginx-security.test.js && node --check test/single-service.test.js"
   },
@@ -23,15 +26,21 @@
     "@alicloud/ocr-api20210707": "^3.1.3",
     "@alicloud/openapi-client": "^0.4.7",
     "@alicloud/tea-util": "^1.4.7",
+    "@supermapgis/iclient-maplibregl": "12.1.0-r",
     "axios": "^1.6.7",
     "dotenv": "^16.4.5",
     "express": "^4.18.2",
+    "maplibre-gl": "5.6.0",
     "mongoose": "^7.6.3",
     "multer": "^2.0.2",
     "node-cron": "^4.6.0",
     "nodemailer": "^9.0.3",
     "socket.io": "^4.7.4",
+    "socket.io-client": "4.7.4",
     "suncalc": "^1.9.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1"
   },
   "engines": {
     "node": ">=20"
