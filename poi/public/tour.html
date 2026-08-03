@@ -18,32 +18,39 @@
             <div class="brand-block">
                 <h1>智游 GeoSync</h1>
                 <p id="scenic-name">游客行程</p>
+                <p id="mock-mode" class="mock-mode hidden">开发 Mock 模式</p>
             </div>
             <div class="status-row" aria-label="连接状态">
-                <span class="status-pill" title="GIS 状态">
+                <span id="map-status-pill" class="status-pill" title="GIS 状态">
                     <i id="map-status-dot" class="status-dot" data-state="connecting"></i>
-                    <span id="map-status-text">地图加载中</span>
+                    <span class="status-kind">GIS</span>
+                    <span id="map-status-text" class="status-detail">地图加载中</span>
                 </span>
-                <span class="status-pill" title="实时连接状态">
+                <span id="socket-status-pill" class="status-pill" title="实时连接状态">
                     <i id="socket-status-dot" class="status-dot" data-state="connecting"></i>
-                    <span id="socket-status-text">实时连接中</span>
+                    <span class="status-kind">实时</span>
+                    <span id="socket-status-text" class="status-detail">连接中</span>
                 </span>
-                <span class="status-pill" title="定位状态">
+                <span id="location-status-pill" class="status-pill" title="定位状态">
                     <i id="location-status-dot" class="status-dot" data-state="idle"></i>
-                    <span id="location-status-text">未定位</span>
+                    <span class="status-kind">定位</span>
+                    <span id="location-status-text" class="status-detail">未定位</span>
                 </span>
             </div>
         </header>
 
         <section id="map-stage" class="map-stage" aria-label="景区地图">
             <div id="tour-map"></div>
-            <div id="map-loading" class="map-loading" role="status"><p>正在加载景区地图…</p></div>
-            <div id="map-fallback" class="map-fallback hidden" role="alert">
-                <p id="map-fallback-message">地图暂不可用，行程列表仍可操作。</p>
-                <button id="retry-map" class="btn btn-secondary" type="button">重试地图</button>
+            <div class="map-notice-stack">
+                <div id="rain-banner" class="rain-banner hidden" role="status"></div>
+                <div id="road-banner" class="road-banner hidden" role="status"></div>
+                <div id="connection-banner" class="connection-banner hidden" role="status">实时连接中断，正在恢复</div>
+                <div id="map-loading" class="map-loading" role="status"><p>正在加载景区地图…</p></div>
+                <div id="map-fallback" class="map-fallback hidden" role="alert">
+                    <p id="map-fallback-message">地图暂不可用，行程列表仍可操作。</p>
+                    <button id="retry-map" class="btn btn-secondary" type="button">重试地图</button>
+                </div>
             </div>
-            <div id="rain-banner" class="rain-banner hidden" role="status"></div>
-            <div id="connection-banner" class="connection-banner hidden" role="status">实时连接中断，正在恢复</div>
             <aside id="crowd-legend" class="crowd-legend" aria-label="拥挤等级图例">
                 <span id="crowd-confidence">实时人流</span>
                 <span class="legend-item"><i class="legend-swatch low"></i>舒适</span>
@@ -103,6 +110,7 @@
                     </fieldset>
                     <label class="switch-row"><span>无障碍路线</span><input name="accessible" type="checkbox"></label>
                     <label class="switch-row"><span>遮荫优先</span><input name="shadeFirst" type="checkbox" checked></label>
+                    <div id="plan-start-source" class="notice">起点：景区入口</div>
                     <div id="plan-message" class="notice hidden" role="status"></div>
                     <button id="submit-plan" class="btn btn-primary" type="submit">生成路线</button>
                 </form>
@@ -145,6 +153,8 @@
             <section class="panel hidden" data-panel="completed">
                 <div class="panel-header"><div><h2>本次游览已结束</h2><p class="panel-subtitle">行程状态已同步</p></div></div>
                 <div id="completed-metrics" class="home-summary"></div>
+                <div id="completed-badges" class="route-badges"></div>
+                <ol id="completed-timeline" class="timeline" aria-label="只读行程时刻表"></ol>
                 <div class="panel-actions"><button id="return-home" class="btn btn-primary" type="button">返回首页</button></div>
             </section>
 
@@ -159,6 +169,21 @@
             </section>
         </section>
     </main>
+
+    <dialog id="poi-dialog" class="poi-dialog" aria-labelledby="poi-dialog-title">
+        <form method="dialog" class="poi-dialog-content">
+            <div class="panel-header">
+                <div>
+                    <h2 id="poi-dialog-title">景点详情</h2>
+                    <p id="poi-dialog-meta" class="panel-subtitle"></p>
+                </div>
+                <button class="icon-btn" type="submit" value="close" aria-label="关闭景点详情">×</button>
+            </div>
+            <p id="poi-dialog-description" class="poi-description"></p>
+            <dl id="poi-dialog-facts" class="poi-facts"></dl>
+            <button class="btn btn-primary dialog-close" type="submit" value="close">关闭</button>
+        </form>
+    </dialog>
 
     <div id="toast" class="toast hidden" role="status" aria-live="assertive"></div>
     <div id="live-region" class="sr-only" aria-live="polite"></div>

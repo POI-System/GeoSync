@@ -88,6 +88,7 @@ button:disabled {
     border-radius: var(--radius-sm);
     font-weight: 700;
     text-align: center;
+    overflow-wrap: anywhere;
 }
 
 .btn-primary {
@@ -138,6 +139,10 @@ button:disabled {
     white-space: nowrap;
 }
 
+.status-kind {
+    color: var(--color-muted);
+}
+
 .status-dot {
     width: 8px;
     height: 8px;
@@ -161,4 +166,9 @@ button:disabled {
 .status-dot[data-state="error"],
 .status-dot[data-state="denied"] {
     background: var(--crowd-high);
+}
+
+.choice input:focus-visible + span {
+    outline: 3px solid rgba(39, 116, 174, 0.4);
+    outline-offset: 2px;
 }
