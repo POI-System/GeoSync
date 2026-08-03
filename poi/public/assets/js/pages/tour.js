@@ -720,12 +720,14 @@ function renderPhotoSpots() {
 async function selectPhotoSpot(spotId) {
     const spot = store.getState().photoSpots.find(item => String(item.spotId) === String(spotId));
     if (!spot) return;
-    store.set({ selectedSpotId: String(spotId) }, 'photospot:selected');
+    const selectedSpotId = String(spotId);
+    store.set({ selectedSpotId }, 'photospot:selected');
     setText(elements.spotTitle, spot.name || '摄影机位');
     setText(elements.spotSubtitle, `朝向 ${spot.heading ?? '--'}° · 推荐指数 ${Number(spot.score || 0).toFixed(2)}`);
     elements.spotDetail.replaceChildren(createNotice('正在读取今日光线…'));
     if (spot.lnglat && mapFacade.map) mapFacade.fitToGeometry({ type: 'Point', coordinates: spot.lnglat });
     const [goldenResult, arResult] = await Promise.allSettled([api.getGoldenWindow(spotId), api.getArData(spotId)]);
+    if (store.getState().selectedSpotId !== selectedSpotId) return;
     const golden = goldenResult.status === 'fulfilled' ? goldenResult.value : null;
     const ar = arResult.status === 'fulfilled' ? arResult.value : null;
     const parts = [];
@@ -734,6 +736,9 @@ async function selectPhotoSpot(spotId) {
         image.className = 'spot-cover';
         image.src = spot.coverPhoto;
         image.alt = `${spot.name} 样片`;
+        image.loading = 'lazy';
+        image.decoding = 'async';
+        image.addEventListener('error', () => image.remove(), { once: true });
         parts.push(image);
     }
     const windowText = golden?.windows?.length
@@ -763,9 +768,10 @@ function createNotice(text) {
 
 function configureSceneButton() {
     const config = store.getState().config;
-    const sceneUrl = config?.gis?.publicServices?.scene;
+    const sceneUrl = String(config?.gis?.publicServices?.scene || '').trim();
     const enabled = Boolean((config?.features?.threeD || config?.gis?.features?.threeD) && sceneUrl);
     elements.openScene.disabled = !enabled;
+    elements.openScene.setAttribute('aria-disabled', String(!enabled));
     setText(elements.openScene, enabled ? '打开三维场景' : '三维场景不可用');
     elements.openScene.dataset.sceneUrl = enabled ? sceneUrl : '';
 }

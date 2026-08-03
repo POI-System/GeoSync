@@ -488,6 +488,17 @@ input[type="range"] {
     }
 }
 
+@media (max-width: 767px) {
+    .map-stage[data-list-only="true"] + .bottom-sheet {
+        height: calc(100% - 220px);
+        min-height: 340px;
+    }
+
+    .map-stage[data-list-only="true"] .crowd-legend {
+        display: none;
+    }
+}
+
 @media (max-width: 430px) {
     .brand-block p,
     .status-pill span {
