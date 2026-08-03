@@ -7,6 +7,8 @@ const {
     toSuperMapError
 } = require('./errors');
 
+const DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
+
 function defaultSleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -72,6 +74,11 @@ function positiveNumber(value, fallback) {
     return Number.isFinite(number) && number > 0 ? number : fallback;
 }
 
+function positiveInteger(value, fallback) {
+    const number = Number(value);
+    return Number.isSafeInteger(number) && number > 0 ? number : fallback;
+}
+
 function requestIdValue(value) {
     if (value === undefined || value === null) return '';
     return String(value)
@@ -109,6 +116,10 @@ class SuperMapHttpClient {
         this.timeoutMs = positiveNumber(options.timeoutMs, 5000);
         this.maxRetries = retryCount(options.maxRetries === undefined ? 1 : options.maxRetries);
         this.retryDelayMs = Math.max(0, Number(options.retryDelayMs) || 0);
+        this.maxResponseBytes = positiveInteger(
+            options.maxResponseBytes,
+            DEFAULT_MAX_RESPONSE_BYTES
+        );
         this.sleep = options.sleep || defaultSleep;
         this.now = options.now || defaultNow;
     }
@@ -181,6 +192,8 @@ class SuperMapHttpClient {
             url: path,
             method: String(method || 'GET').toUpperCase(),
             timeout,
+            maxRedirects: 0,
+            maxContentLength: this.maxResponseBytes,
             headers: {},
             data,
             params
@@ -205,3 +218,4 @@ module.exports.createHttpClient = createHttpClient;
 module.exports.SuperMapHttpClient = SuperMapHttpClient;
 module.exports.defaultSleep = defaultSleep;
 module.exports.defaultNow = defaultNow;
+module.exports.DEFAULT_MAX_RESPONSE_BYTES = DEFAULT_MAX_RESPONSE_BYTES;

@@ -43,6 +43,7 @@ const CONFIG = {
     },
     rerouteGainMin: num(process.env.REROUTE_GAIN_MIN, 5),
     rerouteDailySoftLimit: num(process.env.REROUTE_DAILY_SOFT_LIMIT, 3),
+    barrierRerouteConcurrency: num(process.env.BARRIER_REROUTE_CONCURRENCY, 6),
     capacityTokenTtlS: num(process.env.CAPACITY_TOKEN_TTL_S, 300),
     hmacSecret: process.env.POSITION_HMAC_SECRET || '',
     sessionSecret: String(process.env.AUTH_SESSION_SECRET || ''),

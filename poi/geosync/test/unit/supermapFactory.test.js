@@ -105,6 +105,19 @@ test('factory accepts common boolean forms and forwards route timing values', ()
     assert.equal(gateway.fallbackEnabled, false);
 });
 
+test('factory forwards the configured iServer response limit to its HTTP client', () => {
+    const gateway = createSuperMapGateway(baseOptions({
+        env: {
+            SUPERMAP_ENABLED: 'true',
+            SUPERMAP_MAX_RESPONSE_BYTES: '2048'
+        },
+        httpClient: undefined,
+        axios: { async request() { return { status: 200, data: {} }; } }
+    }));
+
+    assert.equal(gateway.httpClient.maxResponseBytes, 2048);
+});
+
 test('factory warns and uses safe defaults for unknown boolean environment values', () => {
     const warnings = [];
     const gateway = createSuperMapGateway(baseOptions({

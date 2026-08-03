@@ -6,6 +6,7 @@ const SAFE_EDGE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const MUTABLE_STATES = new Set(['pending', 'approaching']);
 const DEFAULT_PROPOSAL_TTL_MS = 10 * 60000;
 const DEFAULT_EVENT_DEDUPE_LIMIT = 2048;
+const DEFAULT_ITINERARY_CONCURRENCY = 6;
 
 function barrierError(code, message, details = null) {
     const error = new Error(message);
@@ -100,6 +101,29 @@ function barrierFingerprint(barriers) {
 async function resolveLeanQuery(query) {
     if (query && typeof query.lean === 'function') return query.lean();
     return query;
+}
+
+async function settleWithConcurrency(items, concurrency, operation) {
+    const settled = new Array(items.length);
+    let nextIndex = 0;
+
+    async function worker() {
+        while (nextIndex < items.length) {
+            const index = nextIndex++;
+            try {
+                settled[index] = {
+                    status: 'fulfilled',
+                    value: await operation(items[index], index)
+                };
+            } catch (reason) {
+                settled[index] = { status: 'rejected', reason };
+            }
+        }
+    }
+
+    const workerCount = Math.min(concurrency, items.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    return settled;
 }
 
 async function loadClosedBarrierSnapshot({ WalkEdge, scenicId }) {
@@ -476,6 +500,12 @@ function createBarrierRerouteCoordinator(deps = {}) {
     if (!Number.isInteger(eventDedupeLimit) || eventDedupeLimit <= 0) {
         throw new TypeError('eventDedupeLimit must be a positive integer');
     }
+    const itineraryConcurrency = deps.itineraryConcurrency === undefined
+        ? DEFAULT_ITINERARY_CONCURRENCY
+        : Number(deps.itineraryConcurrency);
+    if (!Number.isInteger(itineraryConcurrency) || itineraryConcurrency <= 0) {
+        throw new TypeError('itineraryConcurrency must be a positive integer');
+    }
 
     const eventRecords = new Map();
     const scenicQueues = new Map();
@@ -825,9 +855,11 @@ function createBarrierRerouteCoordinator(deps = {}) {
         }
 
         impact.itineraryCount = itineraries.length;
-        const settled = await Promise.allSettled(itineraries.map(itinerary =>
-            processItinerary({ itinerary, event, snapshot, now })
-        ));
+        const settled = await settleWithConcurrency(
+            itineraries,
+            itineraryConcurrency,
+            itinerary => processItinerary({ itinerary, event, snapshot, now })
+        );
         settled.forEach((result, index) => {
             const itineraryId = itineraryIdOf(itineraries[index]);
             if (result.status === 'rejected') {
@@ -917,5 +949,6 @@ module.exports = {
     barrierFingerprint,
     routeAvoidsBarriers,
     remainingRouteUsesEdge,
-    createBarrierRerouteCoordinator
+    createBarrierRerouteCoordinator,
+    DEFAULT_ITINERARY_CONCURRENCY
 };

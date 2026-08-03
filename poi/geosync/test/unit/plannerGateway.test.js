@@ -13,10 +13,16 @@ const originalPredictAtEta = forecast.predictAtEta;
 const originalWindowFit = sunlight.windowFit;
 
 let fixturePois = [];
+let onCandidateQuery = async () => {};
 
 const ExternalPoi = {
     find() {
-        return { lean: async () => fixturePois.map(poi => structuredClone(poi)) };
+        return {
+            async lean() {
+                await onCandidateQuery('ExternalPoi');
+                return fixturePois.map(poi => structuredClone(poi));
+            }
+        };
     }
 };
 
@@ -24,20 +30,29 @@ const PhotoSpot = {
     find() {
         return {
             sort() { return this; },
-            async lean() { return []; }
+            async lean() {
+                await onCandidateQuery('PhotoSpot');
+                return [];
+            }
         };
     }
 };
 
 const Checkin = {
     async aggregate() {
+        await onCandidateQuery('Checkin');
         return [];
     }
 };
 
 const Campaign = {
     find() {
-        return { lean: async () => [] };
+        return {
+            async lean() {
+                await onCandidateQuery('Campaign');
+                return [];
+            }
+        };
     }
 };
 
@@ -52,6 +67,10 @@ test.after(() => {
     modelModule.getModels = originalGetModels;
     forecast.predictAtEta = originalPredictAtEta;
     sunlight.windowFit = originalWindowFit;
+});
+
+test.afterEach(() => {
+    onCandidateQuery = async () => {};
 });
 
 function poi(id, coordinates, stayMin) {
@@ -189,6 +208,69 @@ test('plan uses synchronous estimates for optimization and one authoritative rou
     assert.equal(result.route.gis.durationMs, 30);
     assert.equal(result.route.gis.mode, 'normal');
     assert.deepEqual(decodePolyline(result.route.pathGeometry), result.route.geometry.coordinates);
+});
+
+test('planner starts its optimization budget after all candidate queries are ready', async () => {
+    fixturePois = [poi('poi-slow-db', [0.001, 0], 10)];
+    const queryOrder = [];
+    let elapsedMs = 0;
+    onCandidateQuery = async modelName => {
+        queryOrder.push(modelName);
+        elapsedMs += 1000;
+    };
+    const budgetReadings = [];
+
+    const result = await planner.plan({
+        startLocation: [0, 0],
+        startAt: '2026-08-02T01:00:00.000Z',
+        hours: 1,
+        requestId: 'slow-candidate-queries'
+    }, {
+        budgetNow() {
+            budgetReadings.push(elapsedMs);
+            return elapsedMs;
+        },
+        estimateBetween: (from, to) => ({
+            walkSec: 60,
+            coords: [from.geo.coordinates, to.geo.coordinates],
+            fallback: false
+        }),
+        routeBetween: async (from, to) => route({
+            coordinates: [from.geo.coordinates, to.geo.coordinates],
+            durationSec: 60,
+            distanceM: 80,
+            edgeId: 'slow-db-edge',
+            snap: { startDistanceM: 0, endDistanceM: 0 }
+        })
+    });
+
+    assert.deepEqual(queryOrder, ['ExternalPoi', 'Checkin', 'Campaign', 'PhotoSpot']);
+    assert.ok(budgetReadings.length >= 2);
+    assert.equal(budgetReadings[0], 4000);
+    assert.deepEqual(result.stops.map(stop => stop.poiId), ['poi-slow-db']);
+});
+
+test('planner preserves 1202 when ready candidates are not routable', async () => {
+    fixturePois = [poi('poi-unroutable', [0.001, 0], 10)];
+    let authoritativeCalls = 0;
+
+    await assert.rejects(
+        planner.plan({
+            startLocation: [0, 0],
+            startAt: '2026-08-02T01:00:00.000Z',
+            hours: 1,
+            requestId: 'unroutable-candidate'
+        }, {
+            budgetNow: () => 0,
+            estimateBetween: () => null,
+            routeBetween: async () => {
+                authoritativeCalls++;
+                throw new Error('must not request an authoritative route');
+            }
+        }),
+        error => error.code === 1202 && error.message === '预算内无可安排的POI'
+    );
+    assert.equal(authoritativeCalls, 0);
 });
 
 test('mode selection preserves accessible over shade, then shade, then normal', async () => {

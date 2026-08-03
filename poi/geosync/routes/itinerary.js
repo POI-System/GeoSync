@@ -541,30 +541,19 @@ router.post('/:id/nl-edit', wrap(async (req, res) => {
     }));
     const ops = await guideService.parseNlEdit(text, summary);
 
-    // ops → 简化提案：set_preference/shift_time/end_early 直接构造；复杂 op 交引擎 evaluate（骨架：先支持 shift/remove）
-    const proposal = {
-        proposalId: 'p_' + crypto.randomBytes(4).toString('hex'),
-        type: 'nlEdit',
-        payload: { ops },
-        reason: `根据你的要求"${text}"调整行程`,
-        gainMin: 0,
-        tokenIds: [],
-        expireAt: new Date(Date.now() + 10 * 60000)
-    };
-    const updated = await Itinerary.findOneAndUpdate(
-        {
-            _id: it._id,
-            openId: req.openId,
-            version: it.version,
-            pendingProposal: null
-        },
-        { $set: { pendingProposal: proposal }, $inc: { version: 1 } },
-        { new: true }
-    );
-    if (!updated) return fail(res, 409, 1203, '行程已变化，请刷新');
+    // Parsed operations remain preview-only until every op can be applied by the
+    // versioned route rebuild and preference update contract.
     ok(res, {
-        version: updated.version,
-        pendingProposal: engine.publicProposalView(updated.pendingProposal || proposal, null)
+        version: it.version,
+        previewOnly: true,
+        applied: false,
+        pendingProposal: null,
+        preview: {
+            type: 'nlEdit',
+            parsedOps: ops,
+            reason: `根据你的要求"${text}"调整行程`,
+            gainMin: 0
+        }
     });
 }));
 

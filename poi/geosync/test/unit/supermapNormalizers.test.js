@@ -3,7 +3,11 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const normalizeGeometry = require('../../integrations/supermap/normalizers');
-const { normalizeRouteGeometry, normalizeRouteGeometryWithMeta } = normalizeGeometry;
+const {
+    normalizeRouteGeometry,
+    normalizeRouteGeometryWithMeta,
+    MAX_GEOMETRY_POSITIONS
+} = normalizeGeometry;
 const { GeometryNormalizationError } = require('../../integrations/supermap/errors');
 
 function is8206(error) {
@@ -156,6 +160,16 @@ test('unsupported geometry types and circular coordinate arrays fail as sanitize
     assert.throws(() => normalizeGeometry({
         type: 'LineString', coordinates: circular
     }), is8206);
+});
+
+test('geometry and route normalization reject inputs above the coordinate budget', () => {
+    const tooManyPositions = new Array(MAX_GEOMETRY_POSITIONS + 1).fill([120, 30]);
+
+    assert.throws(() => normalizeGeometry({
+        type: 'MultiPoint',
+        coordinates: tooManyPositions
+    }), is8206);
+    assert.throws(() => normalizeRouteGeometry(tooManyPositions), is8206);
 });
 
 test('errors carry sanitized operation and requestId context without raw geometry details', () => {

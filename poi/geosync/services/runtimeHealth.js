@@ -274,7 +274,7 @@ function createReadinessHandler({ mongoose, readiness, walkGraph, crowdService }
     };
 }
 
-function createHealthHandler({
+function createHealthSnapshotCollector({
     mongoose,
     superMapGateway,
     readiness,
@@ -283,7 +283,7 @@ function createHealthHandler({
     config
 }) {
     runtimeSnapshotOf({ readiness, walkGraph, crowdService });
-    return async function healthHandler(req, res) {
+    return async function collectHealthSnapshot(req) {
         const snap = crowdService.getHeatmapSnapshot();
         const mongo = mongoStatusOf(mongoose);
         let gis;
@@ -312,31 +312,50 @@ function createHealthHandler({
             : 'offline';
         const jobs = startup.components.jobs;
 
-        res.status(coreAvailable ? 200 : 503).json({
-            state,
-            core: {
-                state: coreState,
-                ready: coreAvailable
-            },
-            graphLoaded,
-            poiIndexReady: startup.components.poiIndex.ready,
-            poiIndexCount,
-            jobsRunning: jobs.running,
-            jobs,
-            startup,
-            lastCiSlot: snap?.slot || null,
-            rainSource: config.features.rain ? 'minute' : config.features.weather ? 'hourly' : 'off',
-            llm: config.features.guide,
-            simMode: config.simMode,
-            mongo,
-            gis,
-            manifest: gis.manifest || null,
-            cache: {
-                routeCount: diagnostics.routeCacheSize || 0,
-                lastInvalidationReason: diagnostics.lastInvalidationReason || null
-            },
-            lastSuccessfulGisAt: diagnostics.lastSuccessAt || null
-        });
+        return {
+            status: coreAvailable ? 200 : 503,
+            data: {
+                state,
+                core: {
+                    state: coreState,
+                    ready: coreAvailable
+                },
+                graphLoaded,
+                poiIndexReady: startup.components.poiIndex.ready,
+                poiIndexCount,
+                jobsRunning: jobs.running,
+                jobs,
+                startup,
+                lastCiSlot: snap?.slot || null,
+                rainSource: config.features.rain ? 'minute' : config.features.weather ? 'hourly' : 'off',
+                llm: config.features.guide,
+                simMode: config.simMode,
+                mongo,
+                gis,
+                manifest: gis.manifest || null,
+                cache: {
+                    routeCount: diagnostics.routeCacheSize || 0,
+                    lastInvalidationReason: diagnostics.lastInvalidationReason || null
+                },
+                lastSuccessfulGisAt: diagnostics.lastSuccessAt || null
+            }
+        };
+    };
+}
+
+function createHealthHandler(dependencies) {
+    const collect = createHealthSnapshotCollector(dependencies);
+    return async function healthHandler(req, res) {
+        const snapshot = await collect(req);
+        res.status(snapshot.status).json({ state: snapshot.data.state });
+    };
+}
+
+function createDetailedHealthHandler(dependencies) {
+    const collect = createHealthSnapshotCollector(dependencies);
+    return async function detailedHealthHandler(req, res) {
+        const snapshot = await collect(req);
+        res.status(snapshot.status).json(snapshot.data);
     };
 }
 
@@ -345,6 +364,7 @@ module.exports = {
     createLivenessHandler,
     createReadinessHandler,
     createHealthHandler,
+    createDetailedHealthHandler,
     mongoStatusOf,
     waitForMongoReady,
     safeFailure

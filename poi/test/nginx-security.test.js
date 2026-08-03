@@ -32,6 +32,8 @@ test('production nginx delegates public files to the Node allowlist', async () =
     assert.doesNotMatch(source, /\broot\s+\/opt\/poi\s*;/);
     assert.match(uploads, /alias\s+\/opt\/poi\/uploads\/;/);
     assert.doesNotMatch(uploads, /autoindex\s+on/);
+    assert.match(source, /client_max_body_size\s+12m;/);
+    assert.doesNotMatch(source, /client_max_body_size\s+50m;/);
 
     for (const privatePath of [
         '/server.js', '/package.json', '/.env', '/geosync/index.js', '/logs/app.log'
@@ -56,6 +58,7 @@ test('deployment preflight matches the fixed PM2/Nginx topology and hides privat
     assert.match(deploy, /^readonly PROJECT_DIR=\/opt\/poi$/m);
     assert.doesNotMatch(deploy, /PROJECT_DIR=\$\{PROJECT_DIR/);
     assert.match(ecosystem, /cwd:\s*['"]\/opt\/poi['"]/);
+    assert.match(ecosystem, /kill_timeout:\s*12000/);
     assert.match(deploy, /TLS_CERT=\/etc\/letsencrypt\/live\/8688988\.xyz\/fullchain\.pem/);
     assert.match(deploy, /TLS_KEY=\/etc\/letsencrypt\/live\/8688988\.xyz\/privkey\.pem/);
     assert.match(nginx, /ssl_certificate\s+\/etc\/letsencrypt\/live\/8688988\.xyz\/fullchain\.pem;/);
@@ -66,13 +69,13 @@ test('deployment preflight matches the fixed PM2/Nginx topology and hides privat
     assert.doesNotMatch(standalone, /console\.(?:log|warn|error)[^\n]*MONGO_URI|MONGO_URI\.replace/);
 
     for (const name of [
-        'GEOSYNC_BACKGROUND_ENABLED', 'TPL_REROUTE', 'ALERT_EMAIL',
+        'GEOSYNC_BACKGROUND_ENABLED', 'SHUTDOWN_TIMEOUT_MS', 'TPL_REROUTE', 'ALERT_EMAIL',
         'POSITION_MIN_INTERVAL_S', 'PRESENCE_LEASE_MINUTES', 'CI_SLOT_MINUTES',
         'CI_ALPHA', 'CI_BETA', 'CI_GAMMA', 'REROUTE_GAIN_MIN',
-        'REROUTE_DAILY_SOFT_LIMIT', 'CAPACITY_TOKEN_TTL_S',
+        'REROUTE_DAILY_SOFT_LIMIT', 'BARRIER_REROUTE_CONCURRENCY', 'CAPACITY_TOKEN_TTL_S',
         'RAIN_API_URL', 'RAIN_API_KEY', 'WEATHER_API_URL', 'WEATHER_API_KEY',
         'LLM_API_URL', 'LLM_API_KEY', 'LLM_MODEL', 'GEOSYNC_UPLOAD_DIR',
-        'DEM_TILE_DIR', 'SIM_MODE', 'SIM_STRATEGY'
+        'DEM_TILE_DIR', 'SIM_MODE', 'SIM_STRATEGY', 'SUPERMAP_MAX_RESPONSE_BYTES'
     ]) {
         assert.match(envTemplate, new RegExp(`^${name}=`, 'm'), `${name} missing from .env.example`);
     }

@@ -10,6 +10,7 @@ const SUPPORTED_TYPES = new Set([
     'Polygon',
     'MultiPolygon'
 ]);
+const MAX_GEOMETRY_POSITIONS = 100_000;
 
 function safeContextValue(value, fallback = '') {
     const text = value === undefined || value === null ? '' : String(value).trim();
@@ -166,16 +167,18 @@ function arrayScope(value, state, context, operation) {
 
 function normalizePosition(value, state, context) {
     return arrayScope(value, state, context, position => {
+        state.positionCount++;
+        if (state.positionCount > MAX_GEOMETRY_POSITIONS) fail(context);
         if (position.length !== 2 || !position.every(Number.isFinite)) fail(context);
         const [lng, lat] = position;
         if (lng < -180 || lng > 180 || lat < -90 || lat > 90) fail(context);
-        state.positionCount++;
         return [roundSix(lng), roundSix(lat)];
     });
 }
 
 function normalizePositionList(value, state, context, minimum, dedupeConsecutive) {
     return arrayScope(value, state, context, positions => {
+        if (positions.length > MAX_GEOMETRY_POSITIONS - state.positionCount) fail(context);
         const normalized = [];
         for (const position of positions) {
             const point = normalizePosition(position, state, context);
@@ -267,7 +270,9 @@ function normalizeRouteGeometryWithMeta(rawGeometry, context = {}) {
             : isPlainObject(rawGeometry) && rawGeometry.type === 'LineString'
                 ? rawGeometry.coordinates
                 : null;
-        if (!Array.isArray(rawCoordinates)) fail(routeContext);
+        if (!Array.isArray(rawCoordinates) || rawCoordinates.length > MAX_GEOMETRY_POSITIONS) {
+            fail(routeContext);
+        }
 
         const start = routeReferencePosition(routeContext.start, routeContext);
         const end = routeReferencePosition(routeContext.end, routeContext);
@@ -307,3 +312,4 @@ module.exports.normalizeGeoJSONGeometry = normalizeGeometry;
 module.exports.normalizeRouteGeometry = normalizeRouteGeometry;
 module.exports.normalizeRouteGeometryWithMeta = normalizeRouteGeometryWithMeta;
 module.exports.SUPPORTED_TYPES = SUPPORTED_TYPES;
+module.exports.MAX_GEOMETRY_POSITIONS = MAX_GEOMETRY_POSITIONS;

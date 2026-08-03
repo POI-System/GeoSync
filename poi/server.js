@@ -17,6 +17,10 @@ const { serializePublicPoi } = require('./geosync/services/publicPoiProjection')
 const { createHostSocketRoomSync } = require('./geosync/services/hostSocketRooms');
 const { createFixedWindowRateLimiter } = require('./geosync/services/fixedWindowRateLimiter');
 const { monitorInitialMongoConnection } = require('./geosync/services/mongoStartup');
+const { installGracefulShutdown } = require('./geosync/services/gracefulShutdown');
+const {
+    getAdminSessionRevocationModel
+} = require('./geosync/services/adminSessionRevocation');
 const {
     COLLECTOR_TEMPLATE_LABEL,
     normalizeAudience,
@@ -170,9 +174,11 @@ const userSchema = new mongoose.Schema({
     disabled: { type: Boolean, default: false }
 });
 const User = mongoose.model('User', userSchema);
+const AdminSessionRevocation = getAdminSessionRevocationModel(mongoose);
 
 const hostAuth = createHostAuth({
     User,
+    AdminSessionRevocation,
     sessionSecret: CONFIG.authSessionSecret,
     adminToken: CONFIG.adminToken,
     adminUsername: CONFIG.admin.username || 'admin',
@@ -327,8 +333,8 @@ const app = express();
 const server = http.createServer(app);
 
 app.set('trust proxy', CONFIG.trustProxy);
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ limit: '1mb', extended: true }));
 
 app.get('/api/client-config', (_req, res) => {
     res.json({
@@ -986,9 +992,21 @@ app.post('/api/admin/login', async (req, res) => {
     }
 });
 
-app.post('/api/admin/logout', (req, res) => {
-    hostAuth.clearAdminSession(res);
-    res.json({ success: true });
+app.post('/api/admin/logout', async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    try {
+        await hostAuth.revokeAdminSession(req);
+        hostAuth.clearAdminSession(res);
+        res.json({ success: true });
+    } catch (error) {
+        if (error instanceof HostAuthError) {
+            return res.status(error.httpStatus).json({
+                success: false,
+                message: 'Administrator logout is temporarily unavailable'
+            });
+        }
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
 });
 
 app.post('/api/auth/logout', (req, res) => {
@@ -2136,7 +2154,7 @@ geosync.attach({
     app,
     io,
     mongoose,
-    models: { POI, User },
+    models: { POI, User, AdminSessionRevocation },
     helpers: {
         sendTemplate,
         sendMail: sendGeoSyncMail,
@@ -2148,6 +2166,14 @@ geosync.attach({
         startBackground: String(process.env.GEOSYNC_BACKGROUND_ENABLED || 'true').toLowerCase() !== 'false',
         mountUploads: false
     }
+});
+
+installGracefulShutdown({
+    server,
+    io,
+    mongoose,
+    timeoutMs: process.env.SHUTDOWN_TIMEOUT_MS,
+    logger: console
 });
 
 app.use('/uploads', express.static(uploadDir));

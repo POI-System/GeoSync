@@ -63,13 +63,18 @@ async function waitForStatus(url, expectedStatus, timeoutMs = 8000) {
 }
 
 async function stopChild(child) {
-    if (child.exitCode !== null) return;
-    child.kill();
+    if (child.exitCode !== null || child.signalCode !== null) return;
     const exited = once(child, 'exit');
+    child.kill();
     const timedOut = new Promise(resolve => setTimeout(() => resolve('timeout'), 3000));
-    if (await Promise.race([exited, timedOut]) === 'timeout' && child.exitCode === null) {
+    if (
+        await Promise.race([exited, timedOut]) === 'timeout'
+        && child.exitCode === null
+        && child.signalCode === null
+    ) {
+        const forcedExit = once(child, 'exit');
         child.kill('SIGKILL');
-        await once(child, 'exit');
+        await forcedExit;
     }
 }
 
@@ -130,6 +135,7 @@ test('POI server contains one production runtime and attaches GeoSync before lis
     const poiSchemaExtensionAt = source.indexOf('addHostPoiGeoSyncFields(poiSchema)');
     const poiModelAt = source.indexOf("mongoose.model('POI', poiSchema)");
     const attachAt = source.indexOf('geosync.attach({');
+    const shutdownAt = source.indexOf('installGracefulShutdown({');
     const staticAt = source.indexOf('app.use(express.static(__dirname');
     const listenAt = source.indexOf('server.listen(');
     assert.ok(requireAt >= 0, 'GeoSync must be loaded from poi/geosync');
@@ -142,6 +148,13 @@ test('POI server contains one production runtime and attaches GeoSync before lis
     assert.ok(attachAt > requireAt, 'GeoSync must be attached after it is loaded');
     assert.ok(attachAt < staticAt, 'GeoSync API routes must be mounted before static files');
     assert.ok(attachAt < listenAt, 'GeoSync must be attached before server.listen');
+    assert.ok(
+        shutdownAt > attachAt && shutdownAt < listenAt,
+        'graceful shutdown must be installed after GeoSync attachment and before server.listen'
+    );
+    assert.match(source, /express\.json\(\{ limit: '1mb' \}\)/);
+    assert.match(source, /express\.urlencoded\(\{ limit: '1mb', extended: true \}\)/);
+    assert.doesNotMatch(source, /limit:\s*['"]50mb['"]/i);
     assert.match(
         geosyncSource,
         /app\.get\('\/api\/admin\/geosync\/gis\/status', requireAdmin, wrap\(async/,
@@ -230,10 +243,7 @@ test('single POI process serves old and GeoSync endpoints without exposing backe
 
         const healthResponse = await waitForStatus(`${base}/api/geosync/health`, 503);
         const health = await healthResponse.json();
-        assert.equal(health.jobsRunning, false);
-        assert.equal(['connecting', 'offline'].includes(health.mongo.state), true);
-        assert.equal(health.gis.state, 'offline');
-        assert.equal(health.gis.error.code, 'SUPERMAP_MANIFEST_NOT_FOUND');
+        assert.deepEqual(health, { state: 'offline' });
 
         const liveResponse = await fetch(`${base}/api/geosync/health/live`);
         assert.equal(liveResponse.status, 200);
@@ -258,6 +268,12 @@ test('single POI process serves old and GeoSync endpoints without exposing backe
             })
         });
         assert.equal(gisRouteTestResponse.status, 403);
+        const oversizedJsonResponse = await fetch(`${base}/api/admin/geosync/gis/route-test`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ padding: 'x'.repeat(1024 * 1024) })
+        });
+        assert.equal(oversizedJsonResponse.status, 413);
         const loginResponse = await fetch(`${base}/api/admin/login`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
@@ -420,6 +436,19 @@ test('configured host auth uses HttpOnly cookies and rejects unsafe credential t
         });
         assert.equal(bearerResponse.status, 200);
 
+        const publicHealth = await fetch(`${base}/api/geosync/health`);
+        assert.equal(publicHealth.status, 503);
+        assert.deepEqual(await publicHealth.json(), { state: 'offline' });
+        const privateHealthDenied = await fetch(`${base}/api/admin/geosync/health`);
+        assert.equal(privateHealthDenied.status, 403);
+        const privateHealth = await fetch(`${base}/api/admin/geosync/health`, {
+            headers: { authorization: `Bearer ${adminCredential}` }
+        });
+        assert.equal(privateHealth.status, 503);
+        const privateHealthBody = await privateHealth.json();
+        assert.equal(['connecting', 'offline'].includes(privateHealthBody.mongo.state), true);
+        assert.equal(privateHealthBody.gis.error.code, 'SUPERMAP_MANIFEST_NOT_FOUND');
+
         for (let attempt = 0; attempt < 10; attempt++) {
             const failedLogin = await fetch(`${base}/api/admin/login`, {
                 method: 'POST',
@@ -466,13 +495,13 @@ test('configured host auth uses HttpOnly cookies and rejects unsafe credential t
                 cookie: adminCookie
             }
         });
-        assert.equal(cookieSession.status, 200);
+        assert.equal(cookieSession.status, 503,
+            'signed admin sessions must fail closed while revocation storage is unavailable');
 
         const screenBootstrap = await fetch(`${base}/api/admin/screen/session`, {
             method: 'POST',
             headers: {
-                authorization: 'Bearer cookie-session',
-                cookie: adminCookie
+                authorization: `Bearer ${adminCredential}`
             }
         });
         assert.equal(screenBootstrap.status, 200);
@@ -500,11 +529,18 @@ test('configured host auth uses HttpOnly cookies and rejects unsafe credential t
         assert.match(streamResponse.headers.get('content-type') || '', /text\/event-stream/);
         await streamResponse.body.cancel();
 
+        const screenHealth = await fetch(`${base}/api/screen/geosync/health`, {
+            headers: { cookie: screenCookie }
+        });
+        assert.equal(screenHealth.status, 503);
+        assert.equal(['connecting', 'offline'].includes(
+            (await screenHealth.json()).mongo.state
+        ), true);
+
         const screenLogout = await fetch(`${base}/api/admin/screen/logout`, {
             method: 'POST',
             headers: {
-                authorization: 'Bearer cookie-session',
-                cookie: adminCookie
+                authorization: `Bearer ${adminCredential}`
             }
         });
         assert.equal(screenLogout.status, 200);
@@ -513,6 +549,15 @@ test('configured host auth uses HttpOnly cookies and rejects unsafe credential t
         assert.ok(clearedScreenCookie);
         assert.match(clearedScreenCookie, /Path=\/api\/screen/);
         assert.match(clearedScreenCookie, /Max-Age=0/);
+
+        const adminLogout = await fetch(`${base}/api/admin/logout`, {
+            method: 'POST',
+            headers: { cookie: adminCookie }
+        });
+        assert.equal(adminLogout.status, 503);
+        assert.equal(responseCookies(adminLogout).some(value =>
+            value.startsWith('poi_admin_session=')), false,
+        'logout must not clear the browser cookie until persistent revocation succeeds');
 
         const oauthStart = await fetch(`${base}/auth/wechat?redirect=/portal.html`, {
             redirect: 'manual'

@@ -3,6 +3,7 @@
 // registerModels(mongooseInstance) 幂等；getModels() 各处取用。
 
 const { Schema } = require('mongoose');
+const { getAdminSessionRevocationModel } = require('../services/adminSessionRevocation');
 
 let M = null; // 注册结果缓存
 
@@ -69,6 +70,8 @@ function registerModels(mongoose, injectedModels = {}) {
         new Schema({}, { strict: false, collection: 'pois' }));
     const ExternalUser = injectedModels.User || mongoose.models.User || mongoose.model('User',
         new Schema({}, { strict: false, collection: 'users' }));
+    const AdminSessionRevocation = injectedModels.AdminSessionRevocation
+        || getAdminSessionRevocationModel(mongoose);
 
     // ---- photospots ----
     const photoSpotSchema = new Schema({
@@ -432,7 +435,7 @@ function registerModels(mongoose, injectedModels = {}) {
     trailFragmentSchema.index({ expireAt: 1 }, { expireAfterSeconds: 0 });
 
     M = {
-        ExternalPoi, ExternalUser,
+        ExternalPoi, ExternalUser, AdminSessionRevocation,
         PhotoSpot: mongoose.model('PhotoSpot', photoSpotSchema),
         StaySample: mongoose.model('StaySample', staySampleSchema),
         CrowdSnapshot: mongoose.model('CrowdSnapshot', crowdSnapshotSchema),

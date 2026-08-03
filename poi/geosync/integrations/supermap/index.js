@@ -5,6 +5,7 @@ const SuperMapGateway = require('./gateway');
 const createHttpClient = require('./httpClient');
 const { IServerUnavailableError } = require('./errors');
 const { loadManifestSafe } = require('./manifest');
+const { DEFAULT_MAX_RESPONSE_BYTES } = createHttpClient;
 
 const TRUE_VALUES = new Set(['1', 'true', 'yes', 'on']);
 const FALSE_VALUES = new Set(['0', 'false', 'no', 'off']);
@@ -79,6 +80,10 @@ function createSuperMapGateway(options = {}) {
                 username: env.ISERVER_USERNAME || '',
                 password: env.ISERVER_PASSWORD || '',
                 timeoutMs: positiveNumber(env.SUPERMAP_TIMEOUT_MS, 5000),
+                maxResponseBytes: positiveNumber(
+                    options.maxResponseBytes ?? env.SUPERMAP_MAX_RESPONSE_BYTES,
+                    DEFAULT_MAX_RESPONSE_BYTES
+                ),
                 maxRetries: env.SUPERMAP_MAX_RETRIES === undefined ? 1 : env.SUPERMAP_MAX_RETRIES,
                 retryDelayMs: options.retryDelayMs || 0
             });
@@ -128,5 +133,6 @@ module.exports = {
     environmentBoolean,
     positiveNumber,
     nonNegativeNumber,
-    manifestPathOf
+    manifestPathOf,
+    DEFAULT_MAX_RESPONSE_BYTES
 };

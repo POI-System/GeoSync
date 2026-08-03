@@ -15,6 +15,53 @@ const antiHerding = require('./antiHerding');
 const EVAL_COOLDOWN_MS = 3 * 60000; // 同行程 evaluate 间隔 ≥3min
 const PROPOSAL_TTL_MS = 10 * 60000;
 
+function tokenKey(value) {
+    if (value === undefined || value === null) return null;
+    const key = String(value);
+    return key || null;
+}
+
+function createTokenTracker(releaseTokens) {
+    const held = new Map();
+
+    return {
+        track(tokenIds) {
+            for (const tokenId of tokenIds || []) {
+                const key = tokenKey(tokenId);
+                if (key) held.set(key, tokenId);
+            }
+        },
+        async release(tokenIds = [...held.values()]) {
+            const selected = new Map();
+            for (const tokenId of tokenIds || []) {
+                const key = tokenKey(tokenId);
+                if (key && held.has(key)) selected.set(key, held.get(key));
+            }
+            if (!selected.size) return;
+            await releaseTokens([...selected.values()]);
+            for (const key of selected.keys()) held.delete(key);
+        },
+        async releaseAll() {
+            await this.release([...held.values()]);
+        },
+        transferAll() {
+            held.clear();
+        }
+    };
+}
+
+async function rethrowAfterCleanup(error, cleanup) {
+    try {
+        await cleanup();
+    } catch (cleanupError) {
+        throw new AggregateError(
+            [error, cleanupError],
+            'Proposal evaluation failed and capacity token cleanup also failed'
+        );
+    }
+    throw error;
+}
+
 // ---------- 事件订阅（index.js 启动时调用 init） ----------
 function init() {
     bus.on(bus.EVENTS.CI_LEVEL_CHANGED, async ({ poiId, level }) => {
@@ -74,6 +121,16 @@ async function evaluate(it, trigger, extra = null) {
         console.log(`[GeoSync] [ENGINE] ${it._id} noDisturb, skip (trigger=${trigger})`);
         return;
     }
+    const tokenTracker = createTokenTracker(tokenIds =>
+        antiHerding.releaseTokens(tokenIds, it._id));
+    try {
+        return await evaluateCandidates(it, trigger, extra, tokenTracker);
+    } catch (error) {
+        return rethrowAfterCleanup(error, () => tokenTracker.releaseAll());
+    }
+}
+
+async function evaluateCandidates(it, trigger, extra, tokenTracker) {
     const { ExternalPoi } = getModels();
     const proposalExpireAt = new Date(Date.now() + PROPOSAL_TTL_MS);
     const remaining = it.stops.filter(s => ['pending', 'approaching'].includes(s.state));
@@ -97,7 +154,10 @@ async function evaluate(it, trigger, extra = null) {
             const swap = buildSwap(it, remaining, crowdedStop, poiMap);
             if (swap) candidates.push(swap);
             const replace = await buildReplace(it, crowdedStop, poiMap, proposalExpireAt);
-            if (replace) candidates.push(replace);
+            if (replace) {
+                tokenTracker.track(replace.tokenIds);
+                candidates.push(replace);
+            }
             const delay = buildDelay(it, crowdedStop, poiMap);
             if (delay) candidates.push(delay);
         }
@@ -108,7 +168,8 @@ async function evaluate(it, trigger, extra = null) {
 
     // 择优 + 阈值
     const threshold = CONFIG.rerouteGainMin * (it.rerouteCount >= CONFIG.rerouteDailySoftLimit ? 2 : 1);
-    const best = await selectCandidate(candidates, threshold);
+    const best = await selectCandidate(candidates, threshold, tokenIds =>
+        tokenTracker.release(tokenIds));
     if (!best) return;
 
     // 写 pendingProposal（乐观锁）
@@ -122,25 +183,20 @@ async function evaluate(it, trigger, extra = null) {
         tokenIds: best.tokenIds || [],
         expireAt: proposalExpireAt
     };
-    let updated;
-    try {
-        updated = await Itinerary.findOneAndUpdate(
-            { _id: it._id, version: it.version, 'pendingProposal.proposalId': null },
-            { $set: { pendingProposal: proposal }, $inc: { version: 1 } },
-            { new: true }
-        ) || await Itinerary.findOneAndUpdate(
-            { _id: it._id, version: it.version, pendingProposal: null },
-            { $set: { pendingProposal: proposal }, $inc: { version: 1 } },
-            { new: true }
-        );
-    } catch (e) {
-        await antiHerding.releaseTokens(proposal.tokenIds);
-        throw e;
-    }
+    const updated = await Itinerary.findOneAndUpdate(
+        { _id: it._id, version: it.version, 'pendingProposal.proposalId': null },
+        { $set: { pendingProposal: proposal }, $inc: { version: 1 } },
+        { new: true }
+    ) || await Itinerary.findOneAndUpdate(
+        { _id: it._id, version: it.version, pendingProposal: null },
+        { $set: { pendingProposal: proposal }, $inc: { version: 1 } },
+        { new: true }
+    );
     if (!updated) {
-        await antiHerding.releaseTokens(proposal.tokenIds);
+        await tokenTracker.releaseAll();
         return;
     }
+    tokenTracker.transferAll();
     bus.emit(bus.EVENTS.REROUTE_PROPOSED, { itinerary: updated, proposal });
     console.log(`[GeoSync] [ENGINE] proposal ${proposal.proposalId} (${proposal.type}, +${proposal.gainMin}min) itinerary=${it._id}`);
 }
@@ -233,17 +289,22 @@ async function buildReplace(it, crowdedStop, poiMap, holdUntil) {
     candidates.sort((a, b) => b.gain - a.gain);
     const picked = await antiHerding.pickAlternative(candidates.slice(0, 5), it._id);
     if (!picked) return null;
-    const distM = Math.round(geo.haversine(coords, walkGraph.poiCoords(picked.poi)));
-    return {
-        type: 'replace', gainMin: picked.gain, tokenIds: [picked.tokenId],
-        payload: {
-            stopId: crowdedStop._id,
-            newPoiId: picked.poi._id,
-            newPhotoSpotId: null,
-            capacityTokenId: picked.tokenId
-        },
-        reason: `${target.poiName}拥挤，${picked.poi.poiName}（${distM}m外）视野相近且空闲，预计省${Math.round(picked.gain)}分钟`
-    };
+    try {
+        const distM = Math.round(geo.haversine(coords, walkGraph.poiCoords(picked.poi)));
+        return {
+            type: 'replace', gainMin: picked.gain, tokenIds: [picked.tokenId],
+            payload: {
+                stopId: crowdedStop._id,
+                newPoiId: picked.poi._id,
+                newPhotoSpotId: null,
+                capacityTokenId: picked.tokenId
+            },
+            reason: `${target.poiName}拥挤，${picked.poi.poiName}（${distM}m外）视野相近且空闲，预计省${Math.round(picked.gain)}分钟`
+        };
+    } catch (error) {
+        return rethrowAfterCleanup(error, () =>
+            antiHerding.releaseTokens([picked.tokenId], it._id));
+    }
 }
 
 // delay：原地延后（预测回落）

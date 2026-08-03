@@ -12,6 +12,7 @@ const {
     DEFAULT_HEADER_NAMES,
     createSessionToken
 } = require('../../lib/sessionAuth');
+const { hashAdminSessionId } = require('../../services/adminSessionRevocation');
 
 const users = new Map([
     ['user-1', { openId: 'user-1', role: 'collector' }],
@@ -25,7 +26,24 @@ const ExternalUser = {
     }
 };
 
-modelModule.registerModels(new mongoose.Mongoose(), { User: ExternalUser });
+const revokedAdminSessionIds = new Set();
+let revocationReadError = null;
+const AdminSessionRevocation = {
+    findOne(filter) {
+        return {
+            lean: async () => {
+                if (revocationReadError) throw revocationReadError;
+                return revokedAdminSessionIds.has(filter._id) ? { _id: filter._id } : null;
+            }
+        };
+    },
+    async updateOne(filter, update) {
+        revokedAdminSessionIds.add(filter._id);
+        return { acknowledged: true, update };
+    }
+};
+
+modelModule.registerModels(new mongoose.Mongoose(), { User: ExternalUser, AdminSessionRevocation });
 const {
     LEGACY_ADMIN_SESSION_MARKER,
     requireUser,
@@ -184,7 +202,7 @@ test('legacy X-Open-Id works only when explicitly enabled outside production', a
     }
 });
 
-test('admin accepts only a strong Bearer token or signed admin session cookie', () => {
+test('admin accepts only a strong Bearer token or signed admin session cookie', async () => {
     const previous = snapshotConfig();
     Object.assign(CONFIG, {
         sessionSecret: SESSION_SECRET,
@@ -194,14 +212,14 @@ test('admin accepts only a strong Bearer token or signed admin session cookie', 
     try {
         const bearerReq = { headers: { authorization: `Bearer ${ADMIN_TOKEN}` } };
         let bearerNext = false;
-        requireAdmin(bearerReq, response(), () => { bearerNext = true; });
+        await requireAdmin(bearerReq, response(), () => { bearerNext = true; });
         assert.equal(bearerNext, true);
         assert.equal(bearerReq.adminAuth.kind, 'opaque-admin-token');
 
         const signed = adminToken();
         const cookieReq = { headers: { cookie: `${DEFAULT_COOKIE_NAMES.admin}=${signed}` } };
         let cookieNext = false;
-        requireAdmin(cookieReq, response(), () => { cookieNext = true; });
+        await requireAdmin(cookieReq, response(), () => { cookieNext = true; });
         assert.equal(cookieNext, true);
         assert.equal(cookieReq.adminAuth.kind, 'signed-session');
 
@@ -212,12 +230,12 @@ test('admin accepts only a strong Bearer token or signed admin session cookie', 
             }
         };
         let browserNext = false;
-        requireAdmin(browserReq, response(), () => { browserNext = true; });
+        await requireAdmin(browserReq, response(), () => { browserNext = true; });
         assert.equal(browserNext, true);
         assert.equal(browserReq.adminAuth.kind, 'signed-session');
 
         const staleSubjectRes = response();
-        requireAdmin({
+        await requireAdmin({
             headers: {
                 cookie: `${DEFAULT_COOKIE_NAMES.admin}=${adminToken('former-operator')}`
             }
@@ -229,7 +247,7 @@ test('admin accepts only a strong Bearer token or signed admin session cookie', 
             { headers: { authorization: `Bearer ${signed}` } }
         ]) {
             const res = response();
-            requireAdmin(req, res, () => assert.fail('next must not run'));
+            await requireAdmin(req, res, () => assert.fail('next must not run'));
             assert.equal(res.statusCode, 403);
         }
 
@@ -238,13 +256,13 @@ test('admin accepts only a strong Bearer token or signed admin session cookie', 
             { headers: {}, body: { adminToken: ADMIN_TOKEN } }
         ]) {
             const res = response();
-            requireAdmin(req, res, () => assert.fail('next must not run'));
+            await requireAdmin(req, res, () => assert.fail('next must not run'));
             assert.equal(res.statusCode, 403);
         }
 
         CONFIG.adminToken = 'super-admin-token';
         const weakRes = response();
-        requireAdmin({ headers: { authorization: 'Bearer super-admin-token' } }, weakRes,
+        await requireAdmin({ headers: { authorization: 'Bearer super-admin-token' } }, weakRes,
             () => assert.fail('next must not run'));
         assert.equal(weakRes.statusCode, 403);
     } finally {
@@ -252,7 +270,7 @@ test('admin accepts only a strong Bearer token or signed admin session cookie', 
     }
 });
 
-test('screen authentication rejects query tokens and accepts only a strong header or cookie', () => {
+test('screen authentication rejects query tokens and accepts only a strong header or cookie', async () => {
     const previous = snapshotConfig();
     Object.assign(CONFIG, {
         sessionSecret: SESSION_SECRET,
@@ -262,7 +280,7 @@ test('screen authentication rejects query tokens and accepts only a strong heade
     });
     try {
         const queryRes = response();
-        screenOrAdmin({ headers: {}, query: { screenToken: SCREEN_TOKEN } }, queryRes,
+        await screenOrAdmin({ headers: {}, query: { screenToken: SCREEN_TOKEN } }, queryRes,
             () => assert.fail('next must not run'));
         assert.equal(queryRes.statusCode, 403);
 
@@ -276,13 +294,13 @@ test('screen authentication rejects query tokens and accepts only a strong heade
             }
         ]) {
             let nextCalled = false;
-            screenOrAdmin(req, response(), () => { nextCalled = true; });
+            await screenOrAdmin(req, response(), () => { nextCalled = true; });
             assert.equal(nextCalled, true);
             assert.ok(req.screenAuth);
         }
 
         const expiredRes = response();
-        screenOrAdmin({
+        await screenOrAdmin({
             headers: {
                 cookie: `${DEFAULT_COOKIE_NAMES.screen}=${screenSessionToken(NOW - 3600 * 1000, 60)}`
             },
@@ -300,15 +318,52 @@ test('screen authentication rejects query tokens and accepts only a strong heade
             query: {}
         };
         let adminFallbackNext = false;
-        screenOrAdmin(adminFallbackReq, response(), () => { adminFallbackNext = true; });
+        await screenOrAdmin(adminFallbackReq, response(), () => { adminFallbackNext = true; });
         assert.equal(adminFallbackNext, true);
         assert.equal(adminFallbackReq.adminAuth.kind, 'signed-session');
 
         const adminReq = { headers: { authorization: `Bearer ${ADMIN_TOKEN}` }, query: {} };
         let adminNext = false;
-        screenOrAdmin(adminReq, response(), () => { adminNext = true; });
+        await screenOrAdmin(adminReq, response(), () => { adminNext = true; });
         assert.equal(adminNext, true);
     } finally {
+        restoreConfig(previous);
+    }
+});
+
+test('GeoSync signed administrator auth rejects persisted revocation and storage outages', async () => {
+    const previous = snapshotConfig();
+    Object.assign(CONFIG, {
+        sessionSecret: SESSION_SECRET,
+        adminToken: ADMIN_TOKEN,
+        adminUsername: 'operator-1'
+    });
+    const signed = adminToken();
+    const request = {
+        headers: { cookie: `${DEFAULT_COOKIE_NAMES.admin}=${signed}` }
+    };
+    try {
+        revokedAdminSessionIds.add(hashAdminSessionId('admin-session-1'));
+        const revoked = response();
+        await requireAdmin(request, revoked, () => assert.fail('revoked session must not pass'));
+        assert.equal(revoked.statusCode, 403);
+
+        revokedAdminSessionIds.clear();
+        revocationReadError = new Error('private database detail');
+        const unavailable = response();
+        await requireAdmin(request, unavailable, () => assert.fail('unverified session must not pass'));
+        assert.equal(unavailable.statusCode, 503);
+        assert.doesNotMatch(JSON.stringify(unavailable.body), /private database detail/);
+
+        const bearer = response();
+        let bearerNext = false;
+        await requireAdmin({
+            headers: { authorization: `Bearer ${ADMIN_TOKEN}` }
+        }, bearer, () => { bearerNext = true; });
+        assert.equal(bearerNext, true);
+    } finally {
+        revokedAdminSessionIds.clear();
+        revocationReadError = null;
         restoreConfig(previous);
     }
 });

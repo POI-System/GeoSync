@@ -37,6 +37,7 @@ const {
     createLivenessHandler,
     createReadinessHandler,
     createHealthHandler,
+    createDetailedHealthHandler,
     waitForMongoReady,
     safeFailure
 } = require('./services/runtimeHealth');
@@ -410,6 +411,7 @@ function attach({
         routeBetween,
         releaseProposalTokens: (tokenIds, itineraryId) =>
             antiHerding.releaseTokens(tokenIds, itineraryId),
+        itineraryConcurrency: options.barrierRerouteConcurrency ?? CONFIG.barrierRerouteConcurrency,
         eventBus: bus
     });
     bus.on(bus.EVENTS.EDGE_CLOSED, payload => barrierReroute.enqueueGraphEvent(payload));
@@ -459,6 +461,16 @@ function attach({
 
         // 健康端点（08文档 §4）
         app.get('/api/geosync/health', wrap(createHealthHandler({
+            ...healthDependencies,
+            superMapGateway,
+            config: CONFIG
+        })));
+        app.get('/api/admin/geosync/health', requireAdmin, wrap(createDetailedHealthHandler({
+            ...healthDependencies,
+            superMapGateway,
+            config: CONFIG
+        })));
+        app.get('/api/screen/geosync/health', screenOrAdmin, wrap(createDetailedHealthHandler({
             ...healthDependencies,
             superMapGateway,
             config: CONFIG

@@ -12,7 +12,8 @@ const {
     toSuperMapError
 } = require('../../integrations/supermap/errors');
 const {
-    SuperMapHttpClient
+    SuperMapHttpClient,
+    DEFAULT_MAX_RESPONSE_BYTES
 } = require('../../integrations/supermap/httpClient');
 
 function axiosError({ code, status, data, request = true, message = 'transport failed' } = {}) {
@@ -124,12 +125,24 @@ test('request sends base URL, Basic auth, requestId, timeout and payload only th
         url: '/services/data/query',
         method: 'POST',
         timeout: 1234,
+        maxRedirects: 0,
+        maxContentLength: DEFAULT_MAX_RESPONSE_BYTES,
         headers: { 'X-Request-Id': 'gis-req-1' },
         data: { dataset: 'poi' },
         params: { returnContent: true },
         auth: { username: 'server-user', password: 'server-pass' }
     });
     assert.equal(Object.hasOwn(axios.calls[0].headers, 'Authorization'), false);
+});
+
+test('response size limits are configurable while redirects always remain disabled', async () => {
+    const axios = fakeAxios([{ status: 200, data: {} }]);
+    const client = makeClient(axios, { maxResponseBytes: 2048 });
+
+    await client.request({ operation: 'health', path: '/health' });
+
+    assert.equal(axios.calls[0].maxContentLength, 2048);
+    assert.equal(axios.calls[0].maxRedirects, 0);
 });
 
 test('credentials are omitted when server-side Basic auth is not configured', async () => {

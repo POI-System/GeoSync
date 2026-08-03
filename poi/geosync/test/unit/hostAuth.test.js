@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { DEFAULT_COOKIE_NAMES } = require('../../lib/sessionAuth');
 const { LEGACY_ADMIN_SESSION_MARKER, createHostAuth } = require('../../services/hostAuth');
+const { hashAdminSessionId } = require('../../services/adminSessionRevocation');
 
 const SECRET = 'host-auth-secret-V9x7sQ2pL4mN8cR6tY1uI5oP3aS0';
 const ADMIN_TOKEN = 'host-admin-token-R8m3Q7v2N9x5K4p6D1s0F7h2J8c5';
@@ -14,6 +15,29 @@ function fakeUsers(rows = []) {
     return {
         findOne(filter) {
             return { lean: async () => byOpenId.get(filter.openId) || null };
+        }
+    };
+}
+
+function fakeRevocations(options = {}) {
+    const records = options.records || new Map();
+    const writes = [];
+    return {
+        records,
+        writes,
+        findOne(filter) {
+            return {
+                lean: async () => {
+                    if (options.readError) throw options.readError;
+                    return records.has(filter._id) ? { _id: filter._id } : null;
+                }
+            };
+        },
+        async updateOne(filter, update) {
+            if (options.writeError) throw options.writeError;
+            writes.push({ filter, update });
+            records.set(filter._id, { ...update.$setOnInsert });
+            return { acknowledged: true, upsertedCount: 1 };
         }
     };
 }
@@ -42,6 +66,7 @@ function makeAuth(overrides = {}) {
             { openId: 'reviewer-a', role: 'reviewer' },
             { openId: 'disabled-a', role: 'collector', disabled: true }
         ]),
+        AdminSessionRevocation: overrides.AdminSessionRevocation || fakeRevocations(),
         sessionSecret: overrides.sessionSecret ?? SECRET,
         adminToken: overrides.adminToken ?? ADMIN_TOKEN,
         adminUsername: 'operator',
@@ -89,37 +114,93 @@ test('legacy X-Open-Id requires an explicit non-production compatibility mode', 
     );
 });
 
-test('admin auth accepts only a valid Bearer token or signed cookie, never the UI marker alone', () => {
+test('admin auth accepts only a valid Bearer token or signed cookie, never the UI marker alone', async () => {
     const auth = makeAuth();
-    assert.equal(auth.authenticateAdminRequest({
+    assert.equal((await auth.authenticateAdminRequest({
         headers: { authorization: `Bearer ${ADMIN_TOKEN}` }
-    }).source, 'bearer');
+    })).source, 'bearer');
 
     const res = response();
     auth.issueAdminSession(res);
     const cookie = cookieValue(res.getHeader('Set-Cookie')[0]);
-    assert.equal(auth.authenticateAdminRequest({ headers: { cookie } }).source, 'cookie');
-    assert.equal(auth.authenticateAdminRequest({
+    assert.equal((await auth.authenticateAdminRequest({ headers: { cookie } })).source, 'cookie');
+    assert.equal((await auth.authenticateAdminRequest({
         headers: { authorization: `Bearer ${LEGACY_ADMIN_SESSION_MARKER}`, cookie }
-    }).source, 'cookie');
-    assert.throws(() => auth.authenticateAdminRequest({
+    })).source, 'cookie');
+    await assert.rejects(auth.authenticateAdminRequest({
         headers: { authorization: `Bearer ${LEGACY_ADMIN_SESSION_MARKER}` }
     }), error => error.code === 'ADMIN_AUTH_REQUIRED');
-    assert.throws(() => auth.authenticateAdminRequest({
+    await assert.rejects(auth.authenticateAdminRequest({
         headers: { authorization: 'Bearer wrong-token' }
     }), error => error.code === 'ADMIN_CREDENTIAL_INVALID');
 
     const weakTokenAuth = makeAuth({ adminToken: 'super-admin-token' });
-    assert.throws(() => weakTokenAuth.authenticateAdminRequest({
+    await assert.rejects(weakTokenAuth.authenticateAdminRequest({
         headers: { authorization: 'Bearer super-admin-token' }
     }), error => error.code === 'ADMIN_CREDENTIAL_INVALID');
 });
 
-test('admin query and body tokens are ignored', () => {
+test('admin query and body tokens are ignored', async () => {
     const auth = makeAuth();
-    assert.throws(() => auth.authenticateAdminRequest({
+    await assert.rejects(auth.authenticateAdminRequest({
         headers: {}, query: { adminToken: ADMIN_TOKEN }, body: { adminToken: ADMIN_TOKEN }
     }), error => error.code === 'ADMIN_AUTH_REQUIRED');
+});
+
+test('administrator logout persists a hashed jti and rejects the same cookie until expiry', async () => {
+    const revocations = fakeRevocations();
+    const auth = makeAuth({ AdminSessionRevocation: revocations });
+    const res = response();
+    const token = auth.issueAdminSession(res);
+    const cookie = cookieValue(res.getHeader('Set-Cookie')[0]);
+    const principal = await auth.authenticateAdminRequest({ headers: { cookie } });
+
+    assert.equal(await auth.revokeAdminSession({ headers: { cookie } }), true);
+    assert.equal(revocations.writes.length, 1);
+    assert.equal(revocations.writes[0].filter._id, hashAdminSessionId(principal.sessionId));
+    assert.equal(JSON.stringify(revocations.writes).includes(principal.sessionId), false);
+    assert.equal(JSON.stringify(revocations.writes).includes(token), false);
+    assert.ok(revocations.writes[0].update.$setOnInsert.expiresAt instanceof Date);
+
+    await assert.rejects(
+        auth.authenticateAdminRequest({ headers: { cookie } }),
+        error => error.code === 'ADMIN_SESSION_REVOKED' && error.httpStatus === 403
+    );
+    const restartedAuth = makeAuth({ AdminSessionRevocation: fakeRevocations({
+        records: revocations.records
+    }) });
+    await assert.rejects(
+        restartedAuth.authenticateAdminRequest({ headers: { cookie } }),
+        error => error.code === 'ADMIN_SESSION_REVOKED'
+    );
+});
+
+test('administrator signed sessions fail closed when revocation storage is unavailable', async () => {
+    const readFailure = makeAuth({
+        AdminSessionRevocation: fakeRevocations({ readError: new Error('database detail') })
+    });
+    const res = response();
+    readFailure.issueAdminSession(res);
+    const cookie = cookieValue(res.getHeader('Set-Cookie')[0]);
+    await assert.rejects(
+        readFailure.authenticateAdminRequest({ headers: { cookie } }),
+        error => error.code === 'ADMIN_SESSION_REVOCATION_UNAVAILABLE' && error.httpStatus === 503
+    );
+    assert.equal((await readFailure.authenticateAdminRequest({
+        headers: { authorization: `Bearer ${ADMIN_TOKEN}` }
+    })).source, 'bearer', 'opaque ADMIN_TOKEN must not depend on the revocation database');
+
+    const writeFailure = makeAuth({
+        AdminSessionRevocation: fakeRevocations({ writeError: new Error('database detail') })
+    });
+    const writeRes = response();
+    writeFailure.issueAdminSession(writeRes);
+    await assert.rejects(
+        writeFailure.revokeAdminSession({
+            headers: { cookie: cookieValue(writeRes.getHeader('Set-Cookie')[0]) }
+        }),
+        error => error.code === 'ADMIN_SESSION_REVOCATION_UNAVAILABLE' && error.httpStatus === 503
+    );
 });
 
 test('reviewer middleware rejects collectors and accepts verified reviewers or admins', async () => {

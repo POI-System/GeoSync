@@ -1,6 +1,6 @@
 # GeoSync Deployment and Recovery Runbook
 
-Status date: August 2, 2026
+Status date: August 3, 2026
 
 This runbook covers the Li Ziya backend integration on branch `LZY`. It does not
 claim that a real SuperMap iServer deployment has been validated. Real service
@@ -88,6 +88,52 @@ reflects the scheduler's actual result, while the `jobs` object distinguishes a
 running primary instance, intentional `background-disabled`, and intentional
 `non-primary-instance` disablement.
 
+### Request Parsing and Process Shutdown
+
+The host JSON and URL-encoded parsers use a fixed `1mb` limit. No current JSON
+endpoint accepts files, base64 images, bulk GIS publications, or another payload
+that requires a larger body. Host POI/OCR uploads and GeoSync check-in,
+photospot, and pairing-fulfilment photos use `multipart/form-data` with dedicated
+Multer middleware and a 10 MiB per-file ceiling, so they do not depend on the
+JSON parser limit. Do not raise the global parser limit to accommodate an upload;
+add a reviewed route-local parser only if a future non-multipart contract proves
+that it needs one.
+
+Nginx must not retain the former 50 MiB blanket allowance. The smallest
+compatible upstream ceiling is 12 MiB, which leaves multipart framing room above
+the application-level 10 MiB file limit; Node still rejects JSON and URL-encoded
+bodies above 1 MiB. A stricter Nginx layout may keep a 1 MiB default and apply the
+12 MiB ceiling only to the documented multipart routes. Verify both limits after
+every proxy configuration change.
+
+`server.js` installs the shared graceful-shutdown lifecycle after `server`, `io`,
+and the GeoSync attachment exist and before `server.listen(...)`:
+
+```js
+const { installGracefulShutdown } = require('./geosync/services/gracefulShutdown');
+
+installGracefulShutdown({
+    server,
+    io,
+    mongoose,
+    timeoutMs: process.env.SHUTDOWN_TIMEOUT_MS,
+    logger: console
+});
+```
+
+The first `SIGTERM` or `SIGINT` stops HTTP admission and Socket.io together,
+waits for both drains, disconnects Mongoose, and exits once. Repeated signals
+share the same shutdown promise. The total default deadline is 10000 ms and is
+bounded to at most 60000 ms; timeout or any close/disconnect failure exits with
+code 1. Logs contain the signal and failed phase names only, never driver or
+connection error messages.
+
+PM2 must allow the application deadline to finish. For the default application
+timeout, set `kill_timeout: 12000` in `ecosystem.config.js`. If
+`SHUTDOWN_TIMEOUT_MS` is changed, keep PM2's `kill_timeout` strictly greater than
+that value and validate a real restart with an in-flight HTTP request and an
+active Socket connection.
+
 ## 3. Configuration and Secret Handling
 
 Use `poi/.env.example` as the list of supported variables, not as production
@@ -110,9 +156,15 @@ Core production configuration includes:
   traffic is intentional. Invalid values do not disable the environment default,
   and startup logs contain only sanitized error codes, never the MongoDB URI or
   driver error message.
+- `SHUTDOWN_TIMEOUT_MS`: optional positive integer total shutdown deadline in
+  milliseconds. The default is 10000 and the maximum is 60000; invalid, blank,
+  zero, negative, or oversized values use the default without logging the raw
+  value. PM2's `kill_timeout` must remain greater than the effective deadline.
 - `ADMIN_USERNAME` and `ADMIN_PASSWORD`: required for administrator login.
 - `ADMIN_TOKEN`: optional. When supplied it must be a separate strong opaque
   Bearer credential; it is never accepted in query strings or request bodies.
+  This credential is deliberately independent of the signed-session revocation
+  store and remains available for recovery while MongoDB is unavailable.
 - `AUTH_SESSION_SECRET`: an independent random secret containing at least 32
   bytes. Keep the repository template blank, do not reuse an API credential, and
   inject the production value through the deployment secret manager.
@@ -141,6 +193,10 @@ Core production configuration includes:
   claims; an expired cookie cannot be extended by the browser.
 - `SCENIC_ID`, `SCENIC_CENTER`, and `SCENIC_FENCE_RADIUS_M`: the deployed scenic
   identity and WGS84 `[lng,lat]` operating area.
+- `BARRIER_REROUTE_CONCURRENCY`: positive integer number of active itineraries
+  rebuilt concurrently for one accepted graph event. The default is 6. Events
+  for the same scenic area remain serialized; increasing this value raises
+  concurrent MongoDB and iServer pressure and requires a measured load test.
 - `HOST`, `PORT`, `PUBLIC_HOST`, and `CORS_ORIGIN`: host process settings.
 - `TRUST_PROXY=loopback`: the safe default for direct deployments and a local
   reverse proxy. Authentication rate limits use `req.ip`, so a non-loopback
@@ -182,6 +238,7 @@ SuperMap server-side configuration includes:
 - `SUPERMAP_TIMEOUT_MS`
 - `SUPERMAP_HEALTH_TIMEOUT_MS`
 - `SUPERMAP_MANIFEST_RETRY_MS`
+- `SUPERMAP_MAX_RESPONSE_BYTES`
 - `SUPERMAP_CACHE_TTL_S`
 - `SUPERMAP_FALLBACK_ENABLED`
 - `SUPERMAP_MAX_RETRIES`
@@ -191,6 +248,13 @@ manifest loads. The default is 30000 ms. After that interval, ordinary health,
 query, route, and public-config calls retry the manifest automatically; an
 operator does not need to call the forced administrator status endpoint to
 recover from a transient file-read or mount-order failure.
+
+`SUPERMAP_MAX_RESPONSE_BYTES` is the positive integer Axios response ceiling and
+defaults to 10485760 bytes (10 MiB). Redirect following is always disabled for
+iServer requests, independent of configuration. Geometry normalization rejects
+an upstream geometry or route containing more than 100000 input positions before
+axis, extent, or endpoint scoring. Treat either limit as a contract failure to
+investigate; do not raise it merely to accept an unexplained oversized response.
 
 `ISERVER_BASE`, usernames, passwords, MongoDB URIs, reviewer identities, session
 secrets, and administrator or screen tokens must never appear in
@@ -210,6 +274,13 @@ Supported credential transports are intentionally narrow:
 
 A signed administrator session is a cookie credential, not a Bearer token. Query
 and request-body tokens are not accepted as substitutes for these transports.
+`POST /api/admin/logout` persists only a SHA-256 digest of the signed session
+`jti` plus its bounded expiry in `admin_session_revocations`. Its `expiresAt` TTL
+index removes expired records. HTTP and Socket administrator checks consult the
+shared collection, so a successful logout invalidates the same cookie across
+instances for the rest of its original lifetime. If MongoDB cannot read or write
+revocation state, signed administrator authentication and logout fail closed;
+logout does not clear the cookie or claim success before the write succeeds.
 The screen bootstrap endpoint signs a bounded `SESSION_KINDS.SCREEN` credential
 with `AUTH_SESSION_SECRET`; it never copies the raw `SCREEN_TOKEN` into the
 browser cookie. An expired or otherwise invalid signed screen cookie is HTTP 403
@@ -486,8 +557,10 @@ Start the single service, then verify both the legacy POI surface and GeoSync:
 3. `GET /api/client-config` returns HTTP 200.
 4. `GET /api/geosync/client-config` returns HTTP 200 and contains no credentials,
    private service paths, MongoDB URI, administrator token, or dataset allowlist.
-5. `GET /api/geosync/health` reports MongoDB, graph, jobs, GIS, manifest, route
-   cache count, last invalidation reason, and last successful GIS time.
+5. Public `GET /api/geosync/health` returns only `{state}`. Full MongoDB, graph,
+   jobs, GIS, manifest, and route-cache diagnostics are available at
+   `GET /api/admin/geosync/health` for administrators and
+   `GET /api/screen/geosync/health` for signed/opaque screen credentials.
 6. `GET /api/admin/geosync/gis/status` succeeds only with a valid signed
    administrator session or configured administrator Bearer token.
 7. `POST /api/admin/geosync/gis/route-test` succeeds only with the same
@@ -498,6 +571,14 @@ Start the single service, then verify both the legacy POI surface and GeoSync:
    session. The optional opaque screen token must never be sent in a URL. Verify
    that an expired screen cookie alone receives 403 and that the same route can
    still be reached through an independently valid administrator session.
+9. An unauthenticated JSON request larger than 1 MiB returns HTTP 413 before the
+   route handler, while the same route with a small JSON body reaches its normal
+   authentication or business response. Repeat through Nginx, not only against
+   the loopback Node port. A valid multipart upload below 10 MiB must still reach
+   its route, and a file above 10 MiB must be rejected by Multer.
+10. Send both `SIGTERM` and `SIGINT` in separate restart checks. New HTTP work is
+    refused, active HTTP and Socket work receives the configured drain window,
+    Mongoose disconnects after both listeners close, and the process exits once.
 
 Health status interpretation:
 
@@ -530,10 +611,11 @@ and representative raw responses.
 | Mode unreachable | HTTP/code `8204` | Verify network attributes; never bypass accessible checks |
 | Contract/dataVersion mismatch | HTTP/code `8205`; cache must not be trusted | Align manifest, network publication, and sourceRef mapping |
 | Invalid upstream geometry | HTTP/code `8206` | Capture a sanitized representative response for adapter work |
-| MongoDB unavailable | `/api/geosync/health` and `/api/geosync/health/ready` return HTTP 503 | Remove traffic, restore database connectivity, then recheck |
-| Graph or POI index startup pending/failed | Detailed `/api/geosync/health` returns HTTP 503; host-aware `/api/geosync/health/ready` returns HTTP 200 with `state=degraded` and `geosyncReady=false` | Keep host POI traffic available while repairing database/index data or startup configuration |
-| Jobs requested but scheduler failed | Detailed `/api/geosync/health` returns HTTP 503 with `jobs.state=failed`; host-aware readiness remains HTTP 200 degraded while MongoDB is online | Repair scheduler startup; non-primary/background-disabled states are intentional and named |
+| MongoDB unavailable | Public `/api/geosync/health` and `/api/geosync/health/ready` return HTTP 503; signed administrator sessions also fail closed because revocation state cannot be verified | Use the independent opaque `ADMIN_TOKEN` for protected diagnostics, restore database connectivity, then recheck |
+| Graph or POI index startup pending/failed | Protected detailed health returns HTTP 503; host-aware `/api/geosync/health/ready` returns HTTP 200 with `state=degraded` and `geosyncReady=false` | Keep host POI traffic available while repairing database/index data or startup configuration |
+| Jobs requested but scheduler failed | Protected detailed health returns HTTP 503 with `jobs.state=failed`; host-aware readiness remains HTTP 200 degraded while MongoDB is online | Repair scheduler startup; non-primary/background-disabled states are intentional and named |
 | Initial MongoDB connection fails in production | Process exits with code 1 after a sanitized `MONGO_STARTUP_FAILED` log | Restore MongoDB connectivity or configuration, then let the service manager restart the process; do not disable fail-fast as a permanent workaround |
+| Graceful shutdown exceeds its total deadline | Process exits with code 1 after sanitized `SHUTDOWN_TIMEOUT` diagnostics | Inspect only the named drain phase, correct the stuck dependency, and keep PM2 `kill_timeout` above the application deadline |
 | `AUTH_SESSION_SECRET` missing or unsafe | Session issuance/authentication fails closed; login may return HTTP 503 | Inject an independent random secret of at least 32 bytes and restart |
 | `SCREEN_TOKEN` missing or unsafe | Opaque `X-Screen-Token` access is rejected; the signed administrator-issued screen session remains available | Configure a distinct strong token only if non-cookie header access is operationally required |
 | Signed screen session expired | Screen-only request returns HTTP 403 | Authenticate as an administrator and issue a new bounded screen session; do not reuse or extend the expired cookie client-side |

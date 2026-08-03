@@ -11,6 +11,7 @@ const { dateStrOf, encodePolyline, haversine } = require('../lib/geo');
 
 const PACE_FACTOR = { relaxed: 1.3, normal: 1.0, tight: 0.8 };
 const WALK_SPEED_MPS = 1.4;
+const PLANNER_OPTIMIZATION_BUDGET_MS = 3000;
 
 /**
  * 生成行程（不落库，routes 层负责保存）
@@ -30,16 +31,19 @@ async function plan({
     if (!hours || hours < 1) throw new BizError(1102, '预算时长过短（至少1小时）');
     const estimateBetween = deps.estimateBetween || defaultEstimateBetween;
     const routeBetween = deps.routeBetween;
+    const budgetNow = deps.budgetNow || Date.now;
     if (typeof estimateBetween !== 'function') {
         throw new TypeError('planner estimateBetween must be a function');
     }
     if (typeof routeBetween !== 'function') {
         throw new TypeError('planner routeBetween must be an async function');
     }
+    if (typeof budgetNow !== 'function') {
+        throw new TypeError('planner budgetNow must be a function');
+    }
     const { ExternalPoi, PhotoSpot, Checkin, Campaign } = getModels();
     const mode = accessible ? 'accessible' : shadeFirst ? 'shade' : 'normal';
     const t0 = startAt ? new Date(startAt) : new Date(Date.now() + 10 * 60000);
-    const deadline = Date.now() + 3000; // 3s 熔断（05文档性能预算）
 
     // 0. 候选池 ≤80
     let pois = await ExternalPoi.find({ status: 'approved' }).lean();
@@ -78,6 +82,9 @@ async function plan({
         return (spot.goldenWindows || []).filter(w => w.date === todayStr);
     };
 
+    // Mongo 候选数据准备不占用启发式优化的 3 秒计算预算。
+    const deadline = budgetNow() + PLANNER_OPTIMIZATION_BUDGET_MS;
+
     // 1+2. 贪心装载
     const budgetMin = hours * 60 * 0.85; // 15% 弹性
     const paceF = PACE_FACTOR[pace] || 1;
@@ -88,7 +95,7 @@ async function plan({
     let t = new Date(t0);
     let usedMin = 0;
 
-    while (remaining.size && Date.now() < deadline) {
+    while (remaining.size && budgetNow() < deadline) {
         let best = null, bestRatio = -Infinity;
         for (const id of remaining) {
             const poi = poiById.get(id);
@@ -130,7 +137,7 @@ async function plan({
     let bestWalk = totalWalkSec(order, startLocation, mode, estimateBetween);
     let iter = 0;
     outer:
-    for (let round = 0; round < 20 && Date.now() < deadline; round++) {
+    for (let round = 0; round < 20 && budgetNow() < deadline; round++) {
         let improved = false;
         for (let i = 0; i < order.length - 1; i++) {
             for (let j = i + 1; j < order.length; j++) {

@@ -13,6 +13,11 @@ const {
     serializeExpiredCookie,
     timingSafeEqualText
 } = require('../lib/sessionAuth');
+const {
+    AdminSessionRevocationError,
+    isAdminSessionRevoked,
+    revokeAdminSession
+} = require('./adminSessionRevocation');
 
 const LEGACY_ADMIN_SESSION_MARKER = 'cookie-session';
 const VALID_USER_ROLES = new Set(['collector', 'reviewer', 'thirdParty']);
@@ -55,6 +60,12 @@ function createHostAuth(options = {}) {
     const User = options.User;
     if (!User || typeof User.findOne !== 'function') {
         throw new TypeError('createHostAuth requires User.findOne');
+    }
+    const AdminSessionRevocation = options.AdminSessionRevocation;
+    if (!AdminSessionRevocation
+        || typeof AdminSessionRevocation.findOne !== 'function'
+        || typeof AdminSessionRevocation.updateOne !== 'function') {
+        throw new TypeError('createHostAuth requires AdminSessionRevocation.findOne/updateOne');
     }
 
     let adminToken = '';
@@ -191,7 +202,29 @@ function createHostAuth(options = {}) {
         }
     }
 
-    function authenticateAdminRequest(req) {
+    async function assertAdminSessionActive(claims) {
+        try {
+            if (await isAdminSessionRevoked(AdminSessionRevocation, claims.sessionId)) {
+                throw new HostAuthError(
+                    'ADMIN_SESSION_REVOKED',
+                    403,
+                    'Administrator session has been revoked.'
+                );
+            }
+        } catch (error) {
+            if (error instanceof HostAuthError) throw error;
+            if (error instanceof AdminSessionRevocationError) {
+                throw new HostAuthError(
+                    error.code,
+                    503,
+                    'Administrator authentication is unavailable.'
+                );
+            }
+            throw error;
+        }
+    }
+
+    async function authenticateAdminRequest(req) {
         const bearer = bearerCredential(req);
         const cookieCredential = adminCookieRequest(req);
 
@@ -214,6 +247,7 @@ function createHostAuth(options = {}) {
         if (!timingSafeEqualText(claims.subject, adminUsername)) {
             throw new HostAuthError('ADMIN_CREDENTIAL_INVALID', 403, 'Administrator authorization is invalid.');
         }
+        await assertAdminSessionActive(claims);
         return Object.freeze({
             kind: SESSION_KINDS.ADMIN,
             username: claims.subject,
@@ -242,9 +276,9 @@ function createHostAuth(options = {}) {
         }
     }
 
-    function requireAdmin(req, res, next) {
+    async function requireAdmin(req, res, next) {
         try {
-            const principal = authenticateAdminRequest(req);
+            const principal = await authenticateAdminRequest(req);
             req.principal = principal;
             req.admin = principal;
             next();
@@ -316,6 +350,39 @@ function createHostAuth(options = {}) {
         appendSetCookie(res, serializeExpiredCookie(DEFAULT_COOKIE_NAMES.admin, expiredCookieOptions));
     }
 
+    async function revokeAdminSessionRequest(req) {
+        let credential;
+        try {
+            credential = adminCookieRequest(req);
+        } catch {
+            return false;
+        }
+        if (!credential) return false;
+
+        let claims;
+        try {
+            claims = verifySignedCredential(credential, SESSION_KINDS.ADMIN);
+            if (!timingSafeEqualText(claims.subject, adminUsername)) return false;
+        } catch (error) {
+            if (error instanceof HostAuthError && error.httpStatus >= 500) throw error;
+            return false;
+        }
+
+        try {
+            await revokeAdminSession(AdminSessionRevocation, claims);
+            return true;
+        } catch (error) {
+            if (error instanceof AdminSessionRevocationError) {
+                throw new HostAuthError(
+                    error.code,
+                    503,
+                    'Administrator authentication is unavailable.'
+                );
+            }
+            throw error;
+        }
+    }
+
     async function authenticateSocket(socket) {
         const headers = socket?.handshake?.headers || {};
         const request = { headers: { ...headers } };
@@ -331,6 +398,7 @@ function createHostAuth(options = {}) {
         if (admin && !timingSafeEqualText(admin.subject, adminUsername)) {
             throw new HostAuthError('ADMIN_CREDENTIAL_INVALID', 403, 'Administrator authorization is invalid.');
         }
+        if (admin) await assertAdminSessionActive(admin);
 
         let userCredential = null;
         if (auth.sessionToken) {
@@ -400,10 +468,20 @@ function createHostAuth(options = {}) {
         const identity = socket?.authIdentity;
         if (!identity) return null;
         const nowSec = Math.floor(Number(clock()) / 1000);
-        const adminValid = identity.isAdmin
+        let adminValid = identity.isAdmin
             && Number.isInteger(identity.adminExpiresAt)
             && identity.adminExpiresAt > nowSec
             && timingSafeEqualText(String(identity.adminUsername || ''), adminUsername);
+        if (adminValid) {
+            try {
+                adminValid = !(await isAdminSessionRevoked(
+                    AdminSessionRevocation,
+                    identity.adminSessionId
+                ));
+            } catch {
+                adminValid = false;
+            }
+        }
         let user = null;
         const userSessionValid = identity.userAuthSource === 'legacy'
             ? allowLegacyUserHeader
@@ -431,6 +509,7 @@ function createHostAuth(options = {}) {
         issueAdminSession,
         clearUserSession,
         clearAdminSession,
+        revokeAdminSession: revokeAdminSessionRequest,
         authenticateSocket,
         socketMiddleware,
         getSocketIdentity

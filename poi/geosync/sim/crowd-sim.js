@@ -362,7 +362,16 @@ async function main() {
     const reportDir = ARGS.report || `out/sim-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}`;
 
     // 健康检查
-    const h = await http.get('/api/geosync/health').catch(() => null);
+    const healthAdminToken = String(process.env.ADMIN_TOKEN || '').trim();
+    if (!healthAdminToken) {
+        console.error('[SIM] ADMIN_TOKEN is required for the protected health preflight');
+        process.exit(1);
+    }
+    const h = await http.get('/api/admin/geosync/health', {
+        headers: {
+            authorization: `Bearer ${healthAdminToken}`
+        }
+    }).catch(() => null);
     if (!h || h.status !== 200) {
         console.error('[SIM] 服务端不可达:', ARGS.base);
         process.exit(1);

@@ -13,6 +13,10 @@ const {
     extractRequestToken,
     timingSafeEqualText
 } = require('./sessionAuth');
+const {
+    AdminSessionRevocationError,
+    isAdminSessionRevoked
+} = require('../services/adminSessionRevocation');
 
 const LEGACY_ADMIN_SESSION_MARKER = 'cookie-session';
 
@@ -91,7 +95,7 @@ function configuredOpaqueToken(value, name) {
     }
 }
 
-function requireAdmin(req, res, next) {
+async function requireAdmin(req, res, next) {
     let bearerCredential;
     let cookieCredential;
     try {
@@ -116,14 +120,21 @@ function requireAdmin(req, res, next) {
         if (!timingSafeEqualText(session.subject, CONFIG.adminUsername)) {
             throw new Error('invalid administrator subject');
         }
+        const { AdminSessionRevocation } = getModels();
+        if (await isAdminSessionRevoked(AdminSessionRevocation, session.sessionId)) {
+            return fail(res, 403, 9001, 'Administrator permission is invalid');
+        }
         req.adminAuth = Object.freeze({ source: cookieCredential.source, kind: 'signed-session', session });
         return next();
-    } catch {
+    } catch (error) {
+        if (error instanceof AdminSessionRevocationError) {
+            return fail(res, 503, 9001, 'Administrator authentication is unavailable');
+        }
         return fail(res, 403, 9001, 'Administrator permission is invalid');
     }
 }
 
-function screenOrAdmin(req, res, next) {
+async function screenOrAdmin(req, res, next) {
     if (req.query && Object.prototype.hasOwnProperty.call(req.query, 'screenToken')) {
         return fail(res, 403, 9001, 'Screen credentials must not be passed in the query string');
     }

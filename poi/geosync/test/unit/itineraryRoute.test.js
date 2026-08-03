@@ -59,6 +59,8 @@ const antiHerding = require('../../services/antiHerding');
 const engine = require('../../services/geosyncEngine');
 const forecast = require('../../services/forecastService');
 const timeline = require('../../services/itineraryTimeline');
+const guideService = require('../../services/guideService');
+let nlEditOps;
 
 const originals = {
     claimTokens: antiHerding.claimTokens,
@@ -67,6 +69,7 @@ const originals = {
     finalizeClaimedTokens: antiHerding.finalizeClaimedTokens,
     releaseTokens: antiHerding.releaseTokens,
     applyProposal: engine.applyProposal,
+    parseNlEdit: guideService.parseNlEdit,
     rebuildArrivalIndex: forecast.rebuildArrivalIndex,
     rebuildTimeline: timeline.rebuildTimeline,
     loadClosedBarrierSnapshot: barrierReroute.loadClosedBarrierSnapshot,
@@ -85,6 +88,7 @@ antiHerding.rollbackClaimedTokens = async () => calls.push('rollback');
 antiHerding.finalizeClaimedTokens = async () => calls.push('finalize');
 antiHerding.releaseTokens = async () => calls.push('release');
 engine.applyProposal = itinerary => itinerary.stops.map(stop => ({ ...stop }));
+guideService.parseNlEdit = async () => nlEditOps;
 forecast.rebuildArrivalIndex = async () => calls.push('arrival-index');
 timeline.rebuildTimeline = (...args) => rebuildImpl(...args);
 barrierReroute.loadClosedBarrierSnapshot = (...args) => barrierSnapshotImpl(...args);
@@ -97,6 +101,8 @@ const router = require('../../routes/itinerary');
 const decisionLayer = router.stack.find(layer =>
     layer.route?.path === '/:id/proposal/:proposalId/:decision(accept|reject)');
 const decisionHandler = decisionLayer.route.stack[0].handle;
+const nlEditLayer = router.stack.find(layer => layer.route?.path === '/:id/nl-edit');
+const nlEditHandler = nlEditLayer.route.stack[0].handle;
 
 test.after(() => {
     modelModule.getModels = originalGetModels;
@@ -106,6 +112,7 @@ test.after(() => {
     antiHerding.finalizeClaimedTokens = originals.finalizeClaimedTokens;
     antiHerding.releaseTokens = originals.releaseTokens;
     engine.applyProposal = originals.applyProposal;
+    guideService.parseNlEdit = originals.parseNlEdit;
     forecast.rebuildArrivalIndex = originals.rebuildArrivalIndex;
     timeline.rebuildTimeline = originals.rebuildTimeline;
     barrierReroute.loadClosedBarrierSnapshot = originals.loadClosedBarrierSnapshot;
@@ -118,6 +125,7 @@ function reset() {
     updateResult = undefined;
     rebuildArgs = null;
     decisionEvents = [];
+    nlEditOps = [{ op: 'shift_time', minutes: 30 }];
     barrierSnapshotImpl = async () => ({
         barriers: [],
         edgeIds: [],
@@ -199,6 +207,19 @@ async function decide(decision = 'accept') {
     };
     const res = response();
     await decisionHandler(req, res, () => {});
+    return res;
+}
+
+async function previewNlEdit(text = '晚半小时出发') {
+    const req = {
+        method: 'POST',
+        originalUrl: '/api/itinerary/itinerary-1/nl-edit',
+        openId: 'user-1',
+        params: { id: 'itinerary-1' },
+        body: { text, version: currentItinerary.version }
+    };
+    const res = response();
+    await nlEditHandler(req, res, () => {});
     return res;
 }
 
@@ -377,4 +398,26 @@ test('proposal rejection uses active-state CAS and emits committed lifecycle met
         at: decisionEvents[0].at,
         eventId: 'edge-event-1'
     }]);
+});
+
+test('natural-language edits return an explicit preview without occupying pendingProposal', async () => {
+    reset();
+    currentItinerary.pendingProposal = null;
+    const existingProposal = currentItinerary.pendingProposal;
+    nlEditOps = [
+        { op: 'shift_time', minutes: 30 },
+        { op: 'set_preference', pace: 'relaxed' }
+    ];
+
+    const res = await previewNlEdit('晚半小时出发，走轻松一点');
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.data.version, 4);
+    assert.equal(res.body.data.previewOnly, true);
+    assert.equal(res.body.data.applied, false);
+    assert.equal(res.body.data.pendingProposal, null);
+    assert.deepStrictEqual(res.body.data.preview.parsedOps, nlEditOps);
+    assert.equal(res.body.data.preview.type, 'nlEdit');
+    assert.equal(updateCalls.length, 0);
+    assert.strictEqual(currentItinerary.pendingProposal, existingProposal);
 });

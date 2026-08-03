@@ -110,7 +110,8 @@ function makeHarness(options = {}) {
         idFactory: options.idFactory || (({ event, itinerary }) =>
             `proposal-${event.eventId}-${String(itinerary._id)}`),
         proposalTtlMs: 10 * 60000,
-        eventDedupeLimit: 32
+        eventDedupeLimit: 32,
+        itineraryConcurrency: options.itineraryConcurrency
     });
     return { coordinator, state, routeBetween };
 }
@@ -706,6 +707,55 @@ test('duplicate event IDs share the first execution and produce no repeated side
     assert.equal(harness.state.walkEdgeFilters.length, 1);
     assert.equal(harness.state.itineraryFilters.length, 1);
     assert.equal(harness.state.impacts.length, 1);
+});
+
+test('barrier reroutes bound itinerary concurrency while preserving result order', async () => {
+    const itineraries = Array.from({ length: 7 }, (_, index) => ({
+        _id: `it-window-${index}`,
+        version: index + 1,
+        state: 'active',
+        pendingProposal: null,
+        stops: [mutableStop(`window-${index}`, 'edge-closed')]
+    }));
+    let active = 0;
+    let maxActive = 0;
+    const harness = makeHarness({
+        edges: [edge('edge-closed', 'walk_edges_test', 7)],
+        itineraries,
+        itineraryConcurrency: 2,
+        rebuildTimeline: async ({ itinerary }) => {
+            active++;
+            maxActive = Math.max(maxActive, active);
+            await new Promise(resolve => setImmediate(resolve));
+            active--;
+            return [mutableStop(`safe-${itinerary._id}`, 'edge-open')];
+        }
+    });
+
+    const result = await harness.coordinator.processGraphEvent({
+        eventId: 'event-concurrency-window',
+        scenicId: 'scenic-test',
+        edgeId: 'edge-closed',
+        operation: 'close'
+    });
+
+    assert.equal(maxActive, 2);
+    assert.equal(result.proposedCount, itineraries.length);
+    assert.deepEqual(
+        result.outcomes.map(outcome => outcome.itineraryId),
+        itineraries.map(itinerary => itinerary._id)
+    );
+});
+
+test('barrier reroute concurrency must be a positive integer', () => {
+    assert.throws(
+        () => makeHarness({ itineraryConcurrency: 0 }),
+        /itineraryConcurrency must be a positive integer/
+    );
+    assert.throws(
+        () => makeHarness({ itineraryConcurrency: 1.5 }),
+        /itineraryConcurrency must be a positive integer/
+    );
 });
 
 test('enqueueGraphEvent serializes events for the same scenic area', async () => {

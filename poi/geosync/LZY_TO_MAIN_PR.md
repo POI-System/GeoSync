@@ -35,6 +35,9 @@ GeoSync is attached through dependency injection before static files and before
 - Keep exact-coordinate cache aliases isolated even when requests snap to the
   same node pair, and bound the route cache with TTL plus deterministic LRU
   eviction so one request cannot receive another request's connector geometry.
+- Disable iServer redirects, cap Axios responses at 10 MiB by default, and reject
+  route/feature geometries above 100,000 input positions before expensive
+  normalization scoring.
 - Implement the documented `8201` through `8206` route error contracts.
 - Route itinerary planning and proposal acceptance through the injected Gateway
   adapter while preserving route, ETA, timetable, version, and legacy fields.
@@ -44,6 +47,14 @@ GeoSync is attached through dependency injection before static files and before
 - Add full closed-edge snapshots, barrier fingerprints, per-scenic serialization,
   idempotent graph-event handling, reroute proposals, and operations impact/status
   contracts.
+- Bound one graph event to six concurrent itinerary rebuilds by default while
+  preserving result order and per-scenic event serialization.
+- Make natural-language itinerary edits explicit preview-only responses until the
+  complete edit vocabulary can participate in versioned route/preference commits;
+  previews no longer occupy `pendingProposal` or block executable proposals.
+- Track capacity-token ownership through candidate selection and persistence so
+  assembly exceptions, later failures, threshold rejection, and CAS loss release
+  tokens without relying on periodic reconciliation.
 - Add authenticated GIS status and route-test administration endpoints.
 - Persist closure metadata, route provenance, barrier proposal metadata, and
   proposal lifecycle records.
@@ -63,6 +74,13 @@ GeoSync is attached through dependency injection before static files and before
   removing an otherwise database-ready host POI process from traffic.
 - Retry failed manifest loads automatically after a bounded failure TTL and
   accept common boolean environment forms with warnings for unknown values.
+- Start the planner's three-second optimization budget only after its MongoDB
+  candidate queries are ready, avoiding false `1202` results caused by slow data
+  preparation.
+- Limit global JSON and URL-encoded request bodies to 1 MiB, retain route-local
+  10 MiB multipart upload limits, reduce the Nginx ceiling to 12 MiB, and install
+  an idempotent SIGTERM/SIGINT drain before `server.listen(...)` with a 10-second
+  default application deadline and a 12-second PM2 kill timeout.
 - Remove the scheduled empty `trailMining` placeholder and report actual primary,
   non-primary, or explicitly disabled job state.
 - Restrict itinerary proposal/progress Socket payloads to documented public
@@ -87,6 +105,8 @@ Updated or added HTTP surfaces include:
 - `GET /api/geosync/health`
 - `GET /api/geosync/health/live`
 - `GET /api/geosync/health/ready`
+- `GET /api/admin/geosync/health`
+- `GET /api/screen/geosync/health`
 - `POST /api/itinerary/plan`
 - `POST /api/admin/geosync/graph/edge/:edgeId/close`
 - `POST /api/admin/geosync/graph/edge/:edgeId/open`
@@ -120,6 +140,9 @@ Allowed proposal lifecycle statuses are `shown`, `accepted`, `rejected`,
 - `MONGO_STARTUP_FAIL_FAST` defaults to enabled only in production, and
   `SUPERMAP_MANIFEST_RETRY_MS` controls automatic recovery from transient
   manifest-load failures.
+- `BARRIER_REROUTE_CONCURRENCY`, `SUPERMAP_MAX_RESPONSE_BYTES`, and
+  `SHUTDOWN_TIMEOUT_MS` expose bounded operational limits with conservative
+  defaults of 6, 10485760 bytes, and 10000 milliseconds respectively.
 - `poi/config/supermap-manifest.example.json` is a placeholder contract only.
 
 The WalkEdge migration mapping format is an explicit JSON array of:
@@ -151,9 +174,11 @@ Evidence captured on August 3, 2026 after `npm ci`:
 - `npm ci`: passed from the committed lock file.
 - `check:syntax`: passed.
 - Legacy root GeoSync suite before removal: 67 passed, 0 failed.
-- GeoSync unit suite: 339 passed, 0 failed.
+- GeoSync unit suite: 364 passed, 0 failed.
 - Integration suite: 14 passed, 0 failed.
-- Combined unit and integration suite: 353 passed, 0 failed.
+- Combined unit and integration suite: 378 passed, 0 failed.
+- `git diff --check`: passed with only the existing Windows LF/CRLF conversion
+  notices and no whitespace errors.
 - Production dependency audit: failed with 14 package findings, including 4
   high, 10 moderate, 0 low, and 0 critical.
 
@@ -166,6 +191,13 @@ Evidence captured on August 3, 2026 after `npm ci`:
   available only when explicitly enabled outside production.
 - User and administrator sessions are signed, expiring, and transported through
   HttpOnly SameSite cookies or explicitly supported authorization headers.
+- Administrator logout persists a SHA-256 digest of the signed session `jti` in
+  shared MongoDB with TTL cleanup. Signed administrator HTTP and Socket access
+  fails closed when revocation state cannot be verified; the independent opaque
+  `ADMIN_TOKEN` recovery credential does not depend on that collection.
+- Public `GET /api/geosync/health` exposes only `{state}`. Detailed MongoDB,
+  startup, GIS, manifest, and cache diagnostics require administrator or screen
+  credentials on the dedicated protected endpoints.
 - Administrator GIS endpoints reject missing, malformed, query/body, or invalid
   credentials and accept only a signed administrator session or configured
   Bearer token.
@@ -217,8 +249,8 @@ Evidence captured on August 3, 2026 after `npm ci`:
 - Missing or incompatible manifest: main service starts, GIS is `offline`.
 - Partial GIS service availability: health remains HTTP 200 with GIS `degraded`
   when MongoDB and required startup components are ready.
-- Pending/failed graph or POI-index initialization: health is HTTP 503 with
-  component-level status; actual scheduler state is reported separately.
+- Pending/failed graph or POI-index initialization: public health is HTTP 503;
+  protected detailed health contains component-level and scheduler status.
 - Timeout with route cache: `source=cache`, `degraded=true`.
 - Trusted normal/shade local route: `source=local-fallback`, `degraded=true`.
 - Unverified accessible local route: explicit `8204` failure.
@@ -265,6 +297,15 @@ health interpretation, error handling, and application rollback.
   return to reviewer mode because entitlement remains allowlist-controlled.
 - No real iServer integration has been executed. Unit and integration coverage
   uses Mock/internal contracts only.
+- Automated shutdown coverage exercises SIGTERM/SIGINT, repeated-signal
+  idempotence, phase failures, and the total timeout through injected process and
+  timer boundaries. Windows `child.kill()` cannot execute the production POSIX
+  signal path, so a real Linux/PM2 restart with in-flight HTTP and Socket work is
+  still a deployment gate.
+- Administrator revocation schema, hashing, fail-closed reads/writes, restart
+  persistence semantics, and TTL index metadata are covered locally. Staging
+  must still verify TTL cleanup and cross-instance logout against the deployed
+  MongoDB topology before enabling more than one application instance.
 - Real validation still requires the actual base, published service paths,
   validated manifest, account permissions, representative raw responses, and an
   authoritative WalkEdge mapping with matching `dataVersion`.
@@ -307,7 +348,8 @@ health interpretation, error handling, and application rollback.
 - Verify close/open handlers accept only real state transitions and invalidate
   cache once.
 - Verify reroute processing uses the full current barrier set and avoids stale
-  proposals through version/proposal CAS filters.
+  proposals through version/proposal CAS filters while respecting the configured
+  itinerary concurrency window.
 - Verify accessible fallback requires explicit verification.
 - Verify client configuration and logs contain no private values.
 - Verify signed session expiry, legacy-header production rejection, server-side
@@ -317,6 +359,10 @@ health interpretation, error handling, and application rollback.
 - Verify host POI schema/index compatibility, strict opening-hour validation, and
   concurrent-change-safe POI migration behavior.
 - Verify health distinguishes core readiness from GIS degradation and reports
-  actual scheduler state without an empty scheduled job.
+  only public state unless administrator/screen authorization grants detailed
+  core, GIS, and scheduler diagnostics.
+- Verify JSON bodies above 1 MiB receive 413, iServer redirects are disabled,
+  response and geometry budgets are enforced, and PM2 permits the application
+  shutdown deadline to complete.
 - Verify proposal/progress Socket payloads contain only documented public fields.
 - Verify the final combined regression is green after all concurrent edits stop.
