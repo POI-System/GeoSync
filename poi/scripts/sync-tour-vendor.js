@@ -13,7 +13,11 @@ const files = [
         'node_modules/@supermapgis/iclient-maplibregl/dist/iclient-maplibregl.min.js',
         'supermap-iclient/iclient-maplibregl.min.js'
     ],
-    ['node_modules/socket.io-client/dist/socket.io.min.js', 'socket.io/socket.io.min.js']
+    ['node_modules/socket.io-client/dist/socket.io.min.js', 'socket.io/socket.io.min.js'],
+    [
+        'node_modules/@supermapgis/iclient-common/components/css/fonts/components-icons.woff',
+        'fonts/supermap-components-icons.woff'
+    ]
 ];
 
 for (const [sourceRelative, targetRelative] of files) {
