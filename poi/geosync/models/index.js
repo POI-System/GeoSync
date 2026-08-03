@@ -4,6 +4,7 @@
 
 const { Schema } = require('mongoose');
 const { getAdminSessionRevocationModel } = require('../services/adminSessionRevocation');
+const { getUserSessionRevocationModel } = require('../services/userSessionRevocation');
 const {
     WALK_EDGE_LIMITS,
     normalizeDistanceM,
@@ -79,6 +80,8 @@ function registerModels(mongoose, injectedModels = {}) {
         new Schema({}, { strict: false, collection: 'users' }));
     const AdminSessionRevocation = injectedModels.AdminSessionRevocation
         || getAdminSessionRevocationModel(mongoose);
+    const UserSessionRevocation = injectedModels.UserSessionRevocation
+        || getUserSessionRevocationModel(mongoose);
 
     // ---- photospots ----
     const photoSpotSchema = new Schema({
@@ -498,7 +501,7 @@ function registerModels(mongoose, injectedModels = {}) {
     trailFragmentSchema.index({ expireAt: 1 }, { expireAfterSeconds: 0 });
 
     M = {
-        ExternalPoi, ExternalUser, AdminSessionRevocation,
+        ExternalPoi, ExternalUser, AdminSessionRevocation, UserSessionRevocation,
         PhotoSpot: mongoose.model('PhotoSpot', photoSpotSchema),
         StaySample: mongoose.model('StaySample', staySampleSchema),
         CrowdSnapshot: mongoose.model('CrowdSnapshot', crowdSnapshotSchema),

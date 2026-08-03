@@ -4,7 +4,11 @@ require('dotenv').config();
 
 const mongoose = require('mongoose');
 const { registerModels } = require('../models');
-const { runPoiGeoMigration } = require('../services/poiGeoMigration');
+const {
+    runPoiGeoMigration,
+    migrationBatchSize,
+    migrationReportLimit
+} = require('../services/poiGeoMigration');
 
 const EXIT = {
     OK: 0,
@@ -84,6 +88,24 @@ async function runCli({
             );
         }
         const scenicId = String(env.SCENIC_ID || 'default').trim() || 'default';
+        let batchSize;
+        let reportLimit;
+        try {
+            batchSize = migrationBatchSize(env.POI_MIGRATION_BATCH_SIZE || undefined);
+        } catch {
+            throw new CliInputError(
+                'POI_MIGRATION_BATCH_SIZE_INVALID',
+                'POI_MIGRATION_BATCH_SIZE must be an integer between 1 and 5000'
+            );
+        }
+        try {
+            reportLimit = migrationReportLimit(env.POI_MIGRATION_REPORT_LIMIT || undefined);
+        } catch {
+            throw new CliInputError(
+                'POI_MIGRATION_REPORT_LIMIT_INVALID',
+                'POI_MIGRATION_REPORT_LIMIT must be an integer between 0 and 10000'
+            );
+        }
 
         if (typeof mongooseInstance.set === 'function') {
             mongooseInstance.set('autoIndex', false);
@@ -99,12 +121,15 @@ async function runCli({
         const result = await runPoiGeoMigration({
             POI: ExternalPoi,
             apply: args.apply,
-            scenicId
+            scenicId,
+            batchSize,
+            reportLimit
         });
         writeJson(stdout, {
             operation: 'migrate-poi-geo',
             mode: result.mode,
             ...result.summary,
+            report: result.report,
             errors: safeErrors(result.errors)
         });
         return result.summary.failed > 0 ? EXIT.PARTIAL_FAILURE : EXIT.OK;

@@ -2,9 +2,21 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { DEFAULT_COOKIE_NAMES } = require('../../lib/sessionAuth');
-const { LEGACY_ADMIN_SESSION_MARKER, createHostAuth } = require('../../services/hostAuth');
+const http = require('node:http');
+const express = require('express');
+const {
+    SESSION_KINDS,
+    DEFAULT_COOKIE_NAMES,
+    DEFAULT_HEADER_NAMES,
+    verifySessionToken
+} = require('../../lib/sessionAuth');
+const {
+    LEGACY_ADMIN_SESSION_MARKER,
+    createGlobalLogoutHandler,
+    createHostAuth
+} = require('../../services/hostAuth');
 const { hashAdminSessionId } = require('../../services/adminSessionRevocation');
+const { hashUserSessionId } = require('../../services/userSessionRevocation');
 
 const SECRET = 'host-auth-secret-V9x7sQ2pL4mN8cR6tY1uI5oP3aS0';
 const ADMIN_TOKEN = 'host-admin-token-R8m3Q7v2N9x5K4p6D1s0F7h2J8c5';
@@ -67,6 +79,7 @@ function makeAuth(overrides = {}) {
             { openId: 'disabled-a', role: 'collector', disabled: true }
         ]),
         AdminSessionRevocation: overrides.AdminSessionRevocation || fakeRevocations(),
+        UserSessionRevocation: overrides.UserSessionRevocation || fakeRevocations(),
         sessionSecret: overrides.sessionSecret ?? SECRET,
         adminToken: overrides.adminToken ?? ADMIN_TOKEN,
         adminUsername: 'operator',
@@ -75,6 +88,47 @@ function makeAuth(overrides = {}) {
         clock: overrides.clock || (() => NOW),
         production: overrides.production,
         allowLegacyUserHeader: overrides.allowLegacyUserHeader
+    });
+}
+
+async function listen(server) {
+    await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', resolve);
+    });
+}
+
+async function close(server) {
+    await new Promise((resolve, reject) => {
+        server.close(error => error ? reject(error) : resolve());
+    });
+}
+
+function request(server, { method = 'GET', path = '/', headers = {} } = {}) {
+    const address = server.address();
+    return new Promise((resolve, reject) => {
+        const req = http.request({
+            host: '127.0.0.1',
+            port: address.port,
+            method,
+            path,
+            headers
+        }, res => {
+            let body = '';
+            res.setEncoding('utf8');
+            res.on('data', chunk => { body += chunk; });
+            res.on('end', () => {
+                let json = null;
+                try {
+                    json = body ? JSON.parse(body) : null;
+                } catch {
+                    json = null;
+                }
+                resolve({ statusCode: res.statusCode, headers: res.headers, body, json });
+            });
+        });
+        req.once('error', reject);
+        req.end();
     });
 }
 
@@ -91,6 +145,18 @@ test('user sessions derive the principal server-side and reject identity spoofin
         auth.authenticateUserRequest({ headers: { cookie, 'x-open-id': 'reviewer-a' } }),
         error => error.code === 'USER_IDENTITY_MISMATCH' && error.httpStatus === 403
     );
+    for (const request of [{
+        headers: { cookie }, body: { openId: 'reviewer-a' }
+    }, {
+        headers: { cookie }, query: { openid: 'reviewer-a' }
+    }, {
+        headers: { cookie }, body: { userOpenId: 'reviewer-a' }
+    }]) {
+        await assert.rejects(
+            auth.authenticateUserRequest(request),
+            error => error.code === 'USER_IDENTITY_MISMATCH' && error.httpStatus === 403
+        );
+    }
     await assert.rejects(
         auth.authenticateUserRequest({ headers: { 'x-open-id': 'user-a' } }),
         error => error.code === 'USER_AUTH_REQUIRED'
@@ -112,6 +178,280 @@ test('legacy X-Open-Id requires an explicit non-production compatibility mode', 
         production.authenticateUserRequest({ headers: { 'x-open-id': 'user-a' } }),
         error => error.code === 'SESSION_AUTH_UNAVAILABLE' && error.httpStatus === 503
     );
+});
+
+test('user logout persists a hashed jti and invalidates HTTP and Socket authorization', async () => {
+    const revocations = fakeRevocations();
+    const auth = makeAuth({ UserSessionRevocation: revocations });
+    const res = response();
+    const token = auth.issueUserSession(res, { openId: 'user-a', role: 'collector' });
+    const cookie = cookieValue(res.getHeader('Set-Cookie')[0]);
+    const principal = await auth.authenticateUserRequest({ headers: { cookie } });
+    const socketIdentity = await auth.authenticateSocket({
+        handshake: { headers: { cookie }, auth: {}, query: { openId: 'user-a' } }
+    });
+
+    assert.equal(await auth.revokeUserSession({ headers: { cookie } }), true);
+    assert.equal(revocations.writes.length, 1);
+    assert.equal(revocations.writes[0].filter._id, hashUserSessionId(principal.sessionId));
+    assert.equal(JSON.stringify(revocations.writes).includes(principal.sessionId), false);
+    assert.equal(JSON.stringify(revocations.writes).includes(token), false);
+    assert.ok(revocations.writes[0].update.$setOnInsert.expiresAt instanceof Date);
+
+    await assert.rejects(
+        auth.authenticateUserRequest({ headers: { cookie } }),
+        error => error.code === 'USER_SESSION_REVOKED' && error.httpStatus === 401
+    );
+    await assert.rejects(
+        auth.authenticateSocket({
+            handshake: { headers: { cookie }, auth: {}, query: { openId: 'user-a' } }
+        }),
+        error => error.code === 'USER_SESSION_REVOKED'
+    );
+    assert.equal(await auth.getSocketIdentity({ authIdentity: socketIdentity }), null);
+
+    const restartedAuth = makeAuth({ UserSessionRevocation: fakeRevocations({
+        records: revocations.records
+    }) });
+    await assert.rejects(
+        restartedAuth.authenticateUserRequest({ headers: { cookie } }),
+        error => error.code === 'USER_SESSION_REVOKED'
+    );
+});
+
+test('user signed sessions fail closed when revocation storage is unavailable', async () => {
+    const readFailure = makeAuth({
+        UserSessionRevocation: fakeRevocations({ readError: new Error('database detail') })
+    });
+    const res = response();
+    readFailure.issueUserSession(res, { openId: 'user-a', role: 'collector' });
+    const cookie = cookieValue(res.getHeader('Set-Cookie')[0]);
+    await assert.rejects(
+        readFailure.authenticateUserRequest({ headers: { cookie } }),
+        error => error.code === 'USER_SESSION_REVOCATION_UNAVAILABLE' && error.httpStatus === 503
+    );
+
+    const writeFailure = makeAuth({
+        UserSessionRevocation: fakeRevocations({ writeError: new Error('database detail') })
+    });
+    const writeRes = response();
+    writeFailure.issueUserSession(writeRes, { openId: 'user-a', role: 'collector' });
+    await assert.rejects(
+        writeFailure.revokeUserSession({
+            headers: { cookie: cookieValue(writeRes.getHeader('Set-Cookie')[0]) }
+        }),
+        error => error.code === 'USER_SESSION_REVOCATION_UNAVAILABLE' && error.httpStatus === 503
+    );
+});
+
+test('user logout revokes distinct cookie, header, and Bearer sessions', async () => {
+    const revocations = fakeRevocations();
+    const auth = makeAuth({ UserSessionRevocation: revocations });
+    const cookieRes = response();
+    const headerRes = response();
+    const bearerRes = response();
+    const cookieToken = auth.issueUserSession(cookieRes, { openId: 'user-a', role: 'collector' });
+    const headerToken = auth.issueUserSession(headerRes, { openId: 'user-a', role: 'collector' });
+    const bearerToken = auth.issueUserSession(bearerRes, { openId: 'user-a', role: 'collector' });
+    const cookie = cookieValue(cookieRes.getHeader('Set-Cookie')[0]);
+    const claims = [cookieToken, headerToken, bearerToken].map(token => verifySessionToken(token, {
+        secret: SECRET,
+        expectedKind: SESSION_KINDS.USER,
+        now: NOW
+    }));
+
+    assert.equal(await auth.revokeUserSession({
+        headers: {
+            cookie,
+            [DEFAULT_HEADER_NAMES.user]: headerToken
+        }
+    }), true);
+    assert.deepEqual(new Set(revocations.writes.map(write => write.filter._id)), new Set([
+        hashUserSessionId(claims[0].sessionId),
+        hashUserSessionId(claims[1].sessionId)
+    ]));
+
+    assert.equal(await auth.revokeUserSession({
+        headers: { authorization: `Bearer ${bearerToken}` }
+    }), true);
+    assert.equal(revocations.records.has(hashUserSessionId(claims[2].sessionId)), true);
+
+    await assert.rejects(
+        auth.authenticateUserRequest({ headers: { cookie } }),
+        error => error.code === 'USER_SESSION_REVOKED'
+    );
+    await assert.rejects(
+        auth.authenticateUserRequest({
+            headers: { [DEFAULT_HEADER_NAMES.user]: headerToken }
+        }),
+        error => error.code === 'USER_SESSION_REVOKED'
+    );
+});
+
+test('POST /api/auth/logout revokes and rejects replayed user and admin sessions', async () => {
+    const userRevocations = fakeRevocations();
+    const adminRevocations = fakeRevocations();
+    const auth = makeAuth({
+        UserSessionRevocation: userRevocations,
+        AdminSessionRevocation: adminRevocations
+    });
+    const cookieRes = response();
+    const headerRes = response();
+    const adminRes = response();
+    const cookieToken = auth.issueUserSession(cookieRes, { openId: 'user-a', role: 'collector' });
+    const headerToken = auth.issueUserSession(headerRes, { openId: 'user-a', role: 'collector' });
+    const adminToken = auth.issueAdminSession(adminRes);
+    const userCookie = cookieValue(cookieRes.getHeader('Set-Cookie')[0]);
+    const adminCookie = cookieValue(adminRes.getHeader('Set-Cookie')[0]);
+    const claims = [cookieToken, headerToken].map(token => verifySessionToken(token, {
+        secret: SECRET,
+        expectedKind: SESSION_KINDS.USER,
+        now: NOW
+    }));
+    const adminClaims = verifySessionToken(adminToken, {
+        secret: SECRET,
+        expectedKind: SESSION_KINDS.ADMIN,
+        now: NOW
+    });
+
+    const app = express();
+    app.post('/api/auth/logout', createGlobalLogoutHandler(auth));
+    app.get('/protected', auth.requireUser, (_req, res) => res.json({ success: true }));
+    app.get('/admin-protected', auth.requireAdmin, (_req, res) => res.json({ success: true }));
+    const server = http.createServer(app);
+    await listen(server);
+    try {
+        const logout = await request(server, {
+            method: 'POST',
+            path: '/api/auth/logout',
+            headers: {
+                cookie: `${userCookie}; ${adminCookie}`,
+                [DEFAULT_HEADER_NAMES.user]: headerToken
+            }
+        });
+        assert.equal(logout.statusCode, 200);
+        assert.deepEqual(logout.json, {
+            success: true,
+            userSessionRevoked: true,
+            adminSessionRevoked: true
+        });
+        assert.equal(logout.headers['cache-control'], 'no-store');
+        assert.ok(logout.headers['set-cookie']?.some(value =>
+            value.startsWith(`${DEFAULT_COOKIE_NAMES.user}=`) && value.includes('Max-Age=0')));
+        assert.ok(logout.headers['set-cookie']?.some(value =>
+            value.startsWith(`${DEFAULT_COOKIE_NAMES.admin}=`) && value.includes('Max-Age=0')));
+        assert.deepEqual(new Set(userRevocations.writes.map(write => write.filter._id)), new Set([
+            hashUserSessionId(claims[0].sessionId),
+            hashUserSessionId(claims[1].sessionId)
+        ]));
+        assert.equal(adminRevocations.writes[0].filter._id,
+            hashAdminSessionId(adminClaims.sessionId));
+
+        const cookieReplay = await request(server, {
+            path: '/protected',
+            headers: { cookie: userCookie }
+        });
+        assert.equal(cookieReplay.statusCode, 401);
+        const headerReplay = await request(server, {
+            path: '/protected',
+            headers: { [DEFAULT_HEADER_NAMES.user]: headerToken }
+        });
+        assert.equal(headerReplay.statusCode, 401);
+        const adminReplay = await request(server, {
+            path: '/admin-protected',
+            headers: { cookie: adminCookie }
+        });
+        assert.equal(adminReplay.statusCode, 403);
+    } finally {
+        await close(server);
+    }
+});
+
+test('POST /api/auth/logout clears only the credential class whose revocation completed', async () => {
+    const userRevocations = fakeRevocations({ writeError: new Error('private database detail') });
+    const adminRevocations = fakeRevocations();
+    const auth = makeAuth({
+        UserSessionRevocation: userRevocations,
+        AdminSessionRevocation: adminRevocations
+    });
+    const userRes = response();
+    const adminRes = response();
+    auth.issueUserSession(userRes, { openId: 'user-a', role: 'collector' });
+    auth.issueAdminSession(adminRes);
+    const userCookie = cookieValue(userRes.getHeader('Set-Cookie')[0]);
+    const adminCookie = cookieValue(adminRes.getHeader('Set-Cookie')[0]);
+
+    const app = express();
+    app.post('/api/auth/logout', createGlobalLogoutHandler(auth));
+    app.get('/protected', auth.requireUser, (_req, res) => res.json({ success: true }));
+    app.get('/admin-protected', auth.requireAdmin, (_req, res) => res.json({ success: true }));
+    const server = http.createServer(app);
+    await listen(server);
+    try {
+        const logout = await request(server, {
+            method: 'POST',
+            path: '/api/auth/logout',
+            headers: { cookie: `${userCookie}; ${adminCookie}` }
+        });
+        assert.equal(logout.statusCode, 503);
+        assert.equal(logout.json.userSessionCleared, false);
+        assert.equal(logout.json.adminSessionCleared, true);
+        assert.equal(logout.body.includes('private database detail'), false);
+        assert.equal(logout.headers['set-cookie']?.some(value =>
+            value.startsWith(`${DEFAULT_COOKIE_NAMES.user}=`)), false);
+        assert.equal(logout.headers['set-cookie']?.some(value =>
+            value.startsWith(`${DEFAULT_COOKIE_NAMES.admin}=`) && value.includes('Max-Age=0')), true);
+
+        const userStillValid = await request(server, {
+            path: '/protected',
+            headers: { cookie: userCookie }
+        });
+        assert.equal(userStillValid.statusCode, 200);
+        const adminRevoked = await request(server, {
+            path: '/admin-protected',
+            headers: { cookie: adminCookie }
+        });
+        assert.equal(adminRevoked.statusCode, 403);
+    } finally {
+        await close(server);
+    }
+});
+
+test('logout rejects malformed duplicate cookies without claiming revocation', async () => {
+    const userRevocations = fakeRevocations();
+    const adminRevocations = fakeRevocations();
+    const auth = makeAuth({
+        UserSessionRevocation: userRevocations,
+        AdminSessionRevocation: adminRevocations
+    });
+
+    const userRes = response();
+    auth.issueUserSession(userRes, { openId: 'user-a', role: 'collector' });
+    const userCookie = cookieValue(userRes.getHeader('Set-Cookie')[0]);
+    await assert.rejects(
+        auth.revokeUserSession({
+            headers: {
+                cookie: `${userCookie}; ${DEFAULT_COOKIE_NAMES.user}=%E0%A4%A`
+            }
+        }),
+        error => error.code === 'SESSION_INVALID' && error.httpStatus === 400
+    );
+    assert.equal(userRevocations.writes.length, 0);
+    assert.equal((await auth.authenticateUserRequest({ headers: { cookie: userCookie } })).openId, 'user-a');
+
+    const adminRes = response();
+    auth.issueAdminSession(adminRes);
+    const adminCookie = cookieValue(adminRes.getHeader('Set-Cookie')[0]);
+    await assert.rejects(
+        auth.revokeAdminSession({
+            headers: {
+                cookie: `${adminCookie}; ${DEFAULT_COOKIE_NAMES.admin}=%E0%A4%A`
+            }
+        }),
+        error => error.code === 'ADMIN_CREDENTIAL_INVALID' && error.httpStatus === 403
+    );
+    assert.equal(adminRevocations.writes.length, 0);
+    assert.equal((await auth.authenticateAdminRequest({ headers: { cookie: adminCookie } })).source, 'cookie');
 });
 
 test('admin auth accepts only a valid Bearer token or signed cookie, never the UI marker alone', async () => {
@@ -267,6 +607,24 @@ test('socket authentication rejects query-only identities and derives current DB
             query: { openId: 'user-a' }
         }
     }), error => error.code === 'USER_IDENTITY_MISMATCH');
+
+    await assert.rejects(auth.authenticateSocket({
+        handshake: {
+            headers: { cookie: cookieValue(res.getHeader('Set-Cookie')[0]) },
+            auth: {},
+            query: { openId: 'reviewer-a', openid: 'user-a' }
+        }
+    }), error => error.code === 'USER_IDENTITY_MISMATCH',
+    'conflicting query aliases must not be hidden by first-value selection');
+
+    await assert.rejects(auth.authenticateSocket({
+        handshake: {
+            headers: { cookie: cookieValue(res.getHeader('Set-Cookie')[0]) },
+            auth: { userOpenId: 'user-a' },
+            query: { openId: 'reviewer-a' }
+        }
+    }), error => error.code === 'USER_IDENTITY_MISMATCH',
+    'identity hints in the Socket auth payload must match the signed principal');
 });
 
 test('socket identities can carry both verified user and administrator authorization', async () => {

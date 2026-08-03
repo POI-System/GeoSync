@@ -5,6 +5,7 @@ const ALLOWED_MAPPING_FIELDS = new Set([
 ]);
 const SOURCE_REF_FIELDS = ['datasetName', 'smId', 'sourceId', 'dataVersion'];
 const MAX_STRING_LENGTH = 256;
+const MAX_MAPPING_ENTRIES = 10000;
 
 class SuperMapRefMappingError extends Error {
     constructor(errors, total = 0) {
@@ -16,7 +17,7 @@ class SuperMapRefMappingError extends Error {
             total,
             success: 0,
             skipped: 0,
-            failed: errors.length
+            failed: total
         };
     }
 }
@@ -29,6 +30,14 @@ function normalizeMappingArray(value) {
             'MAPPING_ARRAY_REQUIRED',
             'mapping must be a non-empty JSON array'
         )], Array.isArray(value) ? value.length : 0);
+    }
+    if (value.length > MAX_MAPPING_ENTRIES) {
+        throw new SuperMapRefMappingError([mappingError(
+            null,
+            '',
+            'MAPPING_LIMIT_EXCEEDED',
+            `mapping may contain at most ${MAX_MAPPING_ENTRIES} entries`
+        )], value.length);
     }
 
     const errors = [];
@@ -341,6 +350,7 @@ async function leanResult(query) {
 }
 
 module.exports = {
+    MAX_MAPPING_ENTRIES,
     SuperMapRefMappingError,
     normalizeMappingArray,
     planSuperMapRefMigration,

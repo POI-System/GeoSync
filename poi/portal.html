@@ -364,7 +364,10 @@
         adminEntry: '\u7ba1\u7406\u5458\u5165\u53e3',
         adminEntryHint: '\u767b\u5f55\u540e\u7ba1\u7406\u70b9\u4f4d\u548c\u91c7\u96c6\u72b6\u6001',
         adminLoggedIn: '\u5df2\u767b\u5f55\uff0c\u70b9\u51fb\u8fdb\u5165\u7ba1\u7406\u9762\u677f',
+        adminSessionUnavailable: '\u7ba1\u7406\u5458\u4f1a\u8bdd\u72b6\u6001\u6682\u65f6\u65e0\u6cd5\u9a8c\u8bc1\uff0c\u70b9\u51fb\u91cd\u8bd5',
         adminPanel: '\u7ba1\u7406\u5458\u9762\u677f',
+        adminLogout: '\u9000\u51fa\u7ba1\u7406\u5458',
+        adminLogoutFailed: '\u7ba1\u7406\u5458\u4f1a\u8bdd\u672a\u80fd\u5b89\u5168\u6ce8\u9500',
         adminLoadFailed: '\u7ba1\u7406\u5458\u6570\u636e\u52a0\u8f7d\u5931\u8d25',
         adminActionFailed: '\u7ba1\u7406\u5458\u64cd\u4f5c\u5931\u8d25',
         collectionSwitch: '\u91c7\u96c6\u5f00\u5173',
@@ -603,7 +606,10 @@
         adminEntry: 'Admin Entry',
         adminEntryHint: 'Manage POIs and collection state after login',
         adminLoggedIn: 'Logged in. Tap to manage',
+        adminSessionUnavailable: 'Administrator session status is unavailable. Tap to retry',
         adminPanel: 'Admin Panel',
+        adminLogout: 'Sign Out Admin',
+        adminLogoutFailed: 'Administrator session could not be revoked safely',
         adminLoadFailed: 'Failed to load admin data',
         adminActionFailed: 'Admin action failed',
         collectionSwitch: 'Collection Switch',
@@ -761,6 +767,7 @@
     function clearLegacyIdentityStorage() {
       localStorage.removeItem('user_openid');
       localStorage.removeItem('userOpenId');
+      sessionStorage.removeItem('adminToken');
       const url = new URL(window.location.href);
       let changed = false;
       for (const key of [...url.searchParams.keys()]) {
@@ -913,7 +920,11 @@
     async function fetchJson(url, options = {}) {
       const res = await fetch(url, options);
       const data = await res.json().catch(() => ({}));
-      if (!res.ok || data.success === false) throw new Error(data.message || `Request failed: ${res.status}`);
+      if (!res.ok || data.success === false) {
+        const error = new Error(data.message || `Request failed: ${res.status}`);
+        error.status = res.status;
+        throw error;
+      }
       return data;
     }
     function revokePreview(url) {
@@ -1090,6 +1101,9 @@
           serverLogoutConfirmed = true;
         } catch (error) {
           console.warn('[auth:logout] server logout was not confirmed', error?.message || 'network error');
+          alert(lang === 'en'
+            ? 'Server-side logout was not confirmed. The session may still be active.'
+            : '\u9000\u51fa\u672a\u80fd\u5728\u670d\u52a1\u7aef\u786e\u8ba4\uff0c\u4f1a\u8bdd\u53ef\u80fd\u4ecd\u7136\u6709\u6548\u3002');
         } finally {
           clearLegacyIdentityStorage();
           localStorage.removeItem('userRole');
@@ -2550,21 +2564,105 @@
       const [adminLoginOpen, setAdminLoginOpen] = useState(false);
       const [adminPanelOpen, setAdminPanelOpen] = useState(false);
       const [adminForm, setAdminForm] = useState({ username: '', password: '' });
-      const [adminToken, setAdminToken] = useState(sessionStorage.getItem('adminToken') || '');
+      const [adminAuthenticated, setAdminAuthenticated] = useState(false);
+      const [adminSessionStatus, setAdminSessionStatus] = useState('loading');
+      const adminProbeRef = useRef(0);
+
+      const clearAdminUi = useCallback((nextStatus = 'anonymous') => {
+        adminProbeRef.current += 1;
+        setAdminAuthenticated(false);
+        setAdminSessionStatus(nextStatus);
+        setAdminPanelOpen(false);
+      }, []);
+
+      const probeAdminSession = useCallback(async () => {
+        const generation = ++adminProbeRef.current;
+        try {
+          const response = await fetch('/api/admin/session', {
+            cache: 'no-store',
+            credentials: 'same-origin',
+            headers: { Accept: 'application/json' }
+          });
+          if (generation !== adminProbeRef.current) return false;
+          if (response.ok) {
+            setAdminAuthenticated(true);
+            setAdminSessionStatus('authenticated');
+            return true;
+          }
+          if (response.status === 401 || response.status === 403) {
+            clearAdminUi('anonymous');
+            return false;
+          }
+        } catch (_error) {
+          if (generation !== adminProbeRef.current) return false;
+          setAdminSessionStatus('unavailable');
+          return false;
+        }
+        if (generation !== adminProbeRef.current) return false;
+        setAdminSessionStatus('unavailable');
+        return false;
+      }, [clearAdminUi]);
+
+      useEffect(() => {
+        sessionStorage.removeItem('adminToken');
+        void probeAdminSession();
+        const onFocus = () => { void probeAdminSession(); };
+        const onVisibility = () => {
+          if (document.visibilityState === 'visible') void probeAdminSession();
+        };
+        window.addEventListener('focus', onFocus);
+        document.addEventListener('visibilitychange', onVisibility);
+        return () => {
+          window.removeEventListener('focus', onFocus);
+          document.removeEventListener('visibilitychange', onVisibility);
+        };
+      }, [probeAdminSession]);
 
       async function loginAdmin() {
         if (!adminForm.username.trim() || !adminForm.password) return alert(t('adminEmpty'));
         try {
-          const data = await fetchJson('/api/admin/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(adminForm) });
-          sessionStorage.setItem('adminToken', data.token);
-          setAdminToken(data.token);
+          await fetchJson('/api/admin/login', {
+            method: 'POST',
+            cache: 'no-store',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(adminForm)
+          });
+          adminProbeRef.current += 1;
+          sessionStorage.removeItem('adminToken');
+          setAdminAuthenticated(true);
+          setAdminSessionStatus('authenticated');
           setAdminLoginOpen(false);
           setAdminPanelOpen(true);
           setAdminForm({ username: '', password: '' });
         } catch (err) { alert(err.message || t('adminLoginFailed')); }
       }
 
-      if (adminPanelOpen && adminToken) return <AdminPanel adminToken={adminToken} onBack={() => setAdminPanelOpen(false)} />;
+      async function logoutAdmin() {
+        adminProbeRef.current += 1;
+        try {
+          await fetchJson('/api/admin/logout', {
+            method: 'POST',
+            cache: 'no-store',
+            credentials: 'same-origin',
+            headers: { Accept: 'application/json' }
+          });
+          sessionStorage.removeItem('adminToken');
+          clearAdminUi('anonymous');
+          return true;
+        } catch (err) {
+          alert(err.message || t('adminLogoutFailed'));
+          return false;
+        }
+      }
+
+      if (adminPanelOpen && adminAuthenticated) {
+        return <AdminPanel
+          onBack={() => setAdminPanelOpen(false)}
+          onLogout={logoutAdmin}
+          onUnauthorized={clearAdminUi}
+        />;
+      }
 
       return (
         <div className="flex-1 flex flex-col p-6 lg:p-12 overflow-y-auto w-full items-center liquid-glass-strong mobile-shell-flat rounded-[2.5rem] hide-scrollbar pb-[100px] lg:pb-12 mobile-panel-height relative mobile-settings-shell">
@@ -2582,7 +2680,18 @@
             <div className="space-y-3 mb-10">
               <SettingRow icon="user" title={t('identity')} subtitle={`${role === 'verifier' ? t('reviewer') : t('collector')} - ${openId ? openId.slice(0, 8) + '...' : t('noId')}`} />
               <SettingRow icon="smartphone" title={t('hardwareLink')} subtitle={t('hardwareSynced')} />
-              <SettingRow icon="shield" title={t('adminEntry')} subtitle={adminToken ? t('adminLoggedIn') : t('adminEntryHint')} onClick={() => adminToken ? setAdminPanelOpen(true) : setAdminLoginOpen(true)} />
+              <SettingRow
+                icon="shield"
+                title={t('adminEntry')}
+                subtitle={adminSessionStatus === 'unavailable'
+                  ? t('adminSessionUnavailable')
+                  : adminAuthenticated ? t('adminLoggedIn') : t('adminEntryHint')}
+                onClick={() => {
+                  if (adminAuthenticated) setAdminPanelOpen(true);
+                  else if (adminSessionStatus === 'anonymous') setAdminLoginOpen(true);
+                  else void probeAdminSession();
+                }}
+              />
             </div>
             <button onClick={onLogout} className="w-full liquid-glass text-white py-4 rounded-2xl text-xs font-[500] hover:scale-[1.02] active:scale-95 transition-transform uppercase tracking-widest mt-4">{t('disconnectNode')}</button>
           </div>
@@ -2605,7 +2714,7 @@
       );
     }
 
-    function AdminPanel({ adminToken, onBack }) {
+    function AdminPanel({ onBack, onLogout, onUnauthorized }) {
       const { t } = useLang();
       const [pois, setPois] = useState([]);
       const [thirdPartyEmail, setThirdPartyEmail] = useState('');
@@ -2613,18 +2722,31 @@
       const [collectionPaused, setCollectionPaused] = useState(false);
       const [loading, setLoading] = useState(false);
       const [broadcasting, setBroadcasting] = useState(false);
-      const headers = { Authorization: `Bearer ${adminToken}` };
-      const adminUrl = (url) => `${url}${url.includes('?') ? '&' : '?'}adminToken=${encodeURIComponent(adminToken)}`;
+      const cookieRequest = { cache: 'no-store', credentials: 'same-origin' };
 
-      useEffect(() => { loadAdminData(); }, [adminToken]);
+      async function adminFetch(url, options = cookieRequest) {
+        try {
+          return await fetchJson(url, options);
+        } catch (error) {
+          if (error?.status === 401 || error?.status === 403) {
+            setPois([]);
+            setThirdPartyEmail('');
+            setCollectionPaused(false);
+            onUnauthorized();
+          }
+          throw error;
+        }
+      }
+
+      useEffect(() => { loadAdminData(); }, []);
 
       async function loadAdminData() {
         setLoading(true);
         try {
           const [poiData, statusData, disputeData] = await Promise.all([
-            fetchJson(adminUrl(`/api/admin/reviewed-pois?_t=${Date.now()}`), { headers }),
-            fetchJson(adminUrl(`/api/admin/collection-status?_t=${Date.now()}`), { headers }),
-            fetchJson(adminUrl(`/api/admin/dispute-settings?_t=${Date.now()}`), { headers })
+            adminFetch(`/api/admin/reviewed-pois?_t=${Date.now()}`, cookieRequest),
+            adminFetch(`/api/admin/collection-status?_t=${Date.now()}`, cookieRequest),
+            adminFetch(`/api/admin/dispute-settings?_t=${Date.now()}`, cookieRequest)
           ]);
           setPois(poiData.data || []);
           setCollectionPaused(Boolean(statusData.collectionPaused));
@@ -2634,10 +2756,11 @@
       }
       async function toggleCollection() {
         try {
-          const data = await fetchJson(adminUrl('/api/admin/collection-status'), {
+          const data = await adminFetch('/api/admin/collection-status', {
+            ...cookieRequest,
             method: 'POST',
-            headers: { ...headers, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ collectionPaused: !collectionPaused, adminToken })
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ collectionPaused: !collectionPaused })
           });
           setCollectionPaused(Boolean(data.collectionPaused));
         } catch (err) { alert(err.message || t('adminActionFailed')); }
@@ -2645,16 +2768,20 @@
       async function deletePoi(poi) {
         if (!confirm(t('confirmDeletePoi'))) return;
         try {
-          await fetchJson(adminUrl(`/api/admin/poi/${encodeURIComponent(poi.id || poi._id)}`), { method: 'DELETE', headers });
+          await adminFetch(`/api/admin/poi/${encodeURIComponent(poi.id || poi._id)}`, {
+            ...cookieRequest,
+            method: 'DELETE'
+          });
           setPois(prev => prev.filter(item => (item.id || item._id) !== (poi.id || poi._id)));
         } catch (err) { alert(err.message || t('adminActionFailed')); }
       }
       async function emailPoi(poi) {
         try {
-          const data = await fetchJson(adminUrl('/api/admin/email-poi'), {
+          const data = await adminFetch('/api/admin/email-poi', {
+            ...cookieRequest,
             method: 'POST',
-            headers: { ...headers, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: poi.id || poi._id, adminToken })
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: poi.id || poi._id })
           });
           alert(t('emailSentTo', { email: data.email || thirdPartyEmail }));
         } catch (err) { alert(err.message || t('emailSendFailed')); }
@@ -2664,14 +2791,14 @@
         if (!content) return alert(t('broadcastEmpty'));
         setBroadcasting(true);
         try {
-          const data = await fetchJson(adminUrl('/api/admin/broadcast'), {
+          const data = await adminFetch('/api/admin/broadcast', {
+            ...cookieRequest,
             method: 'POST',
-            headers: { ...headers, 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               audience: broadcast.audience,
               title: broadcast.title.trim() || t('broadcastTitlePlaceholder'),
-              content,
-              adminToken
+              content
             })
           });
           setBroadcast(prev => ({ ...prev, content: '' }));
@@ -2681,10 +2808,11 @@
       }
       async function saveDisputeSettings() {
         try {
-          const data = await fetchJson(adminUrl('/api/admin/dispute-settings'), {
+          const data = await adminFetch('/api/admin/dispute-settings', {
+            ...cookieRequest,
             method: 'POST',
-            headers: { ...headers, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ thirdPartyEmail, adminToken })
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ thirdPartyEmail })
           });
           setThirdPartyEmail(data.thirdPartyEmail || thirdPartyEmail);
           alert(t('thirdPartyEmailSaved'));
@@ -2701,7 +2829,10 @@
                   <h2 className="text-base lg:text-xl text-white uppercase tracking-widest truncate">{t('adminPanel')}</h2>
                   <p className="text-[10px] text-white/45 uppercase tracking-widest mt-1">{t('reviewedPois')} - {pois.length}</p>
                 </div>
-                <button onClick={loadAdminData} className="w-10 h-10 liquid-glass rounded-2xl flex items-center justify-center text-white hover:scale-105 active:scale-95 transition-transform"><Icon name={loading ? 'loader-2' : 'refresh-cw'} className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} /></button>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button onClick={loadAdminData} className="w-10 h-10 liquid-glass rounded-2xl flex items-center justify-center text-white hover:scale-105 active:scale-95 transition-transform" title={t('reload')}><Icon name={loading ? 'loader-2' : 'refresh-cw'} className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} /></button>
+                  <button onClick={onLogout} className="w-10 h-10 liquid-glass rounded-2xl flex items-center justify-center text-rose-100 hover:scale-105 active:scale-95 transition-transform" title={t('adminLogout')}><Icon name="log-out" className="w-4 h-4" /></button>
+                </div>
               </div>
             </div>
             <div className="grid lg:grid-cols-[300px_minmax(0,1fr)] gap-4 lg:gap-5 min-h-0 flex-1">

@@ -313,19 +313,36 @@ Supported credential transports are intentionally narrow:
 
 | Principal | Cookie | Non-cookie transport |
 |---|---|---|
-| User | `poi_user_session` | `X-POI-Session` signed session header |
+| User | `poi_user_session` | `X-POI-Session` signed session header; GeoSync compatibility also accepts `Authorization: Bearer <signed user session>` |
 | Administrator | `poi_admin_session` signed session | `Authorization: Bearer <ADMIN_TOKEN>` using the separate opaque administrator token |
 | Screen | `poi_screen_token` containing a signed `screen` session | Optional strong opaque `X-Screen-Token` |
 
-A signed administrator session is a cookie credential, not a Bearer token. Query
-and request-body tokens are not accepted as substitutes for these transports.
-`POST /api/admin/logout` persists only a SHA-256 digest of the signed session
-`jti` plus its bounded expiry in `admin_session_revocations`. Its `expiresAt` TTL
-index removes expired records. HTTP and Socket administrator checks consult the
-shared collection, so a successful logout invalidates the same cookie across
-instances for the rest of its original lifetime. If MongoDB cannot read or write
-revocation state, signed administrator authentication and logout fail closed;
-logout does not clear the cookie or claim success before the write succeeds.
+Signed user and administrator sessions are cookie/header credentials, not query
+or request-body tokens. Logout stores only a SHA-256 digest of the signed session
+`jti` plus its bounded expiry. User digests are stored in
+`user_session_revocations`; administrator digests remain in
+`admin_session_revocations` for compatibility with already-issued sessions. Each
+collection has an `expiresAt` TTL index. HTTP and Socket checks consult the shared
+collection for that principal, so a successful logout invalidates copied cookies
+and headers across instances for the rest of the original lifetime.
+
+All photo upload routes authenticate before Multer can write a file, then recheck
+the parsed multipart `openId`, `openid`, and `userOpenId` aliases against the
+signed principal. Conflicts return HTTP 403 only after the unowned upload is
+removed. GeoSync image routes accept JPEG/PNG up to 10 MiB, return bounded JSON
+errors (`400` for type/parse errors, `413` for size, and sanitized `503` for
+server-side storage failure), and delete files on
+validation or pre-persistence failure. Once a database record durably references
+the upload, later notification or points-side failures retain the file rather
+than creating a broken database URL.
+
+`POST /api/admin/logout` revokes the presented signed administrator session.
+`POST /api/auth/logout` attempts both presented user and administrator sessions;
+it clears each cookie only after that session's verification/revocation operation
+completes safely. If either revocation store is unavailable, the response fails
+and does not claim a complete logout. The Portal visibly warns that server-side
+authority may still remain. The independent opaque `ADMIN_TOKEN` is not stored in
+or checked against either signed-session revocation collection.
 The screen bootstrap endpoint signs a bounded `SESSION_KINDS.SCREEN` credential
 with `AUTH_SESSION_SECRET`; it never copies the raw `SCREEN_TOKEN` into the
 browser cookie. An expired or otherwise invalid signed screen cookie is HTTP 403
@@ -373,9 +390,10 @@ until TTL expiry. Cleanup and successful consumption release total and network
 counts exactly once.
 
 Socket.io clients authenticate with a signed user or administrator session in
-the handshake auth payload or HttpOnly cookie. The server reloads the user and
-role before deriving room membership. Query-only identities, mismatched query
-openIds, and client-declared administrator roles are rejected in production;
+the handshake auth payload or HttpOnly cookie. The server checks revocation,
+reloads the user and role, and then derives room membership. Query-only
+identities, conflicting identity aliases, mismatched identity hints, and
+client-declared administrator roles are rejected in production;
 legacy query identity is available only in the explicit non-production
 compatibility mode described above. Both host and GeoSync room authorization
 refresh idle connections every 60 seconds, so expired sessions, revoked users,
@@ -397,23 +415,22 @@ authorization again. Do not migrate or mint a session from browser-stored or URL
 identity values. Browser callback redirects and QR polling success responses no
 longer expose OpenID. The portal and the legacy `index.html`, `admin.html`, and
 `chat.html` entry wrappers remove old identity storage and do not copy OpenID
-into URLs, JSON/multipart bodies, or Socket query parameters. The production
-backend still accepts selected compatibility/mismatch fields from coordinated
-older clients, but derives authority only from the signed session.
+into URLs, JSON/multipart bodies, or Socket query parameters. If an older client
+still sends `X-Open-Id`, `openId`, `openid`, or `userOpenId`, every nonempty value
+must match the signed principal or the request is rejected with HTTP 403.
 
 Portal user logout calls `POST /api/auth/logout`, clears the in-memory identity,
 role, and legacy storage, and distinguishes a confirmed anonymous result from an
-unavailable server response. A failed network request is logged as an unconfirmed
-logout rather than claiming that the HttpOnly cookie was cleared.
+unavailable server response. Network or revocation-store failure produces a
+visible warning that the server-side session may still be active.
 
-Administrator cleanup has the same split-state problem. The portal stores the
-non-credential `cookie-session` marker in `sessionStorage` after login, but it has
-no administrator logout path. The marker can remain after the signed
-`poi_admin_session` cookie expires, and hiding the panel or clearing the marker
-does not clear an otherwise valid HttpOnly administrator cookie. The frontend
-follow-up must recover from authentication failures, including HTTP 401/403 as
-applicable, clear stale administrator UI state, and call
-`POST /api/admin/logout` for explicit administrator sign-out.
+The administrator UI is Cookie-only. It removes the retired
+`sessionStorage.adminToken` marker, restores state through protected
+`GET /api/admin/session`, sends no administrator token in URLs, headers, or JSON
+bodies, and exposes explicit `POST /api/admin/logout` sign-out. It revalidates on
+window focus/page visibility and clears cached administrator data plus closes the
+panel on any management request returning HTTP 401/403. Failed persistent
+revocation remains visibly observable and does not claim success.
 
 Other independently deployed clients must migrate to the same signed-cookie
 contract before the backend compatibility fields can be removed entirely.
@@ -556,10 +573,11 @@ under the deployment change procedure:
 Production runtime sets Mongoose `autoIndex=false`; development and test keep
 automatic indexes enabled for feedback. The deployment runner refuses to connect
 without an explicit `MONGO_URI`, disables both `autoIndex` and `autoCreate`,
-and explicitly creates 25 host indexes across the seven authoritative collections
+ and explicitly creates 25 host indexes across the seven authoritative collections
 `users`, `pois`, `notifications`, `chatmessages`, `chatrooms`,
 `systemsettings`, and `disputes`. It then creates every declared GeoSync model
-index, including the unique `eventId`, active-lease, and seven-day TTL indexes on
+index, including the user/administrator session-revocation TTL indexes and the
+unique `eventId`, active-lease, and seven-day TTL indexes on
 `barrier_event_records`. The deployment script runs this gate before reloading
 the application. Do not deploy barrier processing without a successful index run
 because the unique event index is the cross-instance ownership boundary.
@@ -574,8 +592,13 @@ is the default and requires an explicitly configured `MONGO_URI`:
 ```
 
 Review `total`, `success`, `skipped`, `failed`, `gateNodeIdDeferred`,
-`superMapRefDeferred`, and every sanitized per-POI error. `success` in dry-run is
-the number of records that would be updated. The tool never invents
+`superMapRefDeferred`, and the `report` object. `success` in dry-run is the number
+of records that would be updated. Aggregate counters always cover the full
+cursor. To bound memory and output, `operations`, `items`, and `errors` are each
+capped by `POI_MIGRATION_REPORT_LIMIT` (default 1000, maximum 10000, with `0`
+allowed for summary-only output). `report.truncated` and `report.omitted` disclose
+all dropped report rows. `POI_MIGRATION_BATCH_SIZE` controls the cursor batch
+(default 250, maximum 5000). The tool never invents
 `gateNodeId`, dataset names, `smId`, or `dataVersion`; deferred counts must be
 resolved from authoritative GIS data through the separate mapping workflow.
 
@@ -610,11 +633,12 @@ each relevant business `edgeId`:
 edgeId, datasetName, smId, optional sourceId, dataVersion
 ```
 
-The mapping file is a JSON array. Every value must come from the published GIS
-dataset or import/export record. The migration rejects blank values, negative or
-non-integer `smId` values, unsupported fields, duplicate edge IDs, and conflicting
-mappings. It never derives `smId`, dataset names, source IDs, or versions from an
-edge ID.
+The mapping file is a JSON array no larger than 10 MiB and may contain at most
+10,000 entries. Every value must come from the published GIS dataset or
+import/export record. The migration rejects oversized input, blank values,
+negative or non-integer `smId` values, unsupported fields, duplicate edge IDs,
+and conflicting mappings. It never derives `smId`, dataset names, source IDs, or
+versions from an edge ID.
 
 Run dry-run first. The mapping path is mandatory:
 
@@ -671,8 +695,10 @@ Start the single service, then verify both the legacy POI surface and GeoSync:
 2. `GET /api/geosync/health/ready` returns HTTP 503 while the shared MongoDB
    connection is unavailable. With MongoDB online it returns HTTP 200; when
    GeoSync graph/index/jobs are still pending or failed it reports
-   `state=degraded` and `geosyncReady=false` so the host POI service is not removed
+   `{"state":"degraded","ready":true}` so the host POI service is not removed
    from the load balancer solely because an attached GeoSync component is down.
+   This public endpoint never returns MongoDB readyState, graph/index counts, or
+   scheduler details.
 3. `GET /api/client-config` returns HTTP 200.
 4. `GET /api/geosync/client-config` returns HTTP 200 and contains no credentials,
    private service paths, MongoDB URI, administrator token, or dataset allowlist.
@@ -730,8 +756,8 @@ and representative raw responses.
 | Mode unreachable | HTTP/code `8204` | Verify network attributes; never bypass accessible checks |
 | Contract/dataVersion mismatch | HTTP/code `8205`; cache must not be trusted | Align manifest, network publication, and sourceRef mapping |
 | Invalid upstream geometry | HTTP/code `8206` | Capture a sanitized representative response for adapter work |
-| MongoDB unavailable | Public `/api/geosync/health` and `/api/geosync/health/ready` return HTTP 503; signed administrator sessions also fail closed because revocation state cannot be verified | Use the independent opaque `ADMIN_TOKEN` for protected diagnostics, restore database connectivity, then recheck |
-| Graph or POI index startup pending/failed | Protected detailed health returns HTTP 503; host-aware `/api/geosync/health/ready` returns HTTP 200 with `state=degraded` and `geosyncReady=false` | Keep host POI traffic available while repairing database/index data or startup configuration |
+| MongoDB unavailable | Public `/api/geosync/health` and `/api/geosync/health/ready` return HTTP 503; signed user and administrator sessions fail closed because revocation state and principals cannot be verified | Use the independent opaque `ADMIN_TOKEN` for protected diagnostics, restore database connectivity, then recheck |
+| Graph or POI index startup pending/failed | Protected detailed health returns HTTP 503; host-aware `/api/geosync/health/ready` returns only `{"state":"degraded","ready":true}` | Keep host POI traffic available while repairing database/index data or startup configuration |
 | Jobs requested but scheduler failed | Protected detailed health returns HTTP 503 with `jobs.state=failed`; host-aware readiness remains HTTP 200 degraded while MongoDB is online | Repair scheduler startup; non-primary/background-disabled states are intentional and named |
 | Initial MongoDB connection fails in production | Process exits with code 1 after a sanitized `MONGO_STARTUP_FAILED` log | Restore MongoDB connectivity or configuration, then let the service manager restart the process; do not disable fail-fast as a permanent workaround |
 | Graceful shutdown exceeds its total deadline | Process exits with code 1 after sanitized `SHUTDOWN_TIMEOUT` diagnostics | Inspect only the named drain phase, correct the stuck dependency, and keep PM2 `kill_timeout` above the application deadline |
@@ -821,8 +847,9 @@ Production acceptance also requires evidence outside this repository:
   JS key domain allowlist, and supply the root-only Nginx snippet. Operations must
   apply the CDN no-cache rule, pass `nginx -t`, reload, and complete a real-browser
   map smoke test.
-- Staging MongoDB must prove TTL cleanup, administrator revocation, barrier-event
-  lease/heartbeat recovery, and cross-instance single ownership under the deployed
+- Staging MongoDB must prove TTL cleanup, user and administrator revocation,
+  cross-instance logout, barrier-event lease/heartbeat recovery, and
+  cross-instance single ownership under the deployed
   topology. The historical `adminusers` cleanup remains a backup-protected
   operator action; its command is dry-run by default and has not dropped data.
 - Linux/PM2 must prove graceful restart with in-flight HTTP and Socket work.
@@ -830,6 +857,6 @@ Production acceptance also requires evidence outside this repository:
   with deployment-managed credentials and without printing them.
 
 GitHub Pull Request #1 is the review and merge boundary from `LZY` to `main`.
-P2 delivery is complete only after the final `npm ci`, syntax, full test,
+P3 audit closure is complete only after the final `npm ci`, syntax, full test,
 production audit, diff, and staged-file gates pass and the resulting commit is
 non-force-pushed to `origin/LZY`. Do not push or merge `main` directly.

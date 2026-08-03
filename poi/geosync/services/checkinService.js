@@ -22,7 +22,15 @@ function setOcrFn(fn) { ocrFn = fn; }
  * 四重校验
  * @returns {status:'verified'|'pending', checkin, points, badge}
  */
-async function verify({ openId, poiId, lng, lat, photoUrl, viaQrCode = false }) {
+async function verify({
+    openId,
+    poiId,
+    lng,
+    lat,
+    photoUrl,
+    viaQrCode = false,
+    onUploadReferencePersisted = null
+}) {
     const { ExternalPoi, Checkin } = getModels();
     const poi = await ExternalPoi.findById(poiId).lean();
     if (!poi || poi.status !== 'approved') throw new BizError(3101, '点位不存在');
@@ -86,6 +94,9 @@ async function verify({ openId, poiId, lng, lat, photoUrl, viaQrCode = false }) 
         },
         status, points, viaQrCode
     });
+    if (photoUrl && typeof onUploadReferencePersisted === 'function') {
+        onUploadReferencePersisted(checkin);
+    }
 
     let badge = null, totalPoints = 0;
     if (status === 'verified') {

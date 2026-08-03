@@ -23,6 +23,9 @@ const {
     getAdminSessionRevocationModel
 } = require('./geosync/services/adminSessionRevocation');
 const {
+    getUserSessionRevocationModel
+} = require('./geosync/services/userSessionRevocation');
+const {
     AdminPasswordError,
     AdminPasswordBusyError,
     createAdminPasswordVerifier
@@ -37,6 +40,7 @@ const {
 const {
     LEGACY_ADMIN_SESSION_MARKER,
     HostAuthError,
+    createGlobalLogoutHandler,
     createHostAuth
 } = require('./geosync/services/hostAuth');
 const {
@@ -48,6 +52,10 @@ const {
     serializeExpiredCookie,
     timingSafeEqualText
 } = require('./geosync/lib/sessionAuth');
+const {
+    cleanupRequestUploads,
+    rejectMismatchedMultipartIdentity
+} = require('./geosync/lib/identityHints');
 
 const OAUTH_STATE_COOKIE_NAME = 'poi_oauth_state';
 const QR_CLAIM_COOKIE_NAME = 'poi_qr_login_claim';
@@ -232,10 +240,12 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model('User', userSchema);
 const AdminSessionRevocation = getAdminSessionRevocationModel(mongoose);
+const UserSessionRevocation = getUserSessionRevocationModel(mongoose);
 
 const hostAuth = createHostAuth({
     User,
     AdminSessionRevocation,
+    UserSessionRevocation,
     sessionSecret: CONFIG.authSessionSecret,
     adminToken: CONFIG.adminToken,
     adminUsername: CONFIG.admin.username || 'admin',
@@ -618,6 +628,42 @@ async function getReviewerTemplateOpenIds() {
         console.warn('[Template Skip] no valid reviewer openId; open the reviewer menu once to subscribe a real WeChat user');
     }
     return openIds;
+}
+
+async function publishPendingPoiNotifications(poi, options = {}) {
+    try {
+        const reviewerOpenIds = await getReviewerTemplateOpenIds();
+        for (const reviewerOpenId of reviewerOpenIds) {
+            void sendTemplate(reviewerOpenId, CONFIG.wechat.templates.newPoiWait, buildTemplateData({
+                poi: poi.poiName,
+                user: COLLECTOR_TEMPLATE_LABEL,
+                time: formatDateTime(poi.createTime)
+            }));
+        }
+    } catch (error) {
+        console.warn('[POI Review Notification]', error?.name || 'Error');
+    }
+
+    try {
+        if (!io) return;
+        const event = {
+            poiId: poi._id,
+            poiName: poi.poiName,
+            ...(options.updated ? { updated: true } : {})
+        };
+        io.to('reviewer_group').emit('newPoi', event);
+        io.to(socketRoomForGroup('reviewer_group')).emit('newPoi', event);
+        if (options.updated) {
+            io.to(`user_${poi.userOpenId}`).emit('poiStatusChanged', {
+                poiId: poi._id,
+                poiName: poi.poiName,
+                status: 'pending',
+                rejectReason: ''
+            });
+        }
+    } catch (error) {
+        console.warn('[POI Socket Notification]', error?.name || 'Error');
+    }
 }
 
 async function isActiveUser(openId) {
@@ -1068,10 +1114,12 @@ app.post('/api/admin/logout', async (req, res) => {
     }
 });
 
-app.post('/api/auth/logout', (req, res) => {
-    hostAuth.clearUserSession(res);
-    res.json({ success: true });
+app.get('/api/admin/session', requireAdmin, (_req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json({ success: true, data: { authenticated: true } });
 });
+
+app.post('/api/auth/logout', createGlobalLogoutHandler(hostAuth));
 
 app.get('/api/auth/session', requireUser, (req, res) => {
     res.set('Cache-Control', 'no-store');
@@ -1121,6 +1169,12 @@ app.post('/api/admin/screen/logout', requireAdmin, (_req, res) => {
 
 app.post('/api/ocr/classify', requireUser, uploadPoiImage, async (req, res) => {
     try {
+        if (await rejectMismatchedMultipartIdentity(req, req.openId)) {
+            return res.status(403).json({
+                success: false,
+                message: 'User identity does not match the session.'
+            });
+        }
         const { poiName, description } = req.body;
         if (!req.file) {
             return res.status(400).json({ success: false, message: '请上传图片' });
@@ -1136,9 +1190,16 @@ app.post('/api/ocr/classify', requireUser, uploadPoiImage, async (req, res) => {
 });
 
 app.post('/api/submit-poi', requireUser, uploadPoiImage, async (req, res) => {
+    let uploadCommitted = false;
     try {
+        if (await rejectMismatchedMultipartIdentity(req, req.openId)) {
+            return res.status(403).json({
+                success: false,
+                message: 'User identity does not match the session.'
+            });
+        }
         if (await isCollectionPaused()) {
-            cleanupUploadedFile(req.file);
+            await cleanupRequestUploads(req);
             return res.status(423).json({ success: false, message: '采集已暂停，请等待管理员开放采集' });
         }
         const { poiName, description, lng, lat } = req.body;
@@ -1146,11 +1207,11 @@ app.post('/api/submit-poi', requireUser, uploadPoiImage, async (req, res) => {
         const parsedLng = parseCoordinate(lng);
         const parsedLat = parseCoordinate(lat);
         if (!poiName || !lng || !lat || !req.file) {
-            cleanupUploadedFile(req.file);
+            await cleanupRequestUploads(req);
             return res.status(400).json({ success: false, message: '参数不足' });
         }
         if (parsedLng === null || parsedLat === null) {
-            cleanupUploadedFile(req.file);
+            await cleanupRequestUploads(req);
             return res.status(400).json({ success: false, message: '经纬度格式错误' });
         }
 
@@ -1165,34 +1226,28 @@ app.post('/api/submit-poi', requireUser, uploadPoiImage, async (req, res) => {
             imageUrl: req.file ? `/uploads/${req.file.filename}` : ''
         });
         await poi.save();
-
-        
-        const reviewerOpenIds = await getReviewerTemplateOpenIds();
-        for (const reviewerOpenId of reviewerOpenIds) {
-            sendTemplate(reviewerOpenId, CONFIG.wechat.templates.newPoiWait, buildTemplateData({
-                poi: poi.poiName,
-                user: COLLECTOR_TEMPLATE_LABEL,
-                time: formatDateTime(poi.createTime)
-            }));
-        }
-
-        
-        if (io) {
-            io.to('reviewer_group').emit('newPoi', { poiId: poi._id, poiName });
-            io.to(socketRoomForGroup('reviewer_group')).emit('newPoi', { poiId: poi._id, poiName });
-        }
+        uploadCommitted = true;
+        await publishPendingPoiNotifications(poi);
 
         res.json({ success: true, aiCategory: aiCat, id: poi._id });
     } catch (e) {
+        if (!uploadCommitted) await cleanupRequestUploads(req);
         console.error('[submit-poi]', e.message);
         res.status(500).json({ success: false, message: '提交失败' });
     }
 });
 
 app.post('/api/poi/update', requireUser, uploadPoiImage, async (req, res) => {
+    let uploadCommitted = false;
     try {
+        if (await rejectMismatchedMultipartIdentity(req, req.openId)) {
+            return res.status(403).json({
+                success: false,
+                message: 'User identity does not match the session.'
+            });
+        }
         if (await isCollectionPaused()) {
-            cleanupUploadedFile(req.file);
+            await cleanupRequestUploads(req);
             return res.status(423).json({ success: false, message: '采集已暂停，请等待管理员开放采集' });
         }
         const { id, poiName, description, lng, lat } = req.body;
@@ -1200,17 +1255,17 @@ app.post('/api/poi/update', requireUser, uploadPoiImage, async (req, res) => {
         const parsedLng = parseCoordinate(lng);
         const parsedLat = parseCoordinate(lat);
         if (!id || !mongoose.isValidObjectId(id) || !poiName || lng === undefined || lat === undefined) {
-            cleanupUploadedFile(req.file);
+            await cleanupRequestUploads(req);
             return res.status(400).json({ success: false, message: '参数不足' });
         }
         if (parsedLng === null || parsedLat === null) {
-            cleanupUploadedFile(req.file);
+            await cleanupRequestUploads(req);
             return res.status(400).json({ success: false, message: '经纬度格式错误' });
         }
 
         const poi = await POI.findOne({ _id: id, userOpenId, status: 'rejected' });
         if (!poi) {
-            cleanupUploadedFile(req.file);
+            await cleanupRequestUploads(req);
             const existing = await POI.findById(id);
             const message = existing ? '只有被驳回且属于自己的点位可以修改更新' : '点位不存在';
             return res.status(existing ? 400 : 404).json({ success: false, message });
@@ -1227,32 +1282,14 @@ app.post('/api/poi/update', requireUser, uploadPoiImage, async (req, res) => {
         poi.reviewerId = '';
         if (req.file) poi.imageUrl = `/uploads/${req.file.filename}`;
         await poi.save();
+        uploadCommitted = Boolean(req.file);
 
         if (req.file && oldImageUrl !== poi.imageUrl) cleanupLocalImageUrl(oldImageUrl);
-
-        const reviewerOpenIds = await getReviewerTemplateOpenIds();
-        for (const reviewerOpenId of reviewerOpenIds) {
-            sendTemplate(reviewerOpenId, CONFIG.wechat.templates.newPoiWait, buildTemplateData({
-                poi: poi.poiName,
-                user: COLLECTOR_TEMPLATE_LABEL,
-                time: formatDateTime(poi.createTime)
-            }));
-        }
-
-        if (io) {
-            io.to('reviewer_group').emit('newPoi', { poiId: poi._id, poiName: poi.poiName, updated: true });
-            io.to(socketRoomForGroup('reviewer_group')).emit('newPoi', { poiId: poi._id, poiName: poi.poiName, updated: true });
-            io.to(`user_${poi.userOpenId}`).emit('poiStatusChanged', {
-                poiId: poi._id,
-                poiName: poi.poiName,
-                status: 'pending',
-                rejectReason: ''
-            });
-        }
+        await publishPendingPoiNotifications(poi, { updated: true });
 
         res.json({ success: true, aiCategory: aiCat, id: poi._id });
     } catch (e) {
-        cleanupUploadedFile(req.file);
+        if (!uploadCommitted) await cleanupRequestUploads(req);
         console.error('[update-poi]', e.message);
         res.status(500).json({ success: false, message: '更新提交失败' });
     }
@@ -2272,7 +2309,7 @@ geosync.attach({
     app,
     io,
     mongoose,
-    models: { POI, User, AdminSessionRevocation },
+    models: { POI, User, AdminSessionRevocation, UserSessionRevocation },
     helpers: {
         sendTemplate,
         sendMail: sendGeoSyncMail,

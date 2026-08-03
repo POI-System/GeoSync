@@ -104,8 +104,25 @@ GeoSync is attached through dependency injection before static files and before
   explicit anonymous response so session outages cannot create redirect loops.
 - Remove OpenID from Portal request URLs, request bodies, Socket queries, and the
   three legacy entry wrappers. Portal logout now calls `POST /api/auth/logout`
-  and keeps an unconfirmed network failure observable instead of claiming that
-  the server cookie was cleared.
+  and visibly warns when server-side logout cannot be confirmed instead of
+  claiming that the server cookie was cleared.
+- Make Portal administrator access Cookie-only: remove the retired
+  `sessionStorage` marker and all URL/body/Bearer marker transport, restore state
+  through protected `GET /api/admin/session`, and provide explicit persistent
+  `POST /api/admin/logout` revocation. Revalidate on focus/visibility and clear
+  cached management data immediately when an administrator request returns
+  HTTP 401/403.
+- Persist SHA-256 digests of both user and administrator signed-session `jti`
+  values in separate MongoDB TTL collections. HTTP and Socket authorization fail
+  closed when revocation state is unavailable, and copied signed credentials are
+  rejected after logout across application instances.
+- Reject every nonempty legacy identity hint that conflicts with the signed
+  principal, including simultaneous aliases in HTTP and Socket handshakes.
+  Multipart routes authenticate before writing, recheck parsed aliases after
+  Multer, remove unowned files on rejection or pre-persistence failure, and
+  retain files only after a durable database reference. GeoSync photo uploads
+  return bounded JSON errors for invalid type, the 10 MiB limit, or sanitized
+  server-side storage failure.
 - Bound pending browser and QR OAuth flows with one shared per-network quota
   (`AUTH_FLOW_MAX_PENDING_PER_NETWORK`, default `8`) in addition to the global
   `2048` cap, while retaining the server-bound `sid` plus HttpOnly QR claim.
@@ -159,6 +176,9 @@ Updated or added HTTP surfaces include:
 - `POST /api/admin/screen/session`
 - `POST /api/admin/screen/logout`
 - `GET /api/auth/session`
+- `POST /api/auth/logout`
+- `GET /api/admin/session`
+- `POST /api/admin/logout`
 - `GET /auth/wechat`
 - `GET /auth/wechat/qr`
 - `GET /auth/status`
@@ -191,6 +211,9 @@ Allowed proposal lifecycle statuses are `shown`, `accepted`, `rejected`,
 - `BARRIER_REROUTE_CONCURRENCY`, `SUPERMAP_MAX_RESPONSE_BYTES`, and
   `SHUTDOWN_TIMEOUT_MS` expose bounded operational limits with conservative
   defaults of 6, 10485760 bytes, and 10000 milliseconds respectively.
+- `POI_MIGRATION_BATCH_SIZE` and `POI_MIGRATION_REPORT_LIMIT` default to 250 and
+  1000. The report limit caps each detailed output array at 10000 maximum while
+  preserving full aggregate counts and explicit omitted-row metadata.
 - `poi/config/supermap-manifest.example.json` is a placeholder contract only.
 
 The WalkEdge migration mapping format is an explicit JSON array of:
@@ -200,10 +223,12 @@ The WalkEdge migration mapping format is an explicit JSON array of:
 ```
 
 Dry-run is the default. Apply mode requires both `--apply` and an explicitly
-configured `MONGO_URI`. No GIS identifiers or versions are derived from edge IDs.
+configured `MONGO_URI`. Mapping files are capped at 10 MiB and 10,000 entries. No
+GIS identifiers or versions are derived from edge IDs.
 The POI migration follows the same dry-run-first policy, reports
 `total/success/skipped/failed` plus deferred `gateNodeId` and `superMapRef`
-counts, and refuses to overwrite a record changed after planning.
+counts, refuses to overwrite a record changed after planning, and reports
+bounded-detail truncation without losing full aggregate totals.
 
 ## Verification Commands
 
@@ -223,9 +248,9 @@ Evidence captured on August 3, 2026 after `npm ci`:
 - `npm ci`: passed from the committed lock file.
 - `check:syntax`: passed.
 - Legacy root GeoSync suite before removal: 67 passed, 0 failed.
-- GeoSync unit suite: 465 passed, 0 failed.
+- GeoSync unit suite: 480 passed, 0 failed.
 - Integration suite: 16 passed, 0 failed.
-- Combined unit and integration suite: 481 passed, 0 failed.
+- Combined unit and integration suite: 496 passed, 0 failed.
 - `git diff --check`: passed with only the existing Windows LF/CRLF conversion
   notices and no whitespace errors.
 - Production dependency audit: passed with 0 vulnerabilities.
@@ -246,13 +271,21 @@ Evidence captured on August 3, 2026 after `npm ci`:
   available only when explicitly enabled outside production.
 - User and administrator sessions are signed, expiring, and transported through
   HttpOnly SameSite cookies or explicitly supported authorization headers.
-- Administrator logout persists a SHA-256 digest of the signed session `jti` in
-  shared MongoDB with TTL cleanup. Signed administrator HTTP and Socket access
-  fails closed when revocation state cannot be verified; the independent opaque
-  `ADMIN_TOKEN` recovery credential does not depend on that collection.
-- Public `GET /api/geosync/health` exposes only `{state}`. Detailed MongoDB,
-  startup, GIS, manifest, and cache diagnostics require administrator or screen
-  credentials on the dedicated protected endpoints.
+- User and administrator logout persist only SHA-256 digests of signed-session
+  `jti` values in separate shared MongoDB collections with TTL cleanup. Signed
+  HTTP and Socket access fails closed when the corresponding revocation state
+  cannot be verified; the independent opaque `ADMIN_TOKEN` recovery credential
+  does not depend on either collection.
+- Real HTTP logout coverage presents distinct user Cookie/header credentials and
+  an administrator Cookie in one request, verifies both revocation collections,
+  rejects every replay, and proves that a one-sided storage failure clears only
+  the credential class whose revocation completed.
+- Real multipart HTTP coverage proves authentication precedes disk writes,
+  identity conflicts and validation failures leave no orphan files, bounded
+  upload errors remain JSON, and a successfully persisted photo remains owned.
+- Public `GET /api/geosync/health` exposes only `{state}` and public readiness only
+  `{state, ready}`. Detailed MongoDB, startup, GIS, manifest, cache, index, and
+  scheduler diagnostics require administrator or screen credentials.
 - Administrator GIS endpoints reject missing, malformed, query/body, or invalid
   credentials and accept only a signed administrator session or configured
   Bearer token.
@@ -324,16 +357,10 @@ health interpretation, error handling, and application rollback.
 
 ## Residual Risks and External Blockers
 
-- Administrator cleanup is also absent. The non-credential `cookie-session`
-  marker stored in `sessionStorage` can remain after the signed
-  `poi_admin_session` cookie expires, while clearing or abandoning the marker
-  does not clear a still-valid HttpOnly administrator cookie. The frontend must
-  recover from stale session state and HTTP 401/403 responses, close stale
-  administrator UI, and call `POST /api/admin/logout` for explicit sign-out.
-- The backend retains selected compatibility/mismatch identity fields for older
-  independently deployed clients, although the tracked Portal and legacy entry
-  wrappers no longer send them. Removing those accepted fields entirely requires
-  a coordinated public-contract change with every external frontend owner.
+- Independently deployed clients may continue sending legacy identity hint
+  fields, but every nonempty value must now match the signed principal. Client
+  owners must remove stale or conflicting aliases before rollout; mismatches are
+  intentionally rejected rather than silently reassigned.
 - Reviewer rollout requires an authoritative identity inventory before
   `REVIEWER_OPENIDS` is populated. Historical `role='reviewer'` and
   `reviewerSubscribed=true` rows are not trusted and must be cleaned through a
@@ -350,10 +377,11 @@ health interpretation, error handling, and application rollback.
   timer boundaries. Windows `child.kill()` cannot execute the production POSIX
   signal path, so a real Linux/PM2 restart with in-flight HTTP and Socket work is
   still a deployment gate.
-- Administrator revocation and barrier-event lease/heartbeat schemas, fail-closed
-  reads/writes, recovery semantics, and TTL metadata are covered locally. Staging
-  must still verify TTL cleanup, cross-instance logout, stale event recovery, and
-  single event ownership against the deployed MongoDB topology.
+- User/administrator revocation and barrier-event lease/heartbeat schemas,
+  fail-closed reads/writes, recovery semantics, and TTL metadata are covered
+  locally. Staging must still verify TTL cleanup, cross-instance logout, stale
+  event recovery, and single event ownership against the deployed MongoDB
+  topology.
 - Real validation still requires the actual base, published service paths,
   validated manifest, account permissions, representative raw responses, and an
   authoritative WalkEdge mapping with matching `dataVersion`.
@@ -372,10 +400,13 @@ health interpretation, error handling, and application rollback.
   collection; backup and exact confirmation remain required.
 - Real OCR, SMTP, AMap, tourist, operations-screen, and multi-instance MongoDB
   end-to-end validation remains a deployment gate.
-- GitHub Pull Request #1 remains the `LZY` to `main` review boundary. This P2
+- GitHub Pull Request #1 remains the `LZY` to `main` review boundary. This P3
   batch is deliverable only after its final clean-install gates pass and its
   commit is non-force-pushed to `origin/LZY`; do not push or merge `main`
   directly.
+- Repository protection requires one approving human review after the final
+  push; request that approval only after the last commit because a subsequent
+  update dismisses stale approval.
 
 ## Rollback Plan
 
@@ -403,6 +434,8 @@ health interpretation, error handling, and application rollback.
 - Verify signed session expiry, legacy-header production rejection, server-side
   reviewer authorization, query/body credential rejection, and signed Socket
   room derivation without query-only identity fallback.
+- Verify multipart authentication/identity ordering, 10 MiB and JPEG/PNG error
+  contracts, pre-persistence cleanup, and post-persistence file retention.
 - Verify migration apply remains explicit, conditional, idempotent, and sanitized.
 - Verify host POI schema/index compatibility, strict opening-hour validation, and
   concurrent-change-safe POI migration behavior.

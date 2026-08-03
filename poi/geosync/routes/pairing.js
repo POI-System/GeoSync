@@ -2,11 +2,14 @@
 // 03文档 §7 帮拍域 + §8 AI 导游。
 
 const express = require('express');
-const multer = require('multer');
-const { CONFIG } = require('../config');
 const { getModels } = require('../models');
 const { ok, fail, wrap, BizError } = require('../lib/respond');
 const { requireUser } = require('../lib/auth');
+const {
+    cleanupRequestUploads,
+    rejectMismatchedMultipartIdentity
+} = require('../lib/identityHints');
+const { createImageUpload } = require('../lib/imageUpload');
 const memCache = require('../lib/memCache');
 const pairingService = require('../services/pairingService');
 const guideService = require('../services/guideService');
@@ -14,10 +17,7 @@ const guideService = require('../services/guideService');
 const pairingRouter = express.Router();
 pairingRouter.use(requireUser);
 
-const upload = multer({
-    dest: CONFIG.uploadDir,
-    limits: { fileSize: 10 * 1024 * 1024 }
-});
+const uploadPhoto = createImageUpload('photo');
 
 // POST /api/pairing/optin
 pairingRouter.post('/optin', wrap(async (req, res) => {
@@ -76,12 +76,22 @@ pairingRouter.post('/:id/quickmsg', wrap(async (req, res) => {
     ok(res, { sent: true });
 }));
 
-pairingRouter.post('/:id/fulfill', upload.single('photo'), wrap(async (req, res) => {
-    const p = await pairingService.fulfill(
-        req.params.id, req.openId,
-        req.file ? `/uploads/${req.file.filename}` : null
-    );
-    ok(res, { fulfilled: p.state === 'fulfilled', pointsEach: p.state === 'fulfilled' ? 20 : 0 });
+pairingRouter.post('/:id/fulfill', uploadPhoto, wrap(async (req, res) => {
+    let uploadCommitted = false;
+    try {
+        if (await rejectMismatchedMultipartIdentity(req, req.openId)) {
+            return fail(res, 403, 9001, 'User identity does not match the session');
+        }
+        const p = await pairingService.fulfill(
+            req.params.id, req.openId,
+            req.file ? `/uploads/${req.file.filename}` : null
+        );
+        uploadCommitted = Boolean(req.file);
+        ok(res, { fulfilled: p.state === 'fulfilled', pointsEach: p.state === 'fulfilled' ? 20 : 0 });
+    } catch (error) {
+        if (!uploadCommitted) await cleanupRequestUploads(req);
+        throw error;
+    }
 }));
 
 pairingRouter.post('/:id/rate', wrap(async (req, res) => {

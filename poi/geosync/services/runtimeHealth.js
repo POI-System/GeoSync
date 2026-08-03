@@ -240,7 +240,7 @@ function createReadinessHandler({ mongoose, readiness, walkGraph, crowdService }
     runtimeSnapshotOf({ readiness, walkGraph, crowdService });
     return function readinessHandler(_req, res) {
         const mongo = mongoStatusOf(mongoose);
-        const { graphLoaded, poiIndexCount, startup } = runtimeSnapshotOf({
+        const { graphLoaded, startup } = runtimeSnapshotOf({
             readiness,
             walkGraph,
             crowdService
@@ -251,25 +251,11 @@ function createReadinessHandler({ mongoose, readiness, walkGraph, crowdService }
             && startup.ready === true
             && graphLoaded
             && poiIndexReady;
-        const jobs = startup.components.jobs;
         const state = !mongoReady ? 'not-ready' : geosyncReady ? 'ready' : 'degraded';
 
         res.status(mongoReady ? 200 : 503).json({
             state,
-            ready: mongoReady,
-            hostReady: mongoReady,
-            mongoReady,
-            geosyncReady,
-            degraded: mongoReady && !geosyncReady,
-            mongo,
-            geosync: {
-                state: startup.state,
-                graphReady: graphLoaded,
-                poiIndexReady,
-                poiIndexCount,
-                jobsReady: jobs.required === false || jobs.state === 'ready',
-                jobsState: jobs.state
-            }
+            ready: mongoReady
         });
     };
 }

@@ -2,11 +2,15 @@
 // 03文档 §5：摄影域。
 
 const express = require('express');
-const multer = require('multer');
 const { CONFIG } = require('../config');
 const { getModels } = require('../models');
 const { ok, fail, wrap, BizError } = require('../lib/respond');
 const { requireUser } = require('../lib/auth');
+const {
+    cleanupRequestUploads,
+    rejectMismatchedMultipartIdentity
+} = require('../lib/identityHints');
+const { createImageUpload } = require('../lib/imageUpload');
 const sunlight = require('../services/sunlight');
 const forecast = require('../services/forecastService');
 const crowdService = require('../services/crowdService');
@@ -14,13 +18,7 @@ const geo = require('../lib/geo');
 
 const router = express.Router();
 
-const upload = multer({
-    dest: CONFIG.uploadDir,
-    limits: { fileSize: 10 * 1024 * 1024 },
-    fileFilter: (_req, file, cb) => {
-        cb(null, ['image/jpeg', 'image/png'].includes(file.mimetype));
-    }
-});
+const uploadPhoto = createImageUpload('photo');
 
 // GET /api/photospots?near=lng,lat&radius=500&sort=score
 router.get('/', wrap(async (req, res) => {
@@ -110,25 +108,36 @@ function headingText(h) {
 }
 
 // POST /api/photospots（众包上报，进审核流）
-router.post('/', requireUser, upload.single('photo'), wrap(async (req, res) => {
-    if (!req.file) return fail(res, 400, 3107, '请上传样片');
-    const { PhotoSpot } = getModels();
-    const { poiId, name, heading, lng, lat, elevationHint, seasonTags } = req.body || {};
-    const h = Number(heading), lo = Number(lng), la = Number(lat);
-    if (!poiId || !name || !Number.isFinite(h) || !Number.isFinite(lo) || !Number.isFinite(la)) {
-        return fail(res, 400, 1101, '参数不足');
+router.post('/', requireUser, uploadPhoto, wrap(async (req, res) => {
+    let uploadCommitted = false;
+    try {
+        if (await rejectMismatchedMultipartIdentity(req, req.openId)) {
+            return fail(res, 403, 9001, 'User identity does not match the session');
+        }
+        if (!req.file) return fail(res, 400, 3107, '请上传样片');
+        const { PhotoSpot } = getModels();
+        const { poiId, name, heading, lng, lat, elevationHint, seasonTags } = req.body || {};
+        const h = Number(heading), lo = Number(lng), la = Number(lat);
+        if (!poiId || !name || !Number.isFinite(h) || !Number.isFinite(lo) || !Number.isFinite(la)) {
+            await cleanupRequestUploads(req);
+            return fail(res, 400, 1101, '参数不足');
+        }
+        const spot = await PhotoSpot.create({
+            scenicId: CONFIG.scenicId, poiId, name: String(name).slice(0, 50),
+            geo: { type: 'Point', coordinates: [lo, la] },
+            heading: ((Math.round(h) % 360) + 360) % 360,
+            elevationHint: String(elevationHint || '').slice(0, 100),
+            seasonTags: String(seasonTags || '').split(',').filter(Boolean),
+            samplePhotos: [{ url: `/uploads/${req.file.filename}`, status: 'pending' }],
+            status: 'pending',
+            contributorOpenId: req.openId
+        });
+        uploadCommitted = true;
+        ok(res, { spotId: spot._id, status: 'pending' });
+    } catch (error) {
+        if (!uploadCommitted) await cleanupRequestUploads(req);
+        throw error;
     }
-    const spot = await PhotoSpot.create({
-        scenicId: CONFIG.scenicId, poiId, name: String(name).slice(0, 50),
-        geo: { type: 'Point', coordinates: [lo, la] },
-        heading: ((Math.round(h) % 360) + 360) % 360,
-        elevationHint: String(elevationHint || '').slice(0, 100),
-        seasonTags: String(seasonTags || '').split(',').filter(Boolean),
-        samplePhotos: [{ url: `/uploads/${req.file.filename}`, status: 'pending' }],
-        status: 'pending',
-        contributorOpenId: req.openId
-    });
-    ok(res, { spotId: spot._id, status: 'pending' });
 }));
 
 module.exports = router;

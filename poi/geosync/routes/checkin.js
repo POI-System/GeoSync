@@ -2,45 +2,60 @@
 // 03文档 §6：打卡域。
 
 const express = require('express');
-const multer = require('multer');
-const { CONFIG } = require('../config');
 const { getModels } = require('../models');
 const { ok, fail, accepted, wrap } = require('../lib/respond');
 const { requireUser } = require('../lib/auth');
+const {
+    cleanupRequestUploads,
+    rejectMismatchedMultipartIdentity
+} = require('../lib/identityHints');
+const { createImageUpload } = require('../lib/imageUpload');
 const memCache = require('../lib/memCache');
 const checkinService = require('../services/checkinService');
 
 const router = express.Router();
 router.use(requireUser);
 
-const upload = multer({
-    dest: CONFIG.uploadDir,
-    limits: { fileSize: 10 * 1024 * 1024 },
-    fileFilter: (_req, file, cb) => cb(null, ['image/jpeg', 'image/png'].includes(file.mimetype))
-});
+const uploadPhoto = createImageUpload('photo');
 
-// POST /api/checkin
-router.post('/', upload.single('photo'), wrap(async (req, res) => {
+function enforceCheckinRateLimit(req, res, next) {
     if (!memCache.rateLimit(`checkin:${req.openId}`, 1, 10000)) {
         return fail(res, 429, 2101, '打卡过频，请稍候');
     }
-    const { poiId, lng, lat } = req.body || {};
-    if (!poiId || !Number.isFinite(Number(lng)) || !Number.isFinite(Number(lat))) {
-        return fail(res, 400, 1101, '参数不足');
+    next();
+}
+
+// POST /api/checkin
+router.post('/', enforceCheckinRateLimit, uploadPhoto, wrap(async (req, res) => {
+    let uploadCommitted = false;
+    try {
+        if (await rejectMismatchedMultipartIdentity(req, req.openId)) {
+            return fail(res, 403, 9001, 'User identity does not match the session');
+        }
+        const { poiId, lng, lat } = req.body || {};
+        if (!poiId || !Number.isFinite(Number(lng)) || !Number.isFinite(Number(lat))) {
+            await cleanupRequestUploads(req);
+            return fail(res, 400, 1101, '参数不足');
+        }
+        const result = await checkinService.verify({
+            openId: req.openId, poiId,
+            lng: Number(lng), lat: Number(lat),
+            photoUrl: req.file ? `/uploads/${req.file.filename}` : null,
+            onUploadReferencePersisted: () => { uploadCommitted = true; }
+        });
+        uploadCommitted = Boolean(req.file);
+        if (result.status === 'pending') {
+            return accepted(res, 3106, { status: 'pending', checkinId: result.checkin._id });
+        }
+        ok(res, {
+            status: 'verified', points: result.points, totalPoints: result.totalPoints,
+            badge: result.badge,
+            ocr: { matched: result.checkin.proof?.matched, confidence: result.checkin.proof?.ocrConfidence }
+        });
+    } catch (error) {
+        if (!uploadCommitted) await cleanupRequestUploads(req);
+        throw error;
     }
-    const result = await checkinService.verify({
-        openId: req.openId, poiId,
-        lng: Number(lng), lat: Number(lat),
-        photoUrl: req.file ? `/uploads/${req.file.filename}` : null
-    });
-    if (result.status === 'pending') {
-        return accepted(res, 3106, { status: 'pending', checkinId: result.checkin._id });
-    }
-    ok(res, {
-        status: 'verified', points: result.points, totalPoints: result.totalPoints,
-        badge: result.badge,
-        ocr: { matched: result.checkin.proof?.matched, confidence: result.checkin.proof?.ocrConfidence }
-    });
 }));
 
 // POST /api/checkin/qr — 扫码打卡（GPS 拒绝授权降级）

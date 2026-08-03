@@ -17,6 +17,11 @@ const {
     AdminSessionRevocationError,
     isAdminSessionRevoked
 } = require('../services/adminSessionRevocation');
+const {
+    UserSessionRevocationError,
+    isUserSessionRevoked
+} = require('../services/userSessionRevocation');
+const { hasMismatchedIdentityHint } = require('./identityHints');
 
 const LEGACY_ADMIN_SESSION_MARKER = 'cookie-session';
 
@@ -71,9 +76,15 @@ async function requireUser(req, res, next) {
         openId = String(req.headers['x-open-id'] || '').trim();
     }
     if (!openId) return fail(res, 401, 9001, 'A valid user session is required');
+    if (hasMismatchedIdentityHint(req, openId)) {
+        return fail(res, 403, 9001, 'User identity does not match the session');
+    }
 
     try {
-        const { ExternalUser } = getModels();
+        const { ExternalUser, UserSessionRevocation } = getModels();
+        if (session && await isUserSessionRevoked(UserSessionRevocation, session.sessionId)) {
+            return fail(res, 401, 9001, 'User session is invalid');
+        }
         const user = await ExternalUser.findOne({ openId }).lean();
         if (userIsRevoked(user)) return fail(res, 401, 9001, 'User does not exist or is disabled');
         req.openId = openId;
@@ -81,6 +92,9 @@ async function requireUser(req, res, next) {
         req.authSession = session;
         return next();
     } catch (error) {
+        if (error instanceof UserSessionRevocationError) {
+            return fail(res, 503, 9001, 'User authentication is unavailable');
+        }
         console.error('[GeoSync] [AUTH]', error?.name || 'Error');
         return fail(res, 500, 9001, 'Authentication failed');
     }
