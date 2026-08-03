@@ -10,7 +10,7 @@ const bus = require('./lib/eventBus');
 const memCache = require('./lib/memCache');
 const geo = require('./lib/geo');
 const { requireAdmin, screenOrAdmin, legacyOpenIdAllowed, userIsRevoked } = require('./lib/auth');
-const { wrap } = require('./lib/respond');
+const { wrap, safeErrorCode } = require('./lib/respond');
 const { createSocketRoomAuthorizer } = require('./lib/socketRoomAuth');
 const { createSuperMapGateway } = require('./integrations/supermap');
 const notifyBridge = require('./services/notifyBridge');
@@ -86,7 +86,7 @@ function startSseLoops() {
             ]);
             sseSend('stats', { activeItineraries, todayCheckins });
         } catch (e) {
-            console.error('[GeoSync] [SSE] stats failed:', e.message);
+            console.error('[GeoSync] [SSE] stats failed:', safeErrorCode(e, 'SSE_STATS_FAILED'));
         }
     }, 60000);
     hb.unref(); stats.unref();
@@ -254,7 +254,8 @@ function bridgeEvents(io) {
                 if (touched) await p.save();
             }
         } catch (e) {
-            console.error('[GeoSync] [PAIRING] arrivedAt backfill:', e.message);
+            console.error('[GeoSync] [PAIRING] arrivedAt backfill:',
+                safeErrorCode(e, 'PAIRING_BACKFILL_FAILED'));
         }
     });
 }
@@ -270,10 +271,12 @@ function initItineraryProgress() {
     const publish = async result => {
         if (result.status !== 'updated') return;
         if (result.releaseError) {
-            console.error('[GeoSync] [ITINERARY] token release failed:', result.releaseError.message);
+            console.error('[GeoSync] [ITINERARY] token release failed:',
+                safeErrorCode(result.releaseError, 'TOKEN_RELEASE_FAILED'));
         }
         await forecastService.rebuildArrivalIndex().catch(error =>
-            console.error('[GeoSync] [ITINERARY] arrival index rebuild failed:', error.message));
+            console.error('[GeoSync] [ITINERARY] arrival index rebuild failed:',
+                safeErrorCode(error, 'ARRIVAL_INDEX_REBUILD_FAILED')));
         const itinerary = result.itinerary;
         bus.emit(bus.EVENTS.ITINERARY_PROGRESS, {
             openId: itinerary.openId,

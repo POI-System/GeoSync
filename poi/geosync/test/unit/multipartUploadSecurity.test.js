@@ -11,6 +11,7 @@ const mongoose = require('mongoose');
 
 const modelModule = require('../../models');
 const { CONFIG } = require('../../config');
+const { classifyImageUploadError } = require('../../lib/imageUpload');
 const {
     SESSION_KINDS,
     DEFAULT_HEADER_NAMES,
@@ -83,6 +84,26 @@ function request(server, { fields, token = null, fileBuffer, fileName, mimeType 
 }
 
 test('real photospot multipart route authenticates before upload and owns files only after create', async () => {
+    const privateStorageError = Object.assign(
+        new Error('ENOENT C:\\private\\uploads?token=fake-secret'),
+        { code: 'ENOENT' }
+    );
+    const storageFailure = classifyImageUploadError(privateStorageError);
+    assert.deepEqual(storageFailure, {
+        httpStatus: 503,
+        code: 9001,
+        message: '图片存储暂不可用',
+        logCode: 'ENOENT'
+    });
+    assert.doesNotMatch(JSON.stringify(storageFailure), /private|fake-secret/);
+    assert.equal(
+        classifyImageUploadError({
+            code: 'https://user:fake-secret@example.test/private',
+            message: 'private storage detail'
+        }).logCode,
+        'UPLOAD_STORAGE_UNAVAILABLE'
+    );
+
     const tempDir = await mkdtemp(path.join(os.tmpdir(), 'geosync-multipart-route-'));
     const previous = {
         uploadDir: CONFIG.uploadDir,

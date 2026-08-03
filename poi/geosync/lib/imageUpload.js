@@ -2,14 +2,32 @@
 
 const multer = require('multer');
 const { CONFIG } = require('../config');
-const { fail } = require('./respond');
+const { fail, safeErrorCode } = require('./respond');
 
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png']);
 
-function createImageUpload(fieldName = 'photo') {
-    const upload = multer({
-        dest: CONFIG.uploadDir,
+function classifyImageUploadError(error) {
+    const rawCode = String(error?.code || '');
+    if (rawCode === 'LIMIT_FILE_SIZE') {
+        return { httpStatus: 413, code: 1101, message: '图片不能超过10MB', logCode: null };
+    }
+    if (rawCode === 'UNSUPPORTED_IMAGE_TYPE') {
+        return { httpStatus: 400, code: 1101, message: '仅支持JPEG/PNG图片', logCode: null };
+    }
+    if (rawCode.startsWith('LIMIT_')) {
+        return { httpStatus: 400, code: 1101, message: '图片上传请求无效', logCode: null };
+    }
+    return {
+        httpStatus: 503,
+        code: 9001,
+        message: '图片存储暂不可用',
+        logCode: safeErrorCode(error, 'UPLOAD_STORAGE_UNAVAILABLE')
+    };
+}
+
+function createImageUpload(fieldName = 'photo', options = {}) {
+    const uploadOptions = {
         limits: { fileSize: MAX_IMAGE_BYTES },
         fileFilter: (_req, file, cb) => {
             if (ALLOWED_IMAGE_TYPES.has(file.mimetype)) return cb(null, true);
@@ -17,26 +35,20 @@ function createImageUpload(fieldName = 'photo') {
             error.code = 'UNSUPPORTED_IMAGE_TYPE';
             return cb(error);
         }
-    });
+    };
+    if (options.storage) uploadOptions.storage = options.storage;
+    else uploadOptions.dest = CONFIG.uploadDir;
+    const upload = multer(uploadOptions);
+    const logPrefix = options.logPrefix || '[GeoSync] [UPLOAD]';
 
     return function imageUpload(req, res, next) {
         upload.single(fieldName)(req, res, error => {
             if (!error) return next();
-            if (error.code === 'LIMIT_FILE_SIZE') {
-                return fail(res, 413, 1101, '图片不能超过10MB');
+            const failure = classifyImageUploadError(error);
+            if (failure.logCode) {
+                console.error(logPrefix, { code: failure.logCode });
             }
-            if (error.code === 'UNSUPPORTED_IMAGE_TYPE') {
-                return fail(res, 400, 1101, '仅支持JPEG/PNG图片');
-            }
-            if (String(error.code || '').startsWith('LIMIT_')) {
-                return fail(res, 400, 1101, '图片上传请求无效');
-            }
-            console.error('[GeoSync] [UPLOAD]', {
-                name: String(error.name || 'Error').replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 64),
-                code: String(error.code || 'UPLOAD_STORAGE_UNAVAILABLE')
-                    .replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 64)
-            });
-            return fail(res, 503, 9001, '图片存储暂不可用');
+            return fail(res, failure.httpStatus, failure.code, failure.message);
         });
     };
 }
@@ -44,5 +56,6 @@ function createImageUpload(fieldName = 'photo') {
 module.exports = {
     MAX_IMAGE_BYTES,
     ALLOWED_IMAGE_TYPES,
+    classifyImageUploadError,
     createImageUpload
 };

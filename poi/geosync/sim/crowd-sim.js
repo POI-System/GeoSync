@@ -11,6 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 const { decodePolyline } = require('../lib/geo');
+const { safeErrorCode } = require('../lib/respond');
 
 // ---------- CLI ----------
 function parseArgs(argv) {
@@ -241,7 +242,7 @@ async function runScript(script, startReal, adminToken) {
                     for (let i = 0; i < (ev.users || 50); i++) surgeAgent(item.lnglat).catch(() => {});
                 }
             } catch (e) {
-                console.error('[SIM] 剧本事件失败:', e.message);
+                console.error('[SIM] 剧本事件失败:', safeErrorCode(e, 'SIM_EVENT_FAILED'));
             }
         }, Math.max(0, fireAt - Date.now())).unref?.();
     }
@@ -420,4 +421,7 @@ async function main() {
     }
 }
 
-main().catch(e => { console.error('[SIM] fatal:', e.message); process.exit(1); });
+main().catch(e => {
+    console.error('[SIM] fatal:', safeErrorCode(e, 'SIM_FATAL'));
+    process.exit(1);
+});

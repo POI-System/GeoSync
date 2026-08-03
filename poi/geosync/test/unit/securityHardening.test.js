@@ -2,10 +2,12 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { readFile } = require('node:fs/promises');
+const path = require('node:path');
 
 const { CONFIG } = require('../../config');
 const { SessionAuthConfigurationError } = require('../../lib/sessionAuth');
-const { wrap } = require('../../lib/respond');
+const { buildErrorLogContext, wrap, safeErrorCode } = require('../../lib/respond');
 const checkinService = require('../../services/checkinService');
 
 const QR_SECRET = 'Q8rH3mA9cT5kL1pN7vD2sF6jZ4xB0wE9uI3oP5yK';
@@ -52,6 +54,48 @@ test('generic route logging strips query credentials and raw error objects', asy
     assert.match(rendered, /ERR_BAD_RESPONSE/);
     for (const forbidden of [querySecret, password, rawBody, 'message-secret-sentinel', 'user-sentinel', '?']) {
         assert.equal(rendered.includes(forbidden), false, `log must omit ${forbidden}`);
+    }
+    assert.equal(safeErrorCode(error, 'FALLBACK_ERROR'), 'ERR_BAD_RESPONSE');
+    assert.equal(
+        safeErrorCode({ code: 'https://user:password@example.test/private' }, 'FALLBACK_ERROR'),
+        'FALLBACK_ERROR'
+    );
+    const unsafeContext = buildErrorLogContext({
+        method: 'GET',
+        originalUrl: '/api/test?token=query-secret'
+    }, {
+        name: 'Error',
+        code: 'https://user:password@example.test/private',
+        category: 'mongodb://user:password@example.test/private'
+    });
+    assert.equal(unsafeContext.error.code, null);
+    assert.equal(unsafeContext.error.category, null);
+    assert.doesNotMatch(JSON.stringify(unsafeContext), /user|password|private|query-secret/);
+
+    const geosyncRoot = path.resolve(__dirname, '../..');
+    const runtimeFiles = [
+        'index.js',
+        'jobs/index.js',
+        'lib/eventBus.js',
+        'routes/admin.js',
+        'routes/itinerary.js',
+        'services/antiHerding.js',
+        'services/checkinService.js',
+        'services/crowdService.js',
+        'services/guideService.js',
+        'services/horizonBuilder.js',
+        'sim/crowd-sim.js'
+    ];
+    for (const relativePath of runtimeFiles) {
+        const source = await readFile(path.join(geosyncRoot, relativePath), 'utf8');
+        const logCalls = source.matchAll(/(?:console|logger)\.(?:error|warn|log)\(([\s\S]*?)\);/g);
+        for (const [, args] of logCalls) {
+            assert.doesNotMatch(
+                args,
+                /\.message\b/,
+                `${relativePath} must not log raw error messages`
+            );
+        }
     }
 });
 

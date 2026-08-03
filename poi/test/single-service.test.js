@@ -99,6 +99,10 @@ test('POI server contains one production runtime and attaches GeoSync before lis
         path.join(POI_ROOT, 'geosync', 'services', 'hostAuth.js'),
         'utf8'
     );
+    const checkinServiceSource = await readFile(
+        path.join(POI_ROOT, 'geosync', 'services', 'checkinService.js'),
+        'utf8'
+    );
     const multipartRouteSources = await Promise.all(
         ['photospots.js', 'checkin.js', 'pairing.js'].map(fileName => readFile(
             path.join(POI_ROOT, 'geosync', 'routes', fileName),
@@ -211,6 +215,24 @@ test('POI server contains one production runtime and attaches GeoSync before lis
     assert.match(hostAuthSource,
         /if \(adminCompleted\) hostAuth\.clearAdminSession\(res\)/,
         'the administrator cookie must clear only after its revocation check completes safely');
+    const hostUploadAt = source.indexOf("const uploadPoiImage = createImageUpload('poiImage'");
+    const hostCleanupAt = source.indexOf('function cleanupUploadedFile', hostUploadAt);
+    assert.ok(hostUploadAt >= 0 && hostCleanupAt > hostUploadAt);
+    const hostUploadSource = source.slice(hostUploadAt, hostCleanupAt);
+    assert.match(hostUploadSource, /storage:\s*uploadStorage/,
+        'host uploads must retain their reviewed custom disk storage');
+    assert.match(hostUploadSource, /logPrefix:\s*['"]\[POI\] \[UPLOAD\]['"]/,
+        'host upload failures must use a bounded operational log prefix');
+    assert.doesNotMatch(hostUploadSource, /err\.message/,
+        'host uploads must never return raw Multer or storage messages');
+    assert.match(source, /ocrError\s*=\s*['"]OCR_UNAVAILABLE['"]/,
+        'OCR degradation must expose only a stable public error code');
+    assert.doesNotMatch(source, /ocrError\s*=\s*[^;\n]*\.message/,
+        'OCR responses must never contain an upstream SDK message');
+    assert.doesNotMatch(source, /console\.(?:error|warn)\([^\n]*\.message/,
+        'host runtime logs must not emit raw error messages');
+    assert.match(checkinServiceSource, /safeErrorCode\(e, ['"]OCR_FAILED['"]\)/,
+        'checkin OCR degradation must log only a sanitized error code');
     for (const route of ['/api/ocr/classify', '/api/submit-poi', '/api/poi/update']) {
         const routeAt = source.indexOf(`app.post('${route}'`);
         const nextRouteAt = source.indexOf('\napp.', routeAt + 1);

@@ -9,7 +9,7 @@ const {
 } = require('../lib/sessionAuth');
 const { CONFIG } = require('../config');
 const { getModels } = require('../models');
-const { BizError } = require('../lib/respond');
+const { BizError, safeErrorCode } = require('../lib/respond');
 const geo = require('../lib/geo');
 const walkGraph = require('./walkGraph');
 const bus = require('../lib/eventBus');
@@ -79,7 +79,7 @@ async function verify({
             ocrResult = await runOcr(photoUrl, poi);
             status = (ocrResult.matched && ocrResult.confidence >= 0.75) ? 'verified' : 'pending';
         } catch (e) {
-            console.error('[GeoSync] [CHECKIN] OCR failed:', e.message);
+            console.error('[GeoSync] [CHECKIN] OCR failed:', safeErrorCode(e, 'OCR_FAILED'));
             status = 'pending'; // 超时/失败 → 202 人工
         }
     }

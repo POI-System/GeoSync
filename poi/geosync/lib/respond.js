@@ -17,6 +17,16 @@ function safeLogText(value, fallback = null, maxLength = 128) {
     return normalized || fallback;
 }
 
+function safeDiagnosticToken(value, fallback) {
+    const normalized = value === undefined || value === null ? '' : String(value).trim();
+    return /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/.test(normalized) ? normalized : fallback;
+}
+
+function safeErrorCode(error, fallback = 'UNEXPECTED_ERROR') {
+    const value = error?.code;
+    return safeDiagnosticToken(value, fallback);
+}
+
 function requestRoute(req) {
     const routePath = req?.route?.path;
     if (typeof routePath === 'string' && routePath) {
@@ -32,9 +42,9 @@ function buildErrorLogContext(req, error) {
         method: safeLogText(req?.method, 'UNKNOWN', 16),
         path: requestRoute(req),
         error: {
-            name: safeLogText(error?.name, 'Error', 64),
-            code: safeLogText(error?.code, null, 64),
-            category: safeLogText(error?.category, null, 64),
+            name: safeDiagnosticToken(error?.name, 'Error'),
+            code: safeErrorCode(error, null),
+            category: safeDiagnosticToken(error?.category, null),
             status: Number.isInteger(status) && status >= 100 && status <= 599 ? status : null,
             requestId: safeLogText(error?.requestId, null, 128)
         }
@@ -71,4 +81,12 @@ function wrap(handler) {
     };
 }
 
-module.exports = { BizError, ok, accepted, fail, wrap, buildErrorLogContext };
+module.exports = {
+    BizError,
+    ok,
+    accepted,
+    fail,
+    wrap,
+    buildErrorLogContext,
+    safeErrorCode
+};

@@ -2,6 +2,7 @@
 // 01文档 §5：进程内事件总线。升级 Redis Pub/Sub 只改本文件。
 
 const { EventEmitter } = require('events');
+const { safeErrorCode } = require('./respond');
 
 const EVENTS = {
     POSITION_REPORTED: 'position:reported',
@@ -40,7 +41,8 @@ module.exports = {
             try {
                 await handler(payload);
             } catch (e) {
-                console.error(`[GeoSync] [BUS] handler for ${event} failed:`, e.message);
+                console.error(`[GeoSync] [BUS] handler for ${event} failed:`,
+                    safeErrorCode(e, 'EVENT_HANDLER_FAILED'));
             }
         };
         bus.on(event, listener);

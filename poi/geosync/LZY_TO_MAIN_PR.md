@@ -120,9 +120,10 @@ GeoSync is attached through dependency injection before static files and before
   principal, including simultaneous aliases in HTTP and Socket handshakes.
   Multipart routes authenticate before writing, recheck parsed aliases after
   Multer, remove unowned files on rejection or pre-persistence failure, and
-  retain files only after a durable database reference. GeoSync photo uploads
-  return bounded JSON errors for invalid type, the 10 MiB limit, or sanitized
-  server-side storage failure.
+  retain files only after a durable database reference. Host and GeoSync photo
+  uploads share bounded JSON errors for invalid type, the 10 MiB limit, or
+  sanitized server-side storage failure; cleanup logs contain only bounded error
+  codes.
 - Bound pending browser and QR OAuth flows with one shared per-network quota
   (`AUTH_FLOW_MAX_PENDING_PER_NETWORK`, default `8`) in addition to the global
   `2048` cap, while retaining the server-bound `sid` plus HttpOnly QR claim.
@@ -283,6 +284,12 @@ Evidence captured on August 3, 2026 after `npm ci`:
 - Real multipart HTTP coverage proves authentication precedes disk writes,
   identity conflicts and validation failures leave no orphan files, bounded
   upload errors remain JSON, and a successfully persisted photo remains owned.
+  Host POI/OCR routes use the same tested upload-error middleware factory with
+  their custom disk storage; source-level assertions verify the host wiring, and
+  upload cleanup never logs raw filesystem messages or paths.
+- Host and GeoSync runtime diagnostics for HTTP routes, Socket handlers, jobs,
+  events, itinerary repair, OCR, LLM, and DEM processing retain only bounded
+  error codes and structured request metadata, never raw upstream messages.
 - Public `GET /api/geosync/health` exposes only `{state}` and public readiness only
   `{state, ready}`. Detailed MongoDB, startup, GIS, manifest, cache, index, and
   scheduler diagnostics require administrator or screen credentials.

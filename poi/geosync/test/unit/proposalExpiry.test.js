@@ -228,5 +228,6 @@ test('token-release failure is logged but does not suppress the durable expired 
     assert.equal(events[0].payload.status, 'expired');
     assert.equal(events[0].payload.version, 4);
     assert.match(logs[0], /proposal token release failed/);
-    assert.match(logs[0], /token store unavailable/);
+    assert.match(logs[0], /PROPOSAL_TOKEN_RELEASE_FAILED/);
+    assert.doesNotMatch(logs[0], /token store unavailable/);
 });

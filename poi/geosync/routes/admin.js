@@ -5,7 +5,7 @@ const express = require('express');
 const crypto = require('crypto');
 const { CONFIG } = require('../config');
 const { getModels } = require('../models');
-const { ok, accepted, fail, wrap, BizError } = require('../lib/respond');
+const { ok, accepted, fail, wrap, BizError, safeErrorCode } = require('../lib/respond');
 const { requireAdmin } = require('../lib/auth');
 const memCache = require('../lib/memCache');
 const geo = require('../lib/geo');
@@ -400,7 +400,8 @@ router.post('/graph/edge/:edgeId/:op(close|open)', wrap(async (req, res) => {
         await gateway.invalidateRouteCache(`graph-${targetStatus}:${edge.edgeId}:${eventId}`);
     } catch (error) {
         cacheInvalidated = false;
-        console.error('[GeoSync] [GRAPH] route-cache invalidation failed:', error.message);
+        console.error('[GeoSync] [GRAPH] route-cache invalidation failed:',
+            safeErrorCode(error, 'ROUTE_CACHE_INVALIDATION_FAILED'));
     }
 
     const payload = {

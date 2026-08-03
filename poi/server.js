@@ -20,6 +20,11 @@ const { createFixedWindowRateLimiter } = require('./geosync/services/fixedWindow
 const { monitorInitialMongoConnection } = require('./geosync/services/mongoStartup');
 const { installGracefulShutdown } = require('./geosync/services/gracefulShutdown');
 const {
+    buildErrorLogContext,
+    safeErrorCode
+} = require('./geosync/lib/respond');
+const { createImageUpload } = require('./geosync/lib/imageUpload');
+const {
     getAdminSessionRevocationModel
 } = require('./geosync/services/adminSessionRevocation');
 const {
@@ -392,7 +397,7 @@ async function sendTemplate(openId, templateId, data = {}) {
         }
         return r.data;
     } catch (e) {
-        console.error('[Template Error]', e.message);
+        console.error('[Template Error]', safeErrorCode(e, 'TEMPLATE_SEND_FAILED'));
     }
 }
 
@@ -421,27 +426,17 @@ const uploadStorage = multer.diskStorage({
         cb(null, `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${ext}`);
     }
 });
-const upload = multer({
+const uploadPoiImage = createImageUpload('poiImage', {
     storage: uploadStorage,
-    limits: { fileSize: 10 * 1024 * 1024 },
-    fileFilter: (_req, file, cb) => {
-        if (['image/jpeg', 'image/png'].includes(file.mimetype)) return cb(null, true);
-        cb(new Error('仅支持 jpeg/png 图片'));
-    }
+    logPrefix: '[POI] [UPLOAD]'
 });
-
-function uploadPoiImage(req, res, next) {
-    upload.single('poiImage')(req, res, (err) => {
-        if (!err) return next();
-        const message = err.code === 'LIMIT_FILE_SIZE' ? '图片不能超过 10MB' : (err.message || '图片上传失败');
-        return res.status(400).json({ success: false, message });
-    });
-}
 
 function cleanupUploadedFile(file) {
     if (!file || !file.path) return;
     fs.unlink(file.path, (err) => {
-        if (err && err.code !== 'ENOENT') console.warn('[Upload Cleanup]', err.message);
+        if (err && err.code !== 'ENOENT') {
+            console.warn('[Upload Cleanup]', safeErrorCode(err, 'UNLINK_FAILED'));
+        }
     });
 }
 
@@ -563,8 +558,8 @@ async function classifyPoiFromImage(file, poiName, description) {
         try {
             ocrText = await recognizeUploadedImageText(file);
         } catch (e) {
-            ocrError = e.message || 'OCR failed';
-            console.warn('[OCR Skip]', e.message);
+            ocrError = 'OCR_UNAVAILABLE';
+            console.warn('[OCR Skip]', safeErrorCode(e, 'OCR_FAILED'));
         }
     }
     return {
@@ -583,7 +578,9 @@ function cleanupLocalImageUrl(imageUrl) {
     const target = path.resolve(uploadRoot, filename);
     if (!target.startsWith(uploadRoot + path.sep)) return;
     fs.unlink(target, (err) => {
-        if (err && err.code !== 'ENOENT') console.warn('[Image Cleanup]', err.message);
+        if (err && err.code !== 'ENOENT') {
+            console.warn('[Image Cleanup]', safeErrorCode(err, 'UNLINK_FAILED'));
+        }
     });
 }
 
@@ -1040,7 +1037,7 @@ app.post('/api/user/bind-role', requireUser, async (req, res) => {
         if (!user) return res.status(401).json({ success: false, message: '用户身份无效' });
         res.json({ success: true, message: '绑定成功', role: user.role });
     } catch (e) {
-        console.error('[bind-role]', e.message);
+        console.error('[bind-role]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '服务器错误' });
     }
 });
@@ -1184,7 +1181,7 @@ app.post('/api/ocr/classify', requireUser, uploadPoiImage, async (req, res) => {
         res.json({ success: true, ...result });
     } catch (e) {
         cleanupUploadedFile(req.file);
-        console.error('[ocr-classify]', e.message);
+        console.error('[ocr-classify]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: 'OCR 识别失败' });
     }
 });
@@ -1232,7 +1229,7 @@ app.post('/api/submit-poi', requireUser, uploadPoiImage, async (req, res) => {
         res.json({ success: true, aiCategory: aiCat, id: poi._id });
     } catch (e) {
         if (!uploadCommitted) await cleanupRequestUploads(req);
-        console.error('[submit-poi]', e.message);
+        console.error('[submit-poi]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '提交失败' });
     }
 });
@@ -1290,7 +1287,7 @@ app.post('/api/poi/update', requireUser, uploadPoiImage, async (req, res) => {
         res.json({ success: true, aiCategory: aiCat, id: poi._id });
     } catch (e) {
         if (!uploadCommitted) await cleanupRequestUploads(req);
-        console.error('[update-poi]', e.message);
+        console.error('[update-poi]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '更新提交失败' });
     }
 });
@@ -1376,7 +1373,7 @@ app.post('/api/admin/approve-poi', requireReviewerOrAdmin, async (req, res) => {
 
         res.json({ success: true });
     } catch (e) {
-        console.error('[approve-poi]', e.message);
+        console.error('[approve-poi]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '操作失败' });
     }
 });
@@ -1484,7 +1481,7 @@ app.post('/api/poi/dispute', requireUser, async (req, res) => {
         }
         res.json({ success: true });
     } catch (e) {
-        console.error('[poi-dispute]', e.message);
+        console.error('[poi-dispute]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '异议提交失败' });
     }
 });
@@ -1513,7 +1510,7 @@ app.get('/api/admin/reviewed-pois', requireAdmin, async (req, res) => {
             .limit(size);
         res.json({ success: true, data: data.map(serializePoi) });
     } catch (e) {
-        console.error('[admin-reviewed-pois]', e.message);
+        console.error('[admin-reviewed-pois]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '查询失败' });
     }
 });
@@ -1536,7 +1533,7 @@ app.delete('/api/admin/poi/:id', requireAdmin, async (req, res) => {
         if (io) io.emit('poiStatusChanged', { poiId: poi._id, deleted: true, public: true });
         res.json({ success: true });
     } catch (e) {
-        console.error('[admin-delete-poi]', e.message);
+        console.error('[admin-delete-poi]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '删除失败' });
     }
 });
@@ -1565,7 +1562,7 @@ app.post('/api/admin/email-poi', requireAdmin, async (req, res) => {
         });
         res.json({ success: true, email: targetEmail });
     } catch (e) {
-        console.error('[admin-email-poi]', e.message);
+        console.error('[admin-email-poi]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '邮件发送失败' });
     }
 });
@@ -1578,7 +1575,7 @@ app.get('/api/admin/dispute-settings', requireAdmin, async (_req, res) => {
             thirdPartyEmail: setting.thirdPartyEmail || CONFIG.smtp.defaultTestEmail || ''
         });
     } catch (e) {
-        console.error('[admin-dispute-settings]', e.message);
+        console.error('[admin-dispute-settings]', buildErrorLogContext(_req, e));
         res.status(500).json({ success: false, message: '查询失败' });
     }
 });
@@ -1596,7 +1593,7 @@ app.post('/api/admin/dispute-settings', requireAdmin, async (req, res) => {
         );
         res.json({ success: true, thirdPartyEmail: setting.thirdPartyEmail || CONFIG.smtp.defaultTestEmail || '' });
     } catch (e) {
-        console.error('[admin-save-dispute-settings]', e.message);
+        console.error('[admin-save-dispute-settings]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '保存失败' });
     }
 });
@@ -1606,7 +1603,7 @@ app.get('/api/admin/collection-status', requireAdmin, async (_req, res) => {
         const setting = await getSystemSetting();
         res.json({ success: true, collectionPaused: Boolean(setting.collectionPaused) });
     } catch (e) {
-        console.error('[admin-collection-status]', e.message);
+        console.error('[admin-collection-status]', buildErrorLogContext(_req, e));
         res.status(500).json({ success: false, message: '查询失败' });
     }
 });
@@ -1622,7 +1619,7 @@ app.post('/api/admin/collection-status', requireAdmin, async (req, res) => {
         if (io) io.emit('collectionStatusChanged', { collectionPaused: Boolean(setting.collectionPaused) });
         res.json({ success: true, collectionPaused: Boolean(setting.collectionPaused) });
     } catch (e) {
-        console.error('[admin-set-collection-status]', e.message);
+        console.error('[admin-set-collection-status]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '操作失败' });
     }
 });
@@ -1641,7 +1638,7 @@ app.post('/api/admin/broadcast', requireAdmin, async (req, res) => {
         const result = await broadcastNotification({ audience, title, content, type: 'system' });
         res.json({ success: true, ...result });
     } catch (e) {
-        console.error('[admin-broadcast]', e.message);
+        console.error('[admin-broadcast]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '公告发送失败' });
     }
 });
@@ -1656,7 +1653,7 @@ app.get('/api/dispute/:token', async (req, res) => {
         if (!poi) return res.status(404).json({ success: false, message: '点位不存在' });
         res.json({ success: true, data: serializeDispute(dispute, poi) });
     } catch (e) {
-        console.error('[dispute-detail]', e.message);
+        console.error('[dispute-detail]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '查询失败' });
     }
 });
@@ -1749,7 +1746,7 @@ app.post('/api/dispute/:token/resolve', async (req, res) => {
         }
         res.json({ success: true, status: finalAction });
     } catch (e) {
-        console.error('[dispute-resolve]', e.message);
+        console.error('[dispute-resolve]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '处理失败' });
     }
 });
@@ -1769,7 +1766,7 @@ app.get('/api/notifications', requireUser, async (req, res) => {
         const unreadCount = await Notification.countDocuments({ recipientOpenId: openId, read: false });
         res.json({ success: true, unreadCount, data: data.map(serializeNotification) });
     } catch (e) {
-        console.error('[notifications]', e.message);
+        console.error('[notifications]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '查询失败' });
     }
 });
@@ -1791,7 +1788,7 @@ app.post('/api/notifications/read', requireUser, async (req, res) => {
         await Notification.updateMany(query, { read: true });
         res.json({ success: true });
     } catch (e) {
-        console.error('[notifications-read]', e.message);
+        console.error('[notifications-read]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '操作失败' });
     }
 });
@@ -1807,7 +1804,7 @@ app.get('/api/chat/rooms', requireUser, async (req, res) => {
         }).sort({ lastTime: -1 }).limit(100);
         res.json({ success: true, data: data.map(serializeChatRoom) });
     } catch (e) {
-        console.error('[chat-rooms]', e.message);
+        console.error('[chat-rooms]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '查询失败' });
     }
 });
@@ -1837,7 +1834,7 @@ app.get('/api/chat/history', requireUser, async (req, res) => {
         const data = await ChatMessage.find({ roomId }).sort({ createTime: -1 }).limit(size);
         res.json({ success: true, data: data.reverse().map(serializeChatMessage) });
     } catch (e) {
-        console.error('[chat-history]', e.message);
+        console.error('[chat-history]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: 'Query failed' });
     }
 });
@@ -2248,7 +2245,7 @@ io.on('connection', async (socket) => {
                 socket.join(`chat_${roomId}`);
             }
         } catch (e) {
-            console.warn('[joinChatRoom]', e.message);
+            console.warn('[joinChatRoom]', safeErrorCode(e, 'CHAT_ROOM_JOIN_FAILED'));
         }
     });
 
@@ -2281,7 +2278,7 @@ io.on('connection', async (socket) => {
             }
             io.to(`chat_${roomId}`).emit('chatMessage', serializeChatMessage(msg));
         } catch (e) {
-            console.error('[chatMessage]', e.message);
+            console.error('[chatMessage]', safeErrorCode(e, 'CHAT_MESSAGE_FAILED'));
         }
     });
 
@@ -2300,7 +2297,7 @@ io.on('connection', async (socket) => {
                 type: 'system'
             });
         } catch (e) {
-            console.error('[notice broadcast]', e.message);
+            console.error('[notice broadcast]', safeErrorCode(e, 'NOTICE_BROADCAST_FAILED'));
         }
     });
 });

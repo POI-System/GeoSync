@@ -329,12 +329,18 @@ and headers across instances for the rest of the original lifetime.
 All photo upload routes authenticate before Multer can write a file, then recheck
 the parsed multipart `openId`, `openid`, and `userOpenId` aliases against the
 signed principal. Conflicts return HTTP 403 only after the unowned upload is
-removed. GeoSync image routes accept JPEG/PNG up to 10 MiB, return bounded JSON
-errors (`400` for type/parse errors, `413` for size, and sanitized `503` for
-server-side storage failure), and delete files on
+removed. Host and GeoSync image routes accept JPEG/PNG up to 10 MiB and share
+bounded JSON errors (`400` for type/parse errors, `413` for size, and sanitized
+`503` for server-side storage failure). Cleanup diagnostics contain only bounded
+error codes, never raw filesystem messages or paths. Files are deleted on
 validation or pre-persistence failure. Once a database record durably references
 the upload, later notification or points-side failures retain the file rather
 than creating a broken database URL.
+
+Production route, Socket, job, event, itinerary-repair, OCR, LLM, and DEM failure
+logs likewise contain only bounded error codes and structured request metadata.
+Do not replace these diagnostics with raw `error.message` output during incident
+debugging; capture the request ID and inspect the protected health surface instead.
 
 `POST /api/admin/logout` revokes the presented signed administrator session.
 `POST /api/auth/logout` attempts both presented user and administrator sessions;
