@@ -2,6 +2,7 @@
 
 const MODES = new Set(['normal', 'accessible', 'shade']);
 const DEFAULT_TTL_MS = 60_000;
+const DEFAULT_MAX_ENTRIES = 1000;
 const SENSITIVE_REASON = /(?:authorization|credential|password|passwd|secret|token|api[-_]?key|username)/i;
 
 function requireObject(value, field) {
@@ -117,6 +118,14 @@ function ttlValue(value) {
     return ttlMs;
 }
 
+function maxEntriesValue(value) {
+    const maxEntries = value === undefined ? DEFAULT_MAX_ENTRIES : Number(value);
+    if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0) {
+        throw new TypeError('maxEntries must be a positive safe integer');
+    }
+    return maxEntries;
+}
+
 function clone(value) {
     return structuredClone(value);
 }
@@ -142,8 +151,49 @@ class RouteCache {
         );
         this.clock = options.clock || Date.now;
         this.ttlMs = ttlValue(options.ttlMs);
+        this.maxEntries = maxEntriesValue(options.maxEntries);
+        this.expiryHeap = [];
+        this.expirySequence = 0;
+        this.aliasGeneration = 0;
         this.lastInvalidationReason = null;
         this.lastInvalidatedAt = null;
+        this._indexExistingAliases();
+        this._evictToLimit();
+    }
+
+    _indexExistingAliases() {
+        const aliasesByCanonicalKey = new Map();
+        for (const [signature, existing] of this.aliasStore.entries()) {
+            if (!existing || typeof existing !== 'object' || Array.isArray(existing)) continue;
+            const canonical = this.store.get(existing.canonicalKey);
+            const alias = {
+                ...existing,
+                ...(Object.prototype.hasOwnProperty.call(existing, 'value')
+                    ? {}
+                    : canonical && Object.prototype.hasOwnProperty.call(canonical, 'value')
+                        ? { value: canonical.value }
+                        : {}),
+                generation: ++this.aliasGeneration
+            };
+            this.aliasStore.set(signature, alias);
+            this._pushExpiry(signature, alias);
+            if (!aliasesByCanonicalKey.has(alias.canonicalKey)) {
+                aliasesByCanonicalKey.set(alias.canonicalKey, new Set());
+            }
+            aliasesByCanonicalKey.get(alias.canonicalKey).add(signature);
+        }
+
+        for (const [canonicalKey, aliases] of aliasesByCanonicalKey.entries()) {
+            const entry = this.store.get(canonicalKey);
+            if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+            let latestSignature = null;
+            for (const signature of aliases) latestSignature = signature;
+            this.store.set(canonicalKey, {
+                ...entry,
+                aliases,
+                latestSignature
+            });
+        }
     }
 
     _now() {
@@ -157,14 +207,116 @@ class RouteCache {
         return !entry || !Number.isFinite(entry.expiresAt) || entry.expiresAt <= now;
     }
 
-    _pruneExpired(now = this._now()) {
-        for (const [key, entry] of this.store.entries()) {
-            if (this._expired(entry, now)) this.store.delete(key);
+    _heapBefore(left, right) {
+        return left.expiresAt < right.expiresAt
+            || (left.expiresAt === right.expiresAt && left.sequence < right.sequence);
+    }
+
+    _pushExpiry(signature, alias) {
+        if (!Number.isFinite(alias?.expiresAt)) return;
+        const node = {
+            signature,
+            expiresAt: alias.expiresAt,
+            generation: alias.generation,
+            sequence: ++this.expirySequence
+        };
+        this.expiryHeap.push(node);
+        let index = this.expiryHeap.length - 1;
+        while (index > 0) {
+            const parent = Math.floor((index - 1) / 2);
+            if (!this._heapBefore(node, this.expiryHeap[parent])) break;
+            this.expiryHeap[index] = this.expiryHeap[parent];
+            index = parent;
         }
-        for (const [signature, alias] of this.aliasStore.entries()) {
-            if (this._expired(alias, now) || !this.store.get(alias.canonicalKey)) {
-                this.aliasStore.delete(signature);
+        this.expiryHeap[index] = node;
+    }
+
+    _popExpiry() {
+        if (!this.expiryHeap.length) return null;
+        const first = this.expiryHeap[0];
+        const last = this.expiryHeap.pop();
+        if (!this.expiryHeap.length) return first;
+
+        let index = 0;
+        while (true) {
+            const left = index * 2 + 1;
+            const right = left + 1;
+            if (left >= this.expiryHeap.length) break;
+            let child = left;
+            if (right < this.expiryHeap.length
+                && this._heapBefore(this.expiryHeap[right], this.expiryHeap[left])) {
+                child = right;
             }
+            if (!this._heapBefore(this.expiryHeap[child], last)) break;
+            this.expiryHeap[index] = this.expiryHeap[child];
+            index = child;
+        }
+        this.expiryHeap[index] = last;
+        return first;
+    }
+
+    _latestSignature(aliases) {
+        let latest = null;
+        for (const signature of aliases) latest = signature;
+        return latest;
+    }
+
+    _removeAlias(signature, providedAlias) {
+        const alias = providedAlias || this.aliasStore.get(signature);
+        if (!alias) return false;
+        this.aliasStore.delete(signature);
+
+        const entry = this.store.get(alias.canonicalKey);
+        if (!entry) return true;
+        if (!(entry.aliases instanceof Set)) {
+            this.store.delete(alias.canonicalKey);
+            return true;
+        }
+
+        entry.aliases.delete(signature);
+        if (!entry.aliases.size) {
+            this.store.delete(alias.canonicalKey);
+            return true;
+        }
+
+        if (entry.latestSignature === signature || !entry.aliases.has(entry.latestSignature)) {
+            entry.latestSignature = this._latestSignature(entry.aliases);
+            const latestAlias = this.aliasStore.get(entry.latestSignature);
+            if (latestAlias && Object.prototype.hasOwnProperty.call(latestAlias, 'value')) {
+                entry.value = latestAlias.value;
+            }
+        }
+        this.store.set(alias.canonicalKey, entry);
+        return true;
+    }
+
+    _touchAlias(signature, alias) {
+        this.aliasStore.delete(signature);
+        this.aliasStore.set(signature, alias);
+    }
+
+    _pruneExpired(now = this._now()) {
+        while (this.expiryHeap.length && this.expiryHeap[0].expiresAt <= now) {
+            const due = this._popExpiry();
+            const alias = this.aliasStore.get(due.signature);
+            if (!alias || alias.generation !== due.generation) continue;
+            if (this._expired(alias, now)) this._removeAlias(due.signature, alias);
+        }
+    }
+
+    _evictToLimit() {
+        while ((Number(this.aliasStore.size) || 0) > this.maxEntries) {
+            const oldest = this.aliasStore.entries().next();
+            if (oldest.done) break;
+            this._removeAlias(oldest.value[0], oldest.value[1]);
+        }
+    }
+
+    _compactExpiryHeap() {
+        if (this.expiryHeap.length <= Math.max(64, this.maxEntries * 2)) return;
+        this.expiryHeap = [];
+        for (const [signature, alias] of this.aliasStore.entries()) {
+            this._pushExpiry(signature, alias);
         }
     }
 
@@ -173,13 +325,37 @@ class RouteCache {
         const requestSignature = buildRouteRequestSignature(request);
         const now = this._now();
         const expiresAt = now + this.ttlMs;
+        this._pruneExpired(now);
+
+        const existingAlias = this.aliasStore.get(requestSignature);
+        if (existingAlias) this._removeAlias(requestSignature, existingAlias);
+
+        const cachedValue = clone(value);
+        const existingEntry = this.store.get(canonicalKey);
+        const aliases = existingEntry?.aliases instanceof Set
+            ? existingEntry.aliases
+            : new Set();
+        aliases.delete(requestSignature);
+        aliases.add(requestSignature);
+        const alias = {
+            canonicalKey,
+            value: cachedValue,
+            createdAt: now,
+            expiresAt,
+            generation: ++this.aliasGeneration
+        };
 
         this.store.set(canonicalKey, {
-            value: clone(value),
-            createdAt: now,
-            expiresAt
+            value: cachedValue,
+            createdAt: existingEntry?.createdAt ?? now,
+            expiresAt: Math.max(Number(existingEntry?.expiresAt) || 0, expiresAt),
+            aliases,
+            latestSignature: requestSignature
         });
-        this.aliasStore.set(requestSignature, { canonicalKey, expiresAt });
+        this.aliasStore.set(requestSignature, alias);
+        this._pushExpiry(requestSignature, alias);
+        this._evictToLimit();
+        this._compactExpiryHeap();
         return canonicalKey;
     }
 
@@ -190,17 +366,20 @@ class RouteCache {
         const now = this._now();
         const alias = this.aliasStore.get(requestSignature);
         if (this._expired(alias, now)) {
-            if (alias) this.aliasStore.delete(requestSignature);
+            if (alias) this._removeAlias(requestSignature, alias);
             return undefined;
         }
 
         const entry = this.store.get(alias.canonicalKey);
-        if (this._expired(entry, now)) {
-            this.aliasStore.delete(requestSignature);
-            if (entry) this.store.delete(alias.canonicalKey);
+        if (!entry || (!(entry.aliases instanceof Set) && this._expired(entry, now))) {
+            this._removeAlias(requestSignature, alias);
             return undefined;
         }
-        return clone(entry.value);
+        this._touchAlias(requestSignature, alias);
+        const cachedValue = Object.prototype.hasOwnProperty.call(alias, 'value')
+            ? alias.value
+            : entry.value;
+        return clone(cachedValue);
     }
 
     getByCanonicalKey(keyOrIdentity) {
@@ -208,7 +387,29 @@ class RouteCache {
             ? keyOrIdentity
             : buildRouteCacheKey(keyOrIdentity);
         const now = this._now();
+        this._pruneExpired(now);
         const entry = this.store.get(canonicalKey);
+        if (!entry) return undefined;
+        if (entry.aliases instanceof Set) {
+            while (entry.aliases.size) {
+                const requestSignature = entry.aliases.has(entry.latestSignature)
+                    ? entry.latestSignature
+                    : this._latestSignature(entry.aliases);
+                const alias = this.aliasStore.get(requestSignature);
+                if (alias && !this._expired(alias, now)) {
+                    this._touchAlias(requestSignature, alias);
+                    return clone(Object.prototype.hasOwnProperty.call(alias, 'value') ? alias.value : entry.value);
+                }
+                if (alias) {
+                    this._removeAlias(requestSignature, alias);
+                } else {
+                    entry.aliases.delete(requestSignature);
+                    entry.latestSignature = this._latestSignature(entry.aliases);
+                }
+            }
+            this.store.delete(canonicalKey);
+            return undefined;
+        }
         if (this._expired(entry, now)) {
             if (entry) this.store.delete(canonicalKey);
             return undefined;
@@ -222,6 +423,7 @@ class RouteCache {
         const cleared = this.store.size;
         this.store.clear();
         this.aliasStore.clear();
+        this.expiryHeap = [];
         this.lastInvalidationReason = diagnosticReason(reason);
         this.lastInvalidatedAt = new Date(now).toISOString();
         return cleared;
@@ -253,3 +455,4 @@ module.exports.RouteCache = RouteCache;
 module.exports.buildRouteCacheKey = buildRouteCacheKey;
 module.exports.buildRouteRequestSignature = buildRouteRequestSignature;
 module.exports.DEFAULT_TTL_MS = DEFAULT_TTL_MS;
+module.exports.DEFAULT_MAX_ENTRIES = DEFAULT_MAX_ENTRIES;

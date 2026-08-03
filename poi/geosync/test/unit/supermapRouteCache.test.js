@@ -6,7 +6,8 @@ const assert = require('node:assert/strict');
 const RouteCache = require('../../integrations/supermap/routeCache');
 const {
     buildRouteCacheKey,
-    buildRouteRequestSignature
+    buildRouteRequestSignature,
+    DEFAULT_MAX_ENTRIES
 } = RouteCache;
 
 function request(overrides = {}) {
@@ -86,6 +87,40 @@ test('RouteCache aliases a coordinate signature to a canonical snapped-node key'
     assert.deepEqual(cache.getByCanonicalKey(request()), route);
 });
 
+test('exact coordinate aliases sharing snapped nodes keep their own complete routes', () => {
+    const cache = new RouteCache({ clock: () => 1000 });
+    const firstRequest = request();
+    const secondRequest = request({
+        start: [120.000002, 30.000002],
+        end: [120.010002, 30.010002]
+    });
+    const firstRoute = {
+        requestMarker: 'first-exact-route',
+        geometry: { type: 'LineString', coordinates: [firstRequest.start, firstRequest.end] }
+    };
+    const secondRoute = {
+        requestMarker: 'second-exact-route',
+        geometry: { type: 'LineString', coordinates: [secondRequest.start, secondRequest.end] }
+    };
+
+    assert.equal(buildRouteCacheKey(firstRequest), buildRouteCacheKey(secondRequest));
+    assert.notEqual(buildRouteRequestSignature(firstRequest), buildRouteRequestSignature(secondRequest));
+
+    cache.set(firstRequest, firstRoute);
+    cache.set(secondRequest, secondRoute);
+
+    assert.deepEqual(cache.get(firstRequest), firstRoute);
+    assert.deepEqual(cache.get(secondRequest), secondRoute);
+    assert.deepEqual(cache.get(firstRequest), firstRoute);
+    assert.deepEqual(cache.getDiagnostics(), {
+        size: 1,
+        aliasCount: 2,
+        ttlMs: 60000,
+        lastInvalidationReason: null,
+        lastInvalidatedAt: null
+    });
+});
+
 test('set and get isolate cached routes with deep clones', () => {
     const cache = new RouteCache({ clock: () => 1000 });
     const original = {
@@ -103,6 +138,36 @@ test('set and get isolate cached routes with deep clones', () => {
 
     firstRead.segments[0].edgeId = 'MUTATED_READ';
     assert.equal(cache.get(request()).segments[0].edgeId, 'EDGE_10');
+});
+
+test('maxEntries evicts the least recently used exact route predictably', () => {
+    const cache = new RouteCache({ clock: () => 1000, maxEntries: 2 });
+    const firstRequest = request({ barriers: [], startNodeId: 'NODE_1A', endNodeId: 'NODE_1B' });
+    const secondRequest = request({
+        barriers: [],
+        start: [120.02, 30.02],
+        end: [120.03, 30.03],
+        startNodeId: 'NODE_2A',
+        endNodeId: 'NODE_2B'
+    });
+    const thirdRequest = request({
+        barriers: [],
+        start: [120.04, 30.04],
+        end: [120.05, 30.05],
+        startNodeId: 'NODE_3A',
+        endNodeId: 'NODE_3B'
+    });
+
+    cache.set(firstRequest, { marker: 'first' });
+    cache.set(secondRequest, { marker: 'second' });
+    assert.deepEqual(cache.get(firstRequest), { marker: 'first' });
+    cache.set(thirdRequest, { marker: 'third' });
+
+    assert.equal(cache.get(secondRequest), undefined);
+    assert.deepEqual(cache.get(firstRequest), { marker: 'first' });
+    assert.deepEqual(cache.get(thirdRequest), { marker: 'third' });
+    assert.equal(cache.size, 2);
+    assert.equal(cache.getDiagnostics().aliasCount, 2);
 });
 
 test('TTL expiry removes stale aliases and canonical entries', () => {
@@ -153,8 +218,38 @@ test('clear records sanitized diagnostics without keys, coordinates, or route pa
     assert.equal(cache.getDiagnostics().lastInvalidationReason, 'redacted');
 });
 
+test('getDiagnostics does not scan the full stores before entries expire', () => {
+    class CountingMap extends Map {
+        constructor() {
+            super();
+            this.entriesCalls = 0;
+        }
+
+        entries() {
+            this.entriesCalls++;
+            return super.entries();
+        }
+    }
+
+    const routeStore = new CountingMap();
+    const aliasStore = new CountingMap();
+    const cache = new RouteCache({ store: routeStore, aliasStore, clock: () => 1000 });
+    cache.set(request(), { distanceM: 1 });
+    const routeScans = routeStore.entriesCalls;
+    const aliasScans = aliasStore.entriesCalls;
+
+    cache.getDiagnostics();
+    cache.getDiagnostics();
+
+    assert.equal(routeStore.entriesCalls, routeScans);
+    assert.equal(aliasStore.entriesCalls, aliasScans);
+});
+
 test('constructor rejects invalid stores, clocks, and TTL values', () => {
+    assert.equal(new RouteCache().maxEntries, DEFAULT_MAX_ENTRIES);
     assert.throws(() => new RouteCache({ store: {} }), /Map-like/);
     assert.throws(() => new RouteCache({ clock: 'now' }), /clock/);
     assert.throws(() => new RouteCache({ ttlMs: 0 }), /ttlMs/);
+    assert.throws(() => new RouteCache({ maxEntries: 0 }), /maxEntries/);
+    assert.throws(() => new RouteCache({ maxEntries: 1.5 }), /maxEntries/);
 });
