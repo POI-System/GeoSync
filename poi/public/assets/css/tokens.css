@@ -1,0 +1,32 @@
+:root {
+    color-scheme: light;
+    --color-ink: #17222a;
+    --color-muted: #5e6a72;
+    --color-surface: #ffffff;
+    --color-canvas: #f3f6f5;
+    --color-line: #d8e0dd;
+    --color-primary: #087f73;
+    --color-primary-strong: #056158;
+    --color-accent: #d95d39;
+    --color-info: #2774ae;
+    --color-success: #167c45;
+    --color-warning: #a96200;
+    --color-danger: #b42318;
+    --crowd-low: #34c759;
+    --crowd-medium: #ffb020;
+    --crowd-high: #ff453a;
+    --crowd-unknown: #8e8e93;
+    --shadow-sheet: 0 -8px 28px rgba(23, 34, 42, 0.12);
+    --radius-sm: 4px;
+    --radius-md: 8px;
+    --touch-size: 44px;
+    --page-gutter: 16px;
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+    font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+}
+
+@media (min-width: 768px) {
+    :root {
+        --page-gutter: 24px;
+    }
+}

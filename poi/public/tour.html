@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+    <meta name="theme-color" content="#087f73">
+    <title>智游 GeoSync</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/assets/vendor/maplibre/maplibre-gl.css">
+    <link rel="stylesheet" href="/assets/css/tokens.css">
+    <link rel="stylesheet" href="/assets/css/shared.css">
+    <link rel="stylesheet" href="/assets/css/tour.css">
+</head>
+<body>
+    <a class="skip-link" href="#active-panel">跳到行程操作</a>
+    <main id="tour-app" aria-busy="true">
+        <header class="app-header">
+            <div class="brand-block">
+                <h1>智游 GeoSync</h1>
+                <p id="scenic-name">游客行程</p>
+            </div>
+            <div class="status-row" aria-label="连接状态">
+                <span class="status-pill" title="GIS 状态">
+                    <i id="map-status-dot" class="status-dot" data-state="connecting"></i>
+                    <span id="map-status-text">地图加载中</span>
+                </span>
+                <span class="status-pill" title="实时连接状态">
+                    <i id="socket-status-dot" class="status-dot" data-state="connecting"></i>
+                    <span id="socket-status-text">实时连接中</span>
+                </span>
+                <span class="status-pill" title="定位状态">
+                    <i id="location-status-dot" class="status-dot" data-state="idle"></i>
+                    <span id="location-status-text">未定位</span>
+                </span>
+            </div>
+        </header>
+
+        <section id="map-stage" class="map-stage" aria-label="景区地图">
+            <div id="tour-map"></div>
+            <div id="map-loading" class="map-loading" role="status"><p>正在加载景区地图…</p></div>
+            <div id="map-fallback" class="map-fallback hidden" role="alert">
+                <p id="map-fallback-message">地图暂不可用，行程列表仍可操作。</p>
+                <button id="retry-map" class="btn btn-secondary" type="button">重试地图</button>
+            </div>
+            <div id="rain-banner" class="rain-banner hidden" role="status"></div>
+            <div id="connection-banner" class="connection-banner hidden" role="status">实时连接中断，正在恢复</div>
+            <aside id="crowd-legend" class="crowd-legend" aria-label="拥挤等级图例">
+                <span id="crowd-confidence">实时人流</span>
+                <span class="legend-item"><i class="legend-swatch low"></i>舒适</span>
+                <span class="legend-item"><i class="legend-swatch medium"></i>较忙</span>
+                <span class="legend-item"><i class="legend-swatch high"></i>拥挤</span>
+                <span class="legend-item"><i class="legend-swatch unknown"></i>准备中</span>
+            </aside>
+        </section>
+
+        <section id="active-panel" class="bottom-sheet" aria-live="polite" tabindex="-1">
+            <div class="sheet-handle" aria-hidden="true"></div>
+
+            <section class="panel" data-panel="home">
+                <div class="panel-header"><div><h2>现在出发</h2><p class="panel-subtitle">按客流和开放状态查看景点</p></div></div>
+                <div class="home-summary">
+                    <div class="metric"><strong id="poi-count">0</strong><span>可游览景点</span></div>
+                    <div class="metric"><strong id="crowd-updated">--:--</strong><span>客流更新时间</span></div>
+                    <div class="metric"><strong id="active-state">未规划</strong><span>当前行程</span></div>
+                </div>
+                <div class="panel-actions">
+                    <button id="open-plan" class="btn btn-primary" type="button">帮我规划</button>
+                    <button id="open-spots" class="btn btn-secondary" type="button">摄影机位</button>
+                </div>
+                <h2 class="sr-only">景点列表</h2>
+                <ul id="poi-list" class="poi-list"></ul>
+            </section>
+
+            <section class="panel hidden" data-panel="plan">
+                <div class="panel-header">
+                    <div><h2>规划行程</h2><p class="panel-subtitle">选择本次游览偏好</p></div>
+                    <button class="icon-btn" type="button" data-back="home" aria-label="关闭规划">×</button>
+                </div>
+                <form id="plan-form" class="form-grid">
+                    <label class="field-group" for="hours-range">
+                        <span class="field-label">游览时长</span>
+                        <span class="range-row">
+                            <input id="hours-range" name="hours" type="range" min="1" max="12" step="1" value="4">
+                            <output id="hours-output" class="number-output" for="hours-range">4 小时</output>
+                        </span>
+                    </label>
+                    <fieldset class="field-group">
+                        <legend>兴趣</legend>
+                        <div class="chips">
+                            <label class="choice"><input type="checkbox" name="interests" value="photography" checked><span>摄影</span></label>
+                            <label class="choice"><input type="checkbox" name="interests" value="history"><span>人文</span></label>
+                            <label class="choice"><input type="checkbox" name="interests" value="nature"><span>自然</span></label>
+                            <label class="choice"><input type="checkbox" name="interests" value="family"><span>亲子</span></label>
+                        </div>
+                    </fieldset>
+                    <fieldset class="field-group">
+                        <legend>步行节奏</legend>
+                        <div class="segmented">
+                            <label class="choice"><input type="radio" name="pace" value="relaxed"><span>轻松</span></label>
+                            <label class="choice"><input type="radio" name="pace" value="normal" checked><span>适中</span></label>
+                            <label class="choice"><input type="radio" name="pace" value="tight"><span>紧凑</span></label>
+                        </div>
+                    </fieldset>
+                    <label class="switch-row"><span>无障碍路线</span><input name="accessible" type="checkbox"></label>
+                    <label class="switch-row"><span>遮荫优先</span><input name="shadeFirst" type="checkbox" checked></label>
+                    <div id="plan-message" class="notice hidden" role="status"></div>
+                    <button id="submit-plan" class="btn btn-primary" type="submit">生成路线</button>
+                </form>
+            </section>
+
+            <section class="panel hidden" data-panel="preview">
+                <div class="panel-header"><div><h2>路线预览</h2><p id="preview-note" class="panel-subtitle"></p></div><button class="icon-btn" type="button" data-back="plan" aria-label="返回规划">‹</button></div>
+                <div id="preview-metrics" class="home-summary"></div>
+                <div id="preview-badges" class="route-badges"></div>
+                <ol id="preview-timeline" class="timeline"></ol>
+                <div class="panel-actions">
+                    <button id="start-tour" class="btn btn-primary" type="button">开始游览</button>
+                    <button class="btn btn-secondary" type="button" data-back="plan">调整偏好</button>
+                </div>
+            </section>
+
+            <section class="panel hidden" data-panel="touring">
+                <div class="panel-header"><div><h2 id="tour-state-title">游览中</h2><p id="tour-next" class="panel-subtitle"></p></div></div>
+                <div id="tour-metrics" class="home-summary"></div>
+                <div id="tour-badges" class="route-badges"></div>
+                <ol id="tour-timeline" class="timeline"></ol>
+                <div class="action-grid">
+                    <button id="pause-tour" class="btn btn-secondary" type="button">暂停</button>
+                    <button id="resume-tour" class="btn btn-secondary hidden" type="button">继续</button>
+                    <button id="skip-stop" class="btn btn-secondary" type="button">跳过当前站</button>
+                    <button id="finish-tour" class="btn btn-danger" type="button">结束游览</button>
+                </div>
+            </section>
+
+            <section class="panel hidden" data-panel="proposal">
+                <div class="panel-header"><div><h2>路线调整建议</h2><p id="proposal-reason" class="panel-subtitle"></p></div></div>
+                <div id="proposal-countdown" class="notice" role="timer"></div>
+                <div id="proposal-metrics" class="proposal-grid"></div>
+                <div class="panel-actions">
+                    <button id="accept-proposal" class="btn btn-primary" type="button">接受新路线</button>
+                    <button id="reject-proposal" class="btn btn-secondary" type="button">保留原路线</button>
+                </div>
+            </section>
+
+            <section class="panel hidden" data-panel="completed">
+                <div class="panel-header"><div><h2>本次游览已结束</h2><p class="panel-subtitle">行程状态已同步</p></div></div>
+                <div id="completed-metrics" class="home-summary"></div>
+                <div class="panel-actions"><button id="return-home" class="btn btn-primary" type="button">返回首页</button></div>
+            </section>
+
+            <section class="panel hidden" data-panel="spot">
+                <div class="panel-header">
+                    <div><h2 id="spot-title">摄影机位</h2><p id="spot-subtitle" class="panel-subtitle">今日光线与人流</p></div>
+                    <button class="icon-btn" type="button" data-back="home" aria-label="关闭摄影机位">×</button>
+                </div>
+                <div id="spot-detail"></div>
+                <ul id="spot-list" class="spot-list"></ul>
+                <div class="panel-actions"><button id="open-scene" class="btn btn-secondary" type="button" disabled>三维场景不可用</button></div>
+            </section>
+        </section>
+    </main>
+
+    <div id="toast" class="toast hidden" role="status" aria-live="assertive"></div>
+    <div id="live-region" class="sr-only" aria-live="polite"></div>
+
+    <script src="/assets/vendor/maplibre/maplibre-gl.js"></script>
+    <script src="/assets/vendor/supermap-iclient/iclient-maplibregl.min.js"></script>
+    <script src="/assets/vendor/socket.io/socket.io.min.js"></script>
+    <script type="module" src="/assets/js/pages/tour.js"></script>
+</body>
+</html>
