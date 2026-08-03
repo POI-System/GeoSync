@@ -7,6 +7,7 @@
 - 本地化 MapLibreGL、SuperMap iClient 和 Socket.io Client，无 CDN 运行依赖。
 - 新增摄影机位详情、黄金窗口和受配置控制的三维入口。
 - 新增 Playwright 主闭环、模块契约、定位拒绝和四视口测试及正式截图。
+- 新增 `MAP_FACADE_HANDOFF.md`，提供给邵建鹏直接接入的公共方法、事件、颜色和 API Client 约定。
 
 ## 接口、配置或依赖变化
 
@@ -19,6 +20,8 @@
 ```text
 npm.cmd run vendor:sync
 npm.cmd run check:tour-offline
+npm.cmd run check:tour-syntax
+npm.cmd run test:tour:unit
 npm.cmd run test:tour
 npm.cmd run check:syntax
 npm.cmd test
@@ -26,9 +29,10 @@ npm.cmd test
 
 实际结果：
 
-- 游客端 Playwright：`9/9` 通过。
+- 游客端 Playwright：`29/29` 通过。
+- 游客端纯函数：`17/17` 通过。
 - 后端全量测试：`481/481` 通过。
-- Node 语法检查：通过。
+- 游客端语法检查：27 个文件通过；后端 Node 语法检查通过。
 - 离线资源扫描：通过，固定版本为 SuperMap iClient `12.1.0-r`、MapLibreGL `5.6.0`、Socket.io Client `4.7.4`。
 - 演示环境性能断言：首图 `<3s`、封路通知到提案 `<5s`、接受后完整状态替换 `<2s`。
 
@@ -41,6 +45,8 @@ npm.cmd test
 - `docs/screenshots/tour-route-preview.png`
 - `docs/screenshots/tour-reroute-proposal.png`
 - `docs/screenshots/tour-photo-spot.png`
+
+`docs/screenshots/tour-viewport-*.png` 另包含 4 个视口 × 9 种流程/异常/可访问性状态，共 36 张；仓库内正式 PNG 合计 43 张。
 
 ## 已知问题
 

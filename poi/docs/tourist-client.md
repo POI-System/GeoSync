@@ -32,16 +32,20 @@ home -> plan -> preview -> touring -> proposal -> completed
                                  \-> spot/:id
 ```
 
-刷新时重新请求 `/api/itinerary/current`。任何写操作均使用响应中的完整行程替换本地行程，Socket 事件只触发 REST 校准。
+刷新时重新请求 `/api/itinerary/current`。规划、开始、暂停、继续、跳过、结束和接受提案成功时，使用响应中的完整行程整体替换本地行程。拒绝提案的现有后端响应只有 `{version}`，客户端必须随后请求 `current`，不得把该局部响应写成完整行程。Socket 事件只触发 REST 校准，不直接修改站点、ETA 或 version。
+
+`/api/itinerary/current` 当前只返回 `draft`、`active` 或 `paused` 行程。结束操作的响应可在当前会话展示完成路线和时刻表，但刷新后无法通过 `current` 恢复已完成行程；该限制已记录在 `LZY_FRONTEND_CONTRACT_GAPS.md`。
 
 ## 共享地图
 
 公共入口是 `public/assets/js/map/mapFacade.js` 的 `MapFacade`。运营端只允许调用其公开方法，不直接引用 `geosync-*` source 或 layer ID。
 
+完整接入示例、图层规范、颜色和 API Client 方法见 `MAP_FACADE_HANDOFF.md`。
+
 对外事件：
 
 - `poi:selected`：`{ poiId, feature }`
-- `route:compared`：`{ distanceDeltaM, durationDeltaSec, reason }`
+- `route:compared`：`{ distanceDeltaM, durationDeltaSec, reason, degraded, beforeSource, afterSource }`
 - `map:error`：`{ code, message }`
 
 初始化失败同时抛出 `MapFacadeError`，其 `code` 为 `MAP_SDK_LOAD_FAILED`、`MAP_SERVICE_UNAVAILABLE` 或 `MAP_CONFIG_INVALID`。
@@ -55,6 +59,7 @@ home -> plan -> preview -> touring -> proposal -> completed
 | 定位拒绝 | 保留地图手动浏览和纯列表游览 |
 | 定位精度超过 100 米 | 显示低精度状态，不自动移动地图中心 |
 | 2102 | 停止位置上报并显示离开景区 |
+| 2103 | 显示定位精度过差；该样本不计为服务端已接受 |
 | 1203 | 关闭过期本地状态并重新拉取 current |
 | 1204/1205 | 关闭失效提案并刷新行程 |
 | 8204 | 提示无已验证无障碍路线，由用户主动切换模式 |
@@ -64,17 +69,21 @@ home -> plan -> preview -> touring -> proposal -> completed
 ```powershell
 npm.cmd run vendor:sync
 npm.cmd run check:tour-offline
+npm.cmd run check:tour-syntax
+npm.cmd run test:tour:unit
 npm.cmd run test:tour
 npm.cmd run check:syntax
 npm.cmd test
 ```
 
-正式截图位于 `docs/screenshots/`，包含 375×812、390×844、768×1024、1366×768、路线预览、改道提案和摄影点详情。
+正式截图位于 `docs/screenshots/`。其中视口矩阵在 375×812、390×844、768×1024、1366×768 下分别覆盖首页、规划、预览、地图失败列表模式、Socket 断线、定位拒绝、提案、200% 字体和安全区，共 36 张；另有 7 张主流程截图，共 43 张。
 
-本次验证结果：游客端 Playwright `9/9`、后端测试 `481/481`；语法检查与离线资源扫描通过。演示环境的首个可交互地图小于 3 秒、封路通知到提案小于 5 秒、接受提案后完整状态替换小于 2 秒，均由 Playwright 时限断言覆盖。
+2026-08-03 最终本地验证结果为：游客端 Playwright `29/29`、纯函数 `17/17`、后端测试 `481/481`，前后端语法检查与离线资源扫描通过。Playwright 时限断言只证明本地 Mock 演示链路满足首个可交互地图小于 3 秒、封路通知到提案小于 5 秒、接受提案后完整状态替换小于 2 秒；它不能替代真实 iServer、真实 Socket 和微信 H5 环境的性能验收。逐项证据与未签字项见 `TOUR_ACCEPTANCE_EVIDENCE.md`。
 
-## 当前上游契约缺口
+## 当前上游契约差异
 
-截至 LZY 提交 `087d4c9`，公开的 `pendingProposal` 与 `itinerary:proposal` 只包含原因、收益、到期时间和站点 ID 差异，不包含新路线 GeoJSON、距离变化或耗时变化。前端已经兼容 `beforeRoute`、`afterRoute`、`distanceDeltaM` 和 `durationDeltaSec`；上游未提供这些字段时会明确显示“服务端暂未提供新路线几何”，不会在本地推算或伪造路线。
+完整审计结论见 `LZY_FRONTEND_CONTRACT_GAPS.md`。该清单是给 LZY/SXR 的联调输入，本次没有修改后端。
 
-同一提交中的 `graph:update` 只包含 `edgeId`、状态、原因和时间，不包含公开路段几何。游客端会保留封路状态并提示可能改道；收到几何时可直接通过 `setClosedEdges` 渲染。正式环境若要求在提案前绘制封闭路段，需要 LZY/SXR 在公开事件或配置数据中补充 EPSG:4326 几何。
+截至 `origin/LZY@5792852`，公开提案仍不包含新路线 GeoJSON、距离变化或耗时变化，`graph:update` 仍不包含路段几何。游客端在字段缺失时必须显示“服务端暂未提供”，不得根据 `gainMin` 推算时长差、把缺失距离显示为零或伪造路线。正式环境若要求提案前比较路线或绘制封闭路段，需要 LZY/SXR 补充公开、脱敏的 EPSG:4326 数据。
+
+同一实际契约中，位置 `2102/2103` 是 `success:true` 的 soft code，客流 `lowConfidence` 位于 heatmap 顶层，拒绝提案只返回 `{version}`，已完成行程也无法通过 `/current` 刷新恢复。客户端需按差异清单兼容这些结构；真实 GIS、三维入口和性能结果仍需服务可用后联调确认。
