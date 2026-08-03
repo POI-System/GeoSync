@@ -16,6 +16,7 @@ const { OAuthStateStore } = require('./geosync/services/oauthState');
 const { serializePublicPoi } = require('./geosync/services/publicPoiProjection');
 const { createHostSocketRoomSync } = require('./geosync/services/hostSocketRooms');
 const { createFixedWindowRateLimiter } = require('./geosync/services/fixedWindowRateLimiter');
+const { monitorInitialMongoConnection } = require('./geosync/services/mongoStartup');
 const {
     COLLECTOR_TEMPLATE_LABEL,
     normalizeAudience,
@@ -153,11 +154,13 @@ if (!ocrEnabled) console.warn('[OCR] 未配置阿里云 AK/SK,自动分类将跳
 
 mongoose.set('bufferCommands', false);
 
-mongoose.connect(CONFIG.mongoUri, {
+void monitorInitialMongoConnection(mongoose.connect(CONFIG.mongoUri, {
     serverSelectionTimeoutMS: 5000
-})
-    .then(() => console.log('[DB] MongoDB connected'))
-    .catch(e => console.error('[DB] connect failed:', e.message));
+}), {
+    nodeEnv: CONFIG.nodeEnv,
+    failFastOverride: process.env.MONGO_STARTUP_FAIL_FAST,
+    logger: console
+});
 
 const userSchema = new mongoose.Schema({
     openId: { type: String, required: true, unique: true, index: true, trim: true },

@@ -87,20 +87,47 @@ function baseOptions(overrides = {}) {
     };
 }
 
-test('factory forwards route environment values and converts cache TTL seconds to milliseconds', () => {
+test('factory accepts common boolean forms and forwards route timing values', () => {
     const gateway = createSuperMapGateway(baseOptions({
         env: {
-            SUPERMAP_ENABLED: 'true',
+            SUPERMAP_ENABLED: '1',
             SUPERMAP_TIMEOUT_MS: '4321',
+            SUPERMAP_MANIFEST_RETRY_MS: '23456',
             SUPERMAP_CACHE_TTL_S: '12.5',
-            SUPERMAP_FALLBACK_ENABLED: 'false'
+            SUPERMAP_FALLBACK_ENABLED: 'off'
         }
     }));
 
     assert.equal(gateway.enabled, true);
     assert.equal(gateway.routeTimeoutMs, 4321);
+    assert.equal(gateway.manifestFailureTtlMs, 23456);
     assert.equal(gateway.routeCache.ttlMs, 12500);
     assert.equal(gateway.fallbackEnabled, false);
+});
+
+test('factory warns and uses safe defaults for unknown boolean environment values', () => {
+    const warnings = [];
+    const gateway = createSuperMapGateway(baseOptions({
+        env: {
+            SUPERMAP_ENABLED: 'sometimes',
+            SUPERMAP_FALLBACK_ENABLED: 'perhaps'
+        },
+        logger: {
+            info() {},
+            error() {},
+            warn(message, metadata) { warnings.push({ message, metadata }); }
+        }
+    }));
+
+    assert.equal(gateway.enabled, true);
+    assert.equal(gateway.fallbackEnabled, true);
+    assert.deepStrictEqual(warnings, [{
+        message: '[GeoSync] [GIS] SUPERMAP_ENABLED has an invalid boolean value; using the default',
+        metadata: { fallback: true }
+    }, {
+        message: '[GeoSync] [GIS] SUPERMAP_FALLBACK_ENABLED has an invalid boolean value; using the default',
+        metadata: { fallback: true }
+    }]);
 });
 
 test('explicit route options override environment defaults and reach the Gateway', () => {

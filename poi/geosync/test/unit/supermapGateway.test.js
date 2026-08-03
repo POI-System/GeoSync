@@ -128,6 +128,45 @@ test('missing manifest reports offline without making HTTP requests', async () =
     );
 });
 
+test('failed manifest loads are retried automatically after the failure TTL', async () => {
+    let nowMs = Date.parse('2026-08-03T00:00:00.000Z');
+    let available = false;
+    let loads = 0;
+    const client = new MockHttpClient({ fixtures: statusFixtures() });
+    const instance = new SuperMapGateway({
+        manifestPath: '/eventually-available.json',
+        manifestLoader: () => {
+            loads++;
+            return available ? validManifestResult() : {
+                ok: false,
+                state: 'offline',
+                manifest: null,
+                publicConfig: null,
+                error: { code: 'SUPERMAP_MANIFEST_READ_ERROR', message: 'manifest temporarily unavailable' }
+            };
+        },
+        httpClient: client,
+        clock: () => new Date(nowMs),
+        logger: { info() {}, warn() {}, error() {} },
+        manifestFailureTtlMs: 30_000,
+        statusCacheMs: 0
+    });
+
+    assert.equal((await instance.getStatus()).state, 'offline');
+    assert.equal(loads, 1);
+
+    available = true;
+    nowMs += 29_999;
+    assert.equal((await instance.getStatus()).state, 'offline');
+    assert.equal(loads, 1);
+
+    nowMs += 1;
+    const recovered = await instance.getStatus();
+    assert.equal(recovered.state, 'online');
+    assert.equal(loads, 2);
+    assert.equal(client.history.length, 3);
+});
+
 test('disabled gateways reject feature queries as non-retryable configuration failures', async () => {
     const instance = gateway({ enabled: false });
 

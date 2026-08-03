@@ -102,6 +102,14 @@ and simulator controls. Blank optional provider values disable their feature.
 Core production configuration includes:
 
 - `MONGO_URI`: the shared POI/GeoSync MongoDB database.
+- `MONGO_STARTUP_FAIL_FAST`: optional literal `true` or `false`. When blank or
+  unset, an initial MongoDB connection failure terminates the process in
+  production and remains observable without terminating in development/test.
+  Production should keep the default fail-fast behavior. Use `false` only for a
+  reviewed diagnostic window where serving liveness without database-backed POI
+  traffic is intentional. Invalid values do not disable the environment default,
+  and startup logs contain only sanitized error codes, never the MongoDB URI or
+  driver error message.
 - `ADMIN_USERNAME` and `ADMIN_PASSWORD`: required for administrator login.
 - `ADMIN_TOKEN`: optional. When supplied it must be a separate strong opaque
   Bearer credential; it is never accepted in query strings or request bodies.
@@ -173,9 +181,16 @@ SuperMap server-side configuration includes:
 - `ISERVER_PASSWORD`
 - `SUPERMAP_TIMEOUT_MS`
 - `SUPERMAP_HEALTH_TIMEOUT_MS`
+- `SUPERMAP_MANIFEST_RETRY_MS`
 - `SUPERMAP_CACHE_TTL_S`
 - `SUPERMAP_FALLBACK_ENABLED`
 - `SUPERMAP_MAX_RETRIES`
+
+`SUPERMAP_MANIFEST_RETRY_MS` controls the short cache applied only to failed
+manifest loads. The default is 30000 ms. After that interval, ordinary health,
+query, route, and public-config calls retry the manifest automatically; an
+operator does not need to call the forced administrator status endpoint to
+recover from a transient file-read or mount-order failure.
 
 `ISERVER_BASE`, usernames, passwords, MongoDB URIs, reviewer identities, session
 secrets, and administrator or screen tokens must never appear in
@@ -461,16 +476,23 @@ tests do not prove that the seeded production graph is ready.
 
 Start the single service, then verify both the legacy POI surface and GeoSync:
 
-1. `GET /api/client-config` returns HTTP 200.
-2. `GET /api/geosync/client-config` returns HTTP 200 and contains no credentials,
+1. `GET /api/geosync/health/live` returns HTTP 200 and only proves that the Node.js
+   process can answer HTTP. Never use it as a traffic-readiness check.
+2. `GET /api/geosync/health/ready` returns HTTP 503 while the shared MongoDB
+   connection is unavailable. With MongoDB online it returns HTTP 200; when
+   GeoSync graph/index/jobs are still pending or failed it reports
+   `state=degraded` and `geosyncReady=false` so the host POI service is not removed
+   from the load balancer solely because an attached GeoSync component is down.
+3. `GET /api/client-config` returns HTTP 200.
+4. `GET /api/geosync/client-config` returns HTTP 200 and contains no credentials,
    private service paths, MongoDB URI, administrator token, or dataset allowlist.
-3. `GET /api/geosync/health` reports MongoDB, graph, jobs, GIS, manifest, route
+5. `GET /api/geosync/health` reports MongoDB, graph, jobs, GIS, manifest, route
    cache count, last invalidation reason, and last successful GIS time.
-4. `GET /api/admin/geosync/gis/status` succeeds only with a valid signed
+6. `GET /api/admin/geosync/gis/status` succeeds only with a valid signed
    administrator session or configured administrator Bearer token.
-5. `POST /api/admin/geosync/gis/route-test` succeeds only with the same
+7. `POST /api/admin/geosync/gis/route-test` succeeds only with the same
    administrator authentication and is used only for smoke testing.
-6. `POST /api/admin/screen/session` issues a short-lived, signed HttpOnly screen
+8. `POST /api/admin/screen/session` issues a short-lived, signed HttpOnly screen
    session only after administrator authentication; it never places the raw
    `SCREEN_TOKEN` in the cookie. `POST /api/admin/screen/logout` clears the
    session. The optional opaque screen token must never be sent in a URL. Verify
@@ -508,9 +530,10 @@ and representative raw responses.
 | Mode unreachable | HTTP/code `8204` | Verify network attributes; never bypass accessible checks |
 | Contract/dataVersion mismatch | HTTP/code `8205`; cache must not be trusted | Align manifest, network publication, and sourceRef mapping |
 | Invalid upstream geometry | HTTP/code `8206` | Capture a sanitized representative response for adapter work |
-| MongoDB unavailable | Health HTTP 503 | Remove traffic, restore database connectivity, then recheck |
-| Graph or POI index startup pending/failed | Health HTTP 503 with component state | Repair database/index data or startup configuration, restart, and wait for readiness |
-| Jobs requested but scheduler failed | Health HTTP 503 and `jobs.state=failed` | Repair scheduler startup; non-primary/background-disabled states are intentional and named |
+| MongoDB unavailable | `/api/geosync/health` and `/api/geosync/health/ready` return HTTP 503 | Remove traffic, restore database connectivity, then recheck |
+| Graph or POI index startup pending/failed | Detailed `/api/geosync/health` returns HTTP 503; host-aware `/api/geosync/health/ready` returns HTTP 200 with `state=degraded` and `geosyncReady=false` | Keep host POI traffic available while repairing database/index data or startup configuration |
+| Jobs requested but scheduler failed | Detailed `/api/geosync/health` returns HTTP 503 with `jobs.state=failed`; host-aware readiness remains HTTP 200 degraded while MongoDB is online | Repair scheduler startup; non-primary/background-disabled states are intentional and named |
+| Initial MongoDB connection fails in production | Process exits with code 1 after a sanitized `MONGO_STARTUP_FAILED` log | Restore MongoDB connectivity or configuration, then let the service manager restart the process; do not disable fail-fast as a permanent workaround |
 | `AUTH_SESSION_SECRET` missing or unsafe | Session issuance/authentication fails closed; login may return HTTP 503 | Inject an independent random secret of at least 32 bytes and restart |
 | `SCREEN_TOKEN` missing or unsafe | Opaque `X-Screen-Token` access is rejected; the signed administrator-issued screen session remains available | Configure a distinct strong token only if non-cookie header access is operationally required |
 | Signed screen session expired | Screen-only request returns HTTP 403 | Authenticate as an administrator and issue a new bounded screen session; do not reuse or extend the expired cookie client-side |

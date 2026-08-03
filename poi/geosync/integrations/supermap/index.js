@@ -6,9 +6,28 @@ const createHttpClient = require('./httpClient');
 const { IServerUnavailableError } = require('./errors');
 const { loadManifestSafe } = require('./manifest');
 
+const TRUE_VALUES = new Set(['1', 'true', 'yes', 'on']);
+const FALSE_VALUES = new Set(['0', 'false', 'no', 'off']);
+
 function booleanValue(value, fallback) {
     if (value === undefined || value === null || value === '') return fallback;
-    return String(value).trim().toLowerCase() === 'true';
+    const normalized = String(value).trim().toLowerCase();
+    if (TRUE_VALUES.has(normalized)) return true;
+    if (FALSE_VALUES.has(normalized)) return false;
+    return fallback;
+}
+
+function environmentBoolean(env, key, fallback, logger) {
+    const value = env[key];
+    const normalized = value === undefined || value === null
+        ? ''
+        : String(value).trim().toLowerCase();
+    if (normalized && !TRUE_VALUES.has(normalized) && !FALSE_VALUES.has(normalized)) {
+        logger.warn?.(`[GeoSync] [GIS] ${key} has an invalid boolean value; using the default`, {
+            fallback
+        });
+    }
+    return booleanValue(value, fallback);
 }
 
 function positiveNumber(value, fallback) {
@@ -46,7 +65,7 @@ function createSuperMapGateway(options = {}) {
     const logger = options.logger || console;
     const manifestPath = options.manifestPath || manifestPathOf(env.SUPERMAP_MANIFEST_PATH, cwd);
     let enabled = options.enabled === undefined
-        ? booleanValue(env.SUPERMAP_ENABLED, true)
+        ? environmentBoolean(env, 'SUPERMAP_ENABLED', true, logger)
         : Boolean(options.enabled);
     let httpClient = options.httpClient;
     let clientConfigurationError = null;
@@ -82,6 +101,10 @@ function createSuperMapGateway(options = {}) {
         queryTimeoutMs: positiveNumber(env.SUPERMAP_TIMEOUT_MS, 5000),
         routeTimeoutMs: positiveNumber(options.routeTimeoutMs ?? env.SUPERMAP_TIMEOUT_MS, 5000),
         statusCacheMs: positiveNumber(options.statusCacheMs, 5000),
+        manifestFailureTtlMs: nonNegativeNumber(
+            options.manifestFailureTtlMs ?? env.SUPERMAP_MANIFEST_RETRY_MS,
+            30_000
+        ),
         routeCache: options.routeCache,
         routeCacheStore: options.routeCacheStore,
         routeAliasStore: options.routeAliasStore,
@@ -92,7 +115,7 @@ function createSuperMapGateway(options = {}) {
         ),
         localPathSource: options.localPathSource || options.localRouteSource,
         fallbackEnabled: options.fallbackEnabled === undefined
-            ? booleanValue(env.SUPERMAP_FALLBACK_ENABLED, true)
+            ? environmentBoolean(env, 'SUPERMAP_FALLBACK_ENABLED', true, logger)
             : Boolean(options.fallbackEnabled),
         maxSnapDistanceM: positiveNumber(options.maxSnapDistanceM, 200),
         boundsBufferDeg: nonNegativeNumber(options.boundsBufferDeg, 0)
@@ -102,6 +125,7 @@ function createSuperMapGateway(options = {}) {
 module.exports = {
     createSuperMapGateway,
     booleanValue,
+    environmentBoolean,
     positiveNumber,
     nonNegativeNumber,
     manifestPathOf

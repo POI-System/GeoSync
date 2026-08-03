@@ -222,7 +222,10 @@ test('GeoSync Phase 5 cross-module workflows', { concurrency: false }, async t =
                 });
             }
         });
-        const routeBetween = createRouteBetween(gateway, { scenicId: SCENIC_ID });
+        const routeBetween = createRouteBetween(gateway, {
+            scenicId: SCENIC_ID,
+            closedBarrierProvider: async () => ({ barriers: [] })
+        });
         const start = { gateNodeId: 'GATE_A', geo: { coordinates: [120, 30] } };
         const firstEnd = { gateNodeId: 'GATE_B', geo: { coordinates: [120.01, 30.01] } };
 
@@ -288,7 +291,10 @@ test('GeoSync Phase 5 cross-module workflows', { concurrency: false }, async t =
                 }
             }
         });
-        const routeBetween = createRouteBetween(gateway, { scenicId: SCENIC_ID });
+        const routeBetween = createRouteBetween(gateway, {
+            scenicId: SCENIC_ID,
+            closedBarrierProvider: async () => ({ barriers: [] })
+        });
         const poiRows = [{
             _id: 'poi-one',
             geo: { type: 'Point', coordinates: [120.005, 30.005] },
@@ -553,7 +559,10 @@ test('GeoSync Phase 5 cross-module workflows', { concurrency: false }, async t =
             },
             clock: () => new Date()
         });
-        const routeBetween = createRouteBetween(gateway, { scenicId: SCENIC_ID });
+        const routeBetween = createRouteBetween(gateway, {
+            scenicId: SCENIC_ID,
+            closedBarrierProvider: async () => ({ barriers: [] })
+        });
 
         try {
             modelModule.getModels = () => fakeModels;

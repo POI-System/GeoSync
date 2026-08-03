@@ -1,6 +1,9 @@
 'use strict';
 
+const { ContractMismatchError } = require('../integrations/supermap/errors');
+
 const ROUTE_MODES = new Set(['normal', 'accessible', 'shade']);
+const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
 
 function isObject(value) {
     return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -62,6 +65,49 @@ function barriersOf(value) {
     return value;
 }
 
+function explicitBarriersOf(context) {
+    if (!Array.isArray(context.barriers)) {
+        throw new TypeError('explicit route barriers must be an array');
+    }
+    return context.barriers;
+}
+
+function snapshotBarriers(value) {
+    if (!isObject(value)) throw new TypeError('closed barrier provider must return a snapshot object');
+    if (!Array.isArray(value.barriers)) {
+        throw new TypeError('closed barrier snapshot must contain a barriers array');
+    }
+    return value.barriers;
+}
+
+function barrierSnapshotError(requestId) {
+    return new ContractMismatchError(
+        '当前封路状态不可验证，路径规划已安全停止',
+        { operation: 'loadClosedBarrierSnapshot', requestId }
+    );
+}
+
+function createClosedBarrierLoader(provider, scenicId) {
+    let inFlight = null;
+
+    return async function loadClosedBarriers(requestId) {
+        let task = inFlight;
+        if (!task) {
+            task = Promise.resolve().then(() => provider({ scenicId }));
+            inFlight = task;
+            void task.finally(() => {
+                if (inFlight === task) inFlight = null;
+            }).catch(() => undefined);
+        }
+
+        try {
+            return snapshotBarriers(await task);
+        } catch {
+            throw barrierSnapshotError(requestId);
+        }
+    };
+}
+
 function createLocalPathSource(walkGraph) {
     if (!walkGraph || typeof walkGraph.findLocalPath !== 'function') {
         throw new TypeError('createLocalPathSource requires walkGraph.findLocalPath');
@@ -88,16 +134,18 @@ function createRouteBetween(gateway, options = {}) {
     if (!isObject(options)) throw new TypeError('route adapter options must be an object');
     const scenicId = String(options.scenicId || '').trim();
     if (!scenicId) throw new TypeError('createRouteBetween requires scenicId');
+    if (typeof options.closedBarrierProvider !== 'function') {
+        throw new TypeError('createRouteBetween requires closedBarrierProvider');
+    }
+    const loadClosedBarriers = createClosedBarrierLoader(options.closedBarrierProvider, scenicId);
 
     return async function routeBetween(from, to, mode = 'normal', rawContext = {}) {
         const context = callContext(rawContext);
-        const barriers = barriersOf(context.barriers);
         const input = {
             start: coordinatesOf(from, 'route start'),
             end: coordinatesOf(to, 'route end'),
             mode: routeMode(mode),
-            scenicId,
-            barriers
+            scenicId
         };
         const startNodeId = nodeIdOf(from);
         const endNodeId = nodeIdOf(to);
@@ -106,6 +154,11 @@ function createRouteBetween(gateway, options = {}) {
         if (context.requestId !== undefined && context.requestId !== null) {
             input.requestId = context.requestId;
         }
+
+        const barriers = hasOwn(context, 'barriers')
+            ? explicitBarriersOf(context)
+            : await loadClosedBarriers(context.requestId);
+        input.barriers = barriers;
 
         return barriers.length > 0
             ? gateway.findPathWithBarriers(input)

@@ -7,11 +7,17 @@ const {
     createRouteBetween
 } = require('../../services/gisRouting');
 
+const emptyBarrierProvider = async () => ({ barriers: [] });
+
 test('routing adapter factories reject missing dependencies and scenic identity', () => {
     assert.throws(() => createLocalPathSource(), TypeError);
     assert.throws(() => createLocalPathSource({}), TypeError);
     assert.throws(() => createRouteBetween(), TypeError);
     assert.throws(() => createRouteBetween({ findPath() {}, findPathWithBarriers() {} }), TypeError);
+    assert.throws(() => createRouteBetween({
+        findPath() {},
+        findPathWithBarriers() {}
+    }, { scenicId: 'test-scenic' }), /closedBarrierProvider/);
 });
 
 test('local path source validates canonical input and delegates without inventing a route', async () => {
@@ -73,7 +79,7 @@ test('routeBetween converts POI and anchor coordinates, maps standard mode, and 
             calls.push({ method: 'findPathWithBarriers', input });
             return expected;
         }
-    }, { scenicId: 'test-scenic' });
+    }, { scenicId: 'test-scenic', closedBarrierProvider: emptyBarrierProvider });
 
     const result = await routeBetween(
         { gateNodeId: 'GATE_A', location: { lng: 120, lat: 30 } },
@@ -110,7 +116,14 @@ test('routeBetween accepts anchor coordinate shapes and only uses barrier routin
             return { method: 'findPathWithBarriers' };
         }
     };
-    const routeBetween = createRouteBetween(gateway, { scenicId: 'test-scenic' });
+    let snapshotLoads = 0;
+    const routeBetween = createRouteBetween(gateway, {
+        scenicId: 'test-scenic',
+        closedBarrierProvider: async () => {
+            snapshotLoads++;
+            return { barriers: [] };
+        }
+    });
 
     await routeBetween([120, 30], { coordinates: [120.1, 30.1] }, 'shade', []);
     await routeBetween(
@@ -127,6 +140,84 @@ test('routeBetween accepts anchor coordinate shapes and only uses barrier routin
     assert.deepStrictEqual(calls[1].input.barriers, [{ edgeId: 'E-2' }, { edgeId: 'E-1' }]);
     assert.equal(calls[1].input.requestId, 'barrier-route');
     assert.equal(calls[1].input.mode, 'accessible');
+    assert.equal(snapshotLoads, 0, 'explicit barrier arrays must bypass snapshot loading');
+});
+
+test('routeBetween loads the authoritative snapshot for ordinary calls and reuses an in-flight load', async () => {
+    const calls = [];
+    let loads = 0;
+    let releaseSnapshot;
+    const firstSnapshot = new Promise(resolve => { releaseSnapshot = resolve; });
+    const routeBetween = createRouteBetween({
+        async findPath(input) {
+            calls.push({ method: 'findPath', input });
+            return input;
+        },
+        async findPathWithBarriers(input) {
+            calls.push({ method: 'findPathWithBarriers', input });
+            return input;
+        }
+    }, {
+        scenicId: 'test-scenic',
+        closedBarrierProvider: async input => {
+            loads++;
+            assert.deepStrictEqual(input, { scenicId: 'test-scenic' });
+            if (loads === 1) return firstSnapshot;
+            return { barriers: [] };
+        }
+    });
+
+    const pending = [0, 1, 2].map(index => routeBetween(
+        [120 + index * 0.001, 30],
+        [120.01 + index * 0.001, 30.01],
+        'normal',
+        { requestId: `request-${index}` }
+    ));
+    await Promise.resolve();
+    assert.equal(loads, 1, 'concurrent planner legs must share the in-flight snapshot query');
+
+    const barriers = [{
+        edgeId: 'E-CLOSED',
+        sourceRef: { datasetName: 'WalkEdge@Test', smId: 7 }
+    }];
+    releaseSnapshot({ barriers });
+    await Promise.all(pending);
+
+    assert.equal(calls.length, 3);
+    assert.ok(calls.every(call => call.method === 'findPathWithBarriers'));
+    assert.ok(calls.every(call => call.input.barriers === barriers));
+
+    await routeBetween([120, 30], [120.02, 30.02], 'shade', { requestId: 'later-request' });
+    assert.equal(loads, 2, 'a completed load must not become a stale cross-request cache');
+    assert.equal(calls.at(-1).method, 'findPath');
+});
+
+test('routeBetween fails closed with an HTTP-mappable error when the barrier snapshot is unavailable', async () => {
+    let gatewayCalls = 0;
+    const gateway = {
+        async findPath() { gatewayCalls++; },
+        async findPathWithBarriers() { gatewayCalls++; }
+    };
+
+    for (const closedBarrierProvider of [
+        async () => { throw new Error('database unavailable'); },
+        async () => ({ barriers: null })
+    ]) {
+        const routeBetween = createRouteBetween(gateway, {
+            scenicId: 'test-scenic',
+            closedBarrierProvider
+        });
+        await assert.rejects(
+            routeBetween([120, 30], [120.1, 30.1], 'normal', { requestId: 'snapshot-failure' }),
+            error => error?.name === 'ContractMismatchError'
+                && error.code === 8205
+                && error.httpStatus === 409
+                && error.requestId === 'snapshot-failure'
+                && error.operation === 'loadClosedBarrierSnapshot'
+        );
+    }
+
+    assert.equal(gatewayCalls, 0, 'snapshot failure must never fall through to unobstructed routing');
 });
 
 test('routeBetween rejects invalid endpoints, modes, and barrier context without calling Gateway', async () => {
@@ -134,13 +225,15 @@ test('routeBetween rejects invalid endpoints, modes, and barrier context without
     const routeBetween = createRouteBetween({
         async findPath() { calls++; },
         async findPathWithBarriers() { calls++; }
-    }, { scenicId: 'test-scenic' });
+    }, { scenicId: 'test-scenic', closedBarrierProvider: emptyBarrierProvider });
 
     for (const args of [
         [{}, [120, 30], 'normal'],
         [[120, 30], [120], 'normal'],
         [[120, 30], [120.1, 30.1], 'teleport'],
         [[120, 30], [120.1, 30.1], 'normal', { barriers: {} }],
+        [[120, 30], [120.1, 30.1], 'normal', { barriers: null }],
+        [[120, 30], [120.1, 30.1], 'normal', { barriers: undefined }],
         [[120, 30], [120.1, 30.1], 'normal', 'invalid-context']
     ]) {
         await assert.rejects(routeBetween(...args), TypeError);

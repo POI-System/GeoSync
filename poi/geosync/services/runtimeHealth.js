@@ -209,6 +209,71 @@ function offlineGisStatus(error) {
     };
 }
 
+function runtimeSnapshotOf({ readiness, walkGraph, crowdService }) {
+    if (!readiness || typeof readiness.snapshot !== 'function') {
+        throw new TypeError('Health handler requires a readiness tracker');
+    }
+    if (!walkGraph || typeof walkGraph.isReady !== 'function') {
+        throw new TypeError('Health handler requires walkGraph.isReady');
+    }
+    if (!crowdService || typeof crowdService.getPoiIndex !== 'function') {
+        throw new TypeError('Health handler requires crowdService.getPoiIndex');
+    }
+
+    const graphLoaded = walkGraph.isReady() === true;
+    const poiIndex = crowdService.getPoiIndex();
+    const poiIndexCount = Array.isArray(poiIndex) ? poiIndex.length : 0;
+    const startup = readiness.snapshot({ graphReady: graphLoaded, poiIndexCount });
+    return { graphLoaded, poiIndexCount, startup };
+}
+
+function createLivenessHandler() {
+    return function livenessHandler(_req, res) {
+        res.status(200).json({
+            state: 'live',
+            live: true
+        });
+    };
+}
+
+function createReadinessHandler({ mongoose, readiness, walkGraph, crowdService }) {
+    runtimeSnapshotOf({ readiness, walkGraph, crowdService });
+    return function readinessHandler(_req, res) {
+        const mongo = mongoStatusOf(mongoose);
+        const { graphLoaded, poiIndexCount, startup } = runtimeSnapshotOf({
+            readiness,
+            walkGraph,
+            crowdService
+        });
+        const mongoReady = mongo.state === 'online';
+        const poiIndexReady = startup.components.poiIndex.ready === true;
+        const geosyncReady = mongoReady
+            && startup.ready === true
+            && graphLoaded
+            && poiIndexReady;
+        const jobs = startup.components.jobs;
+        const state = !mongoReady ? 'not-ready' : geosyncReady ? 'ready' : 'degraded';
+
+        res.status(mongoReady ? 200 : 503).json({
+            state,
+            ready: mongoReady,
+            hostReady: mongoReady,
+            mongoReady,
+            geosyncReady,
+            degraded: mongoReady && !geosyncReady,
+            mongo,
+            geosync: {
+                state: startup.state,
+                graphReady: graphLoaded,
+                poiIndexReady,
+                poiIndexCount,
+                jobsReady: jobs.required === false || jobs.state === 'ready',
+                jobsState: jobs.state
+            }
+        });
+    };
+}
+
 function createHealthHandler({
     mongoose,
     superMapGateway,
@@ -217,9 +282,7 @@ function createHealthHandler({
     crowdService,
     config
 }) {
-    if (!readiness || typeof readiness.snapshot !== 'function') {
-        throw new TypeError('Health handler requires a readiness tracker');
-    }
+    runtimeSnapshotOf({ readiness, walkGraph, crowdService });
     return async function healthHandler(req, res) {
         const snap = crowdService.getHeatmapSnapshot();
         const mongo = mongoStatusOf(mongoose);
@@ -235,9 +298,11 @@ function createHealthHandler({
         } catch {
             diagnostics = {};
         }
-        const graphLoaded = walkGraph.isReady();
-        const poiIndexCount = crowdService.getPoiIndex().length;
-        const startup = readiness.snapshot({ graphReady: graphLoaded, poiIndexCount });
+        const { graphLoaded, poiIndexCount, startup } = runtimeSnapshotOf({
+            readiness,
+            walkGraph,
+            crowdService
+        });
         const coreAvailable = mongo.state === 'online' && startup.ready;
         const coreState = mongo.state === 'online'
             ? startup.state
@@ -277,6 +342,8 @@ function createHealthHandler({
 
 module.exports = {
     createRuntimeReadiness,
+    createLivenessHandler,
+    createReadinessHandler,
     createHealthHandler,
     mongoStatusOf,
     waitForMongoReady,

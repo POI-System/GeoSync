@@ -32,9 +32,15 @@ GeoSync is attached through dependency injection before static files and before
   duration, segments, snap data, GIS provenance, and accessibility verification.
 - Add canonical route caching, directional keys, sorted barriers, TTL handling,
   manifest-version invalidation, and cache diagnostics.
+- Keep exact-coordinate cache aliases isolated even when requests snap to the
+  same node pair, and bound the route cache with TTL plus deterministic LRU
+  eviction so one request cannot receive another request's connector geometry.
 - Implement the documented `8201` through `8206` route error contracts.
 - Route itinerary planning and proposal acceptance through the injected Gateway
   adapter while preserving route, ETA, timetable, version, and legacy fields.
+- Load the authoritative complete closed-edge snapshot for ordinary itinerary
+  planning as well as reroute proposals. Snapshot load or mapping failures stop
+  routing with `8205` instead of silently calling iServer without barriers.
 - Add full closed-edge snapshots, barrier fingerprints, per-scenic serialization,
   idempotent graph-event handling, reroute proposals, and operations impact/status
   contracts.
@@ -51,6 +57,12 @@ GeoSync is attached through dependency injection before static files and before
 - Track MongoDB, graph, POI-index, and scheduler readiness independently. Health
   returns 503 for pending/failed core startup but remains 200 when only GIS is
   degraded or offline.
+- Add dependency-free liveness and host-aware readiness probes. Production Mongo
+  initial-connection failure is fail-fast by default with sanitized diagnostics,
+  while an attached GeoSync graph/index failure is reported as degraded without
+  removing an otherwise database-ready host POI process from traffic.
+- Retry failed manifest loads automatically after a bounded failure TTL and
+  accept common boolean environment forms with warnings for unknown values.
 - Remove the scheduled empty `trailMining` placeholder and report actual primary,
   non-primary, or explicitly disabled job state.
 - Restrict itinerary proposal/progress Socket payloads to documented public
@@ -73,6 +85,8 @@ Updated or added HTTP surfaces include:
 
 - `GET /api/geosync/client-config`
 - `GET /api/geosync/health`
+- `GET /api/geosync/health/live`
+- `GET /api/geosync/health/ready`
 - `POST /api/itinerary/plan`
 - `POST /api/admin/geosync/graph/edge/:edgeId/close`
 - `POST /api/admin/geosync/graph/edge/:edgeId/open`
@@ -103,6 +117,9 @@ Allowed proposal lifecycle statuses are `shown`, `accepted`, `rejected`,
 - `.env.example` contains placeholder-only SuperMap configuration; blank
   server-side credentials and reviewer identities; signed-session settings; and
   bounded user, administrator, and screen session lifetimes.
+- `MONGO_STARTUP_FAIL_FAST` defaults to enabled only in production, and
+  `SUPERMAP_MANIFEST_RETRY_MS` controls automatic recovery from transient
+  manifest-load failures.
 - `poi/config/supermap-manifest.example.json` is a placeholder contract only.
 
 The WalkEdge migration mapping format is an explicit JSON array of:
@@ -129,13 +146,14 @@ Run from `D:\poi项目\poi` after all changes are stable:
 & 'D:\nodejs\npm.cmd' run audit:prod
 ```
 
-Evidence captured on August 2, 2026:
+Evidence captured on August 3, 2026 after `npm ci`:
 
+- `npm ci`: passed from the committed lock file.
 - `check:syntax`: passed.
 - Legacy root GeoSync suite before removal: 67 passed, 0 failed.
-- GeoSync unit suite: 327 passed, 0 failed.
-- Integration suite: 13 passed, 0 failed.
-- Combined unit and integration suite: 340 passed, 0 failed.
+- GeoSync unit suite: 339 passed, 0 failed.
+- Integration suite: 14 passed, 0 failed.
+- Combined unit and integration suite: 353 passed, 0 failed.
 - Production dependency audit: failed with 14 package findings, including 4
   high, 10 moderate, 0 low, and 0 critical.
 
@@ -264,7 +282,7 @@ health interpretation, error handling, and application rollback.
   boundaries, so remediation or an approved time-bounded exception is required
   before production release. Do not apply forced or major upgrades without
   focused compatibility work and the full regression.
-- The final verified branch was pushed to `origin/LZY` on August 2, 2026, and
+- The final verified branch was pushed to `origin/LZY` on August 3, 2026, and
   GitHub Pull Request #1 was opened from `LZY` to `main` through an approved API
   workflow. The `gh` executable remains unavailable, but it is no longer a
   delivery blocker. This pull request must remain the review and merge boundary;

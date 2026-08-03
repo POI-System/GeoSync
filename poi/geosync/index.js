@@ -27,10 +27,15 @@ const forecastService = require('./services/forecastService');
 const { createItineraryRuntime } = require('./services/itineraryRuntime');
 const { rebuildTimeline } = require('./services/itineraryTimeline');
 const { aggregateRouteFromStops } = require('./services/itineraryRouteData');
-const { createBarrierRerouteCoordinator } = require('./services/barrierReroute');
+const {
+    createBarrierRerouteCoordinator,
+    loadClosedBarrierSnapshot
+} = require('./services/barrierReroute');
 const { bindOpsEvents } = require('./services/opsEvents');
 const {
     createRuntimeReadiness,
+    createLivenessHandler,
+    createReadinessHandler,
     createHealthHandler,
     waitForMongoReady,
     safeFailure
@@ -377,6 +382,7 @@ function attach({
 
     validateOnBoot();
     registerModels(mongoose, models);
+    const registeredModels = getModels();
     if (helpers.uploadDir) CONFIG.uploadDir = path.resolve(helpers.uploadDir);
     const localPathSource = options.localPathSource === undefined
         ? createLocalPathSource(walkGraph)
@@ -388,10 +394,15 @@ function attach({
     });
     const runtimeReadiness = createRuntimeReadiness({ backgroundEnabled: startBackground });
     const routeBetween = options.routeBetween || createRouteBetween(superMapGateway, {
-        scenicId: CONFIG.scenicId
+        scenicId: CONFIG.scenicId,
+        closedBarrierProvider: options.closedBarrierProvider || (({ scenicId }) =>
+            loadClosedBarrierSnapshot({
+                WalkEdge: registeredModels.WalkEdge,
+                scenicId
+            }))
     });
     const barrierReroute = createBarrierRerouteCoordinator({
-        models: getModels(),
+        models: registeredModels,
         gateway: superMapGateway,
         walkGraph,
         rebuildTimeline,
@@ -437,13 +448,19 @@ function attach({
         if (mountUploads) app.use('/uploads', express.static(CONFIG.uploadDir));
         if (CONFIG.simMode) app.use('/api/sim', simRouter());
 
-        // 健康端点（08文档 §4）
-        app.get('/api/geosync/health', wrap(createHealthHandler({
+        const healthDependencies = {
             mongoose,
-            superMapGateway,
             readiness: runtimeReadiness,
             walkGraph,
-            crowdService,
+            crowdService
+        };
+        app.get('/api/geosync/health/live', createLivenessHandler());
+        app.get('/api/geosync/health/ready', wrap(createReadinessHandler(healthDependencies)));
+
+        // 健康端点（08文档 §4）
+        app.get('/api/geosync/health', wrap(createHealthHandler({
+            ...healthDependencies,
+            superMapGateway,
             config: CONFIG
         })));
 

@@ -49,6 +49,11 @@ function finitePositive(value, fallback) {
     return Number.isFinite(number) && number > 0 ? number : fallback;
 }
 
+function finiteNonNegative(value, fallback) {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : fallback;
+}
+
 function asDate(value) {
     const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
     return Number.isFinite(date.getTime()) ? date : new Date();
@@ -582,6 +587,7 @@ class SuperMapGateway {
         this.queryTimeoutMs = finitePositive(options.queryTimeoutMs, 5000);
         this.routeTimeoutMs = finitePositive(options.routeTimeoutMs, 5000);
         this.statusCacheMs = Math.max(0, Number(options.statusCacheMs) || 0);
+        this.manifestFailureTtlMs = finiteNonNegative(options.manifestFailureTtlMs, 30_000);
         this.boundsBufferDeg = Math.max(0, Number(options.boundsBufferDeg) || 0);
         this.maxSnapDistanceM = finitePositive(options.maxSnapDistanceM, 200);
         this.fallbackEnabled = options.fallbackEnabled !== false;
@@ -593,6 +599,7 @@ class SuperMapGateway {
             ttlMs: finitePositive(options.routeCacheTtlMs, 60_000)
         });
         this.manifestResult = null;
+        this.manifestLoadedAtMs = null;
         this.statusCache = null;
         this.diagnostics = {
             lastSuccessAt: null,
@@ -608,13 +615,26 @@ class SuperMapGateway {
     }
 
     _loadManifest(refresh = false) {
-        if (this.manifestResult && !refresh) return this.manifestResult;
+        const nowMs = this._now().getTime();
+        const failureAgeMs = this.manifestLoadedAtMs === null
+            ? Number.POSITIVE_INFINITY
+            : Math.max(0, nowMs - this.manifestLoadedAtMs);
+        const cachedFailureIsFresh = this.manifestResult?.ok === false
+            && failureAgeMs < this.manifestFailureTtlMs;
+        if (
+            this.manifestResult
+            && !refresh
+            && (this.manifestResult.ok === true || cachedFailureIsFresh)
+        ) {
+            return this.manifestResult;
+        }
         const previousDataVersion = this.manifestResult?.manifest?.dataVersion || null;
         try {
             this.manifestResult = this.manifestLoader(this.manifestPath);
         } catch (error) {
             this.manifestResult = normalizeManifestFailure(error);
         }
+        this.manifestLoadedAtMs = nowMs;
         const nextDataVersion = this.manifestResult?.manifest?.dataVersion || null;
         if (previousDataVersion && nextDataVersion && previousDataVersion !== nextDataVersion) {
             this._invalidateRouteCache('manifest-data-version-changed');

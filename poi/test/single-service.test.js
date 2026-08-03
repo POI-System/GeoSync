@@ -77,6 +77,11 @@ test('POI server contains one production runtime and attaches GeoSync before lis
     const source = await readFile(path.join(POI_ROOT, 'server.js'), 'utf8');
     const geosyncSource = await readFile(path.join(POI_ROOT, 'geosync', 'index.js'), 'utf8');
     assert.equal(countOf(source, /mongoose\.connect\s*\(/g), 1);
+    assert.match(
+        source,
+        /monitorInitialMongoConnection\(mongoose\.connect\(CONFIG\.mongoUri/,
+        'the single Mongo connection must be covered by the startup failure policy'
+    );
     assert.equal(countOf(source, /http\.createServer\s*\(/g), 1);
     assert.equal(countOf(source, /new Server\s*\(/g), 1);
     assert.equal(countOf(source, /server\.listen\s*\(/g), 1);
@@ -147,6 +152,16 @@ test('POI server contains one production runtime and attaches GeoSync before lis
         /app\.get\('\/api\/geosync\/health', wrap\(createHealthHandler\(/,
         'GeoSync health must use the async route error boundary'
     );
+    assert.match(
+        geosyncSource,
+        /app\.get\('\/api\/geosync\/health\/live', createLivenessHandler\(\)\)/,
+        'GeoSync must expose a dependency-free liveness probe'
+    );
+    assert.match(
+        geosyncSource,
+        /app\.get\('\/api\/geosync\/health\/ready', wrap\(createReadinessHandler\(/,
+        'GeoSync must expose the host-aware readiness probe'
+    );
 });
 
 test('single POI process serves old and GeoSync endpoints without exposing backend files', {
@@ -160,9 +175,11 @@ test('single POI process serves old and GeoSync endpoints without exposing backe
             ...process.env,
             PORT: String(port),
             HOST: '127.0.0.1',
+            NODE_ENV: 'test',
             PUBLIC_HOST: `http://127.0.0.1:${port}`,
             CORS_ORIGIN: `http://127.0.0.1:${port}`,
             MONGO_URI: 'mongodb://127.0.0.1:1/poi_phase1_smoke',
+            MONGO_STARTUP_FAIL_FAST: 'false',
             ADMIN_TOKEN: '',
             ADMIN_USERNAME: 'phase1-admin',
             ADMIN_PASSWORD: 'phase1-password',
@@ -218,6 +235,17 @@ test('single POI process serves old and GeoSync endpoints without exposing backe
         assert.equal(health.gis.state, 'offline');
         assert.equal(health.gis.error.code, 'SUPERMAP_MANIFEST_NOT_FOUND');
 
+        const liveResponse = await fetch(`${base}/api/geosync/health/live`);
+        assert.equal(liveResponse.status, 200);
+        assert.deepEqual(await liveResponse.json(), { state: 'live', live: true });
+
+        const readyResponse = await fetch(`${base}/api/geosync/health/ready`);
+        assert.equal(readyResponse.status, 503);
+        const ready = await readyResponse.json();
+        assert.equal(ready.ready, false);
+        assert.equal(ready.mongoReady, false);
+        assert.equal(ready.geosyncReady, false);
+
         const adminResponse = await fetch(`${base}/api/admin/geosync/dashboard`);
         assert.equal(adminResponse.status, 403);
         const gisAdminResponse = await fetch(`${base}/api/admin/geosync/gis/status`);
@@ -253,6 +281,68 @@ test('single POI process serves old and GeoSync endpoints without exposing backe
     }
 });
 
+test('production Mongo initial connection failure exits with sanitized diagnostics by default', {
+    timeout: 15000
+}, async () => {
+    const port = await reservePort();
+    const child = spawn(process.execPath, ['server.js'], {
+        cwd: POI_ROOT,
+        windowsHide: true,
+        env: {
+            ...process.env,
+            PORT: String(port),
+            HOST: '127.0.0.1',
+            NODE_ENV: 'production',
+            PUBLIC_HOST: `http://127.0.0.1:${port}`,
+            CORS_ORIGIN: `http://127.0.0.1:${port}`,
+            MONGO_URI: 'mongodb://sensitive-user:sensitive-password@127.0.0.1:1/poi_fail_fast',
+            MONGO_STARTUP_FAIL_FAST: '',
+            AUTH_SESSION_SECRET: 'fail-fast-session-secret-Q7m2V9x4K6p1R8c3N5h0',
+            AUTH_SIGN_REQUIRED: 'true',
+            AUTH_COOKIE_SECURE: 'false',
+            ADMIN_TOKEN: '',
+            ADMIN_USERNAME: 'fail-fast-admin',
+            ADMIN_PASSWORD: 'fail-fast-password',
+            GEOSYNC_BACKGROUND_ENABLED: 'false',
+            SUPERMAP_ENABLED: 'false',
+            SCENIC_ID: 'fail-fast-test',
+            SCENIC_CENTER: '120,30',
+            POSITION_HMAC_SECRET: 'fail-fast-position-secret-N8p3V6c1Q9m4K7x2',
+            WX_APPID: '',
+            WX_SECRET: '',
+            ALIYUN_AK: '',
+            ALIYUN_SK: '',
+            SMTP_HOST: '',
+            SMTP_USER: '',
+            SMTP_PASS: '',
+            AMAP_KEY: '',
+            AMAP_SEC: '',
+            ISERVER_USERNAME: '',
+            ISERVER_PASSWORD: ''
+        },
+        stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    let output = '';
+    child.stdout.on('data', chunk => { output += chunk.toString(); });
+    child.stderr.on('data', chunk => { output += chunk.toString(); });
+
+    try {
+        const exit = once(child, 'exit');
+        const timeout = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error('production process did not fail fast')), 12000);
+        });
+        const [code, signal] = await Promise.race([exit, timeout]);
+        assert.equal(code, 1);
+        assert.equal(signal, null);
+        assert.match(output, /MongoDB initial connection failed/);
+        assert.match(output, /MONGO_STARTUP_FAILED/);
+        assert.doesNotMatch(output, /sensitive-user|sensitive-password|poi_fail_fast/);
+    } finally {
+        await stopChild(child);
+    }
+});
+
 test('configured host auth uses HttpOnly cookies and rejects unsafe credential transports', {
     timeout: 25000
 }, async () => {
@@ -266,9 +356,11 @@ test('configured host auth uses HttpOnly cookies and rejects unsafe credential t
             ...process.env,
             PORT: String(port),
             HOST: '127.0.0.1',
+            NODE_ENV: 'test',
             PUBLIC_HOST: `http://127.0.0.1:${port}`,
             CORS_ORIGIN: `http://127.0.0.1:${port}`,
             MONGO_URI: 'mongodb://127.0.0.1:1/poi_phase5_auth_smoke',
+            MONGO_STARTUP_FAIL_FAST: 'false',
             AUTH_SESSION_SECRET: 'integration-session-secret-Z9x4P2m8V6c1R7k5Q3h0',
             AUTH_SIGN_REQUIRED: 'true',
             AUTH_COOKIE_SECURE: 'false',
