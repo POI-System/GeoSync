@@ -134,6 +134,39 @@ test('POI migration planning reports updates, skips, failures, and deferred auth
     assert.equal(plan.errors[0].code, 'INVALID_LOCATION');
 });
 
+test('POI migration never treats blank or unsafe SmID values as authoritative mappings', () => {
+    const invalidSmIds = [null, '', ' ', '01', -1, 1.5, Number.MAX_SAFE_INTEGER + 1];
+    const pois = invalidSmIds.map((smId, index) => ({
+        _id: `poi-invalid-smid-${index}`,
+        geo: { type: 'Point', coordinates: [120, 30] },
+        visitMeta: completeVisitMeta(),
+        gateNodeId: 'gate-1',
+        superMapRef: {
+            datasetName: 'POI@Test',
+            smId,
+            dataVersion: 'v1'
+        }
+    }));
+    pois.push({
+        _id: 'poi-valid-string-smid',
+        geo: { type: 'Point', coordinates: [120, 30] },
+        visitMeta: completeVisitMeta(),
+        gateNodeId: 'gate-1',
+        superMapRef: {
+            datasetName: 'POI@Test',
+            smId: '12',
+            dataVersion: 'v1'
+        }
+    });
+
+    const plan = planPoiGeoMigration({ pois, scenicId: 'scenic-a' });
+    assert.equal(plan.summary.superMapRefDeferred, invalidSmIds.length);
+    for (let index = 0; index < invalidSmIds.length; index++) {
+        assert.equal(plan.items[index].deferred.includes('superMapRef'), true);
+    }
+    assert.equal(plan.items.at(-1).deferred.includes('superMapRef'), false);
+});
+
 test('dry-run performs no writes while apply is conditional and idempotent', async () => {
     const model = createModel([{
         _id: 'poi-1',
@@ -185,6 +218,59 @@ test('dry-run performs no writes while apply is conditional and idempotent', asy
         superMapRefDeferred: 1
     });
     assert.equal(model.calls.updates.length, 1);
+});
+
+test('migration streams production queries through a bounded lean cursor', async () => {
+    const documents = [{
+        _id: 'poi-cursor-1',
+        category: 'museum',
+        location: { lng: 120, lat: 30 }
+    }, {
+        _id: 'poi-cursor-2',
+        category: 'park',
+        location: { lng: 121, lat: 31 }
+    }];
+    let cursorOptions;
+    let closeCalls = 0;
+    const model = {
+        find() {
+            return {
+                lean() {
+                    return {
+                        cursor(options) {
+                            cursorOptions = options;
+                            return {
+                                async *[Symbol.asyncIterator]() {
+                                    for (const document of documents) yield copy(document);
+                                },
+                                async close() { closeCalls++; }
+                            };
+                        }
+                    };
+                }
+            };
+        },
+        async updateOne() {
+            throw new Error('dry-run must not write');
+        }
+    };
+
+    const result = await runPoiGeoMigration({
+        POI: model,
+        scenicId: 'scenic-a',
+        batchSize: 2
+    });
+
+    assert.deepEqual(cursorOptions, { batchSize: 2 });
+    assert.equal(closeCalls, 1);
+    assert.deepEqual(result.summary, {
+        total: 2,
+        success: 2,
+        skipped: 0,
+        failed: 0,
+        gateNodeIdDeferred: 2,
+        superMapRefDeferred: 2
+    });
 });
 
 test('apply continues after sanitized per-POI write failures', async () => {

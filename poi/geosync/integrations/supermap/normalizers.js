@@ -11,14 +11,17 @@ const SUPPORTED_TYPES = new Set([
     'MultiPolygon'
 ]);
 const MAX_GEOMETRY_POSITIONS = 100_000;
+const MAX_ROUTE_INVALID_POSITIONS = 4;
+const MAX_ROUTE_INVALID_POSITION_RATIO = 0.5;
+const ROUTE_INVALID_POSITION_MESSAGE = 'Route geometry contains too many invalid positions';
 
 function safeContextValue(value, fallback = '') {
     const text = value === undefined || value === null ? '' : String(value).trim();
     return (text || fallback).replace(/[^A-Za-z0-9._:-]/g, '_').slice(0, 128);
 }
 
-function normalizationError(context = {}) {
-    return new GeometryNormalizationError(undefined, {
+function normalizationError(context = {}, message) {
+    return new GeometryNormalizationError(message, {
         operation: safeContextValue(context.operation, 'normalizeGeometry'),
         requestId: safeContextValue(context.requestId),
         category: 'geometry',
@@ -26,8 +29,8 @@ function normalizationError(context = {}) {
     });
 }
 
-function fail(context) {
-    throw normalizationError(context);
+function fail(context, message) {
+    throw normalizationError(context, message);
 }
 
 function isPlainObject(value) {
@@ -133,9 +136,17 @@ function routeAxisCandidate(rawCoordinates, swapped, start, end, extent) {
     return {
         coordinates,
         validCount,
+        invalidCount: rawCoordinates.length - validCount,
+        rawPositionCount: rawCoordinates.length,
         extentScore: routeExtentScore(coordinates, extent),
         endpointScore: routeEndpointScore(coordinates, start, end)
     };
+}
+
+function routeCandidateWithinInvalidBudget(candidate) {
+    if (!candidate || candidate.rawPositionCount <= 0) return false;
+    return candidate.invalidCount <= MAX_ROUTE_INVALID_POSITIONS
+        && candidate.invalidCount / candidate.rawPositionCount <= MAX_ROUTE_INVALID_POSITION_RATIO;
 }
 
 function routeCandidateIsBetter(candidate, current, hasExtent, hasEndpointContext) {
@@ -279,13 +290,25 @@ function normalizeRouteGeometryWithMeta(rawGeometry, context = {}) {
         const extent = routeExtent(routeContext.extent, routeContext);
         const canonical = routeAxisCandidate(rawCoordinates, false, start, end, extent);
         const swapped = routeAxisCandidate(rawCoordinates, true, start, end, extent);
-        let selected = canonical;
+        const canonicalAccepted = routeCandidateWithinInvalidBudget(canonical) ? canonical : null;
+        const swappedAccepted = routeCandidateWithinInvalidBudget(swapped) ? swapped : null;
+        let selected = canonicalAccepted;
         let axisSwapped = false;
-        if (swapped && routeCandidateIsBetter(swapped, selected, Boolean(extent), Boolean(start || end))) {
-            selected = swapped;
+        if (swappedAccepted && routeCandidateIsBetter(
+            swappedAccepted,
+            selected,
+            Boolean(extent),
+            Boolean(start || end)
+        )) {
+            selected = swappedAccepted;
             axisSwapped = true;
         }
-        if (!selected) fail(routeContext);
+        if (!selected) {
+            fail(
+                routeContext,
+                canonical || swapped ? ROUTE_INVALID_POSITION_MESSAGE : undefined
+            );
+        }
 
         const coordinates = selected.coordinates.map(position => [...position]);
         const reversed = selected.endpointScore.reverse < selected.endpointScore.forward;
@@ -313,3 +336,5 @@ module.exports.normalizeRouteGeometry = normalizeRouteGeometry;
 module.exports.normalizeRouteGeometryWithMeta = normalizeRouteGeometryWithMeta;
 module.exports.SUPPORTED_TYPES = SUPPORTED_TYPES;
 module.exports.MAX_GEOMETRY_POSITIONS = MAX_GEOMETRY_POSITIONS;
+module.exports.MAX_ROUTE_INVALID_POSITIONS = MAX_ROUTE_INVALID_POSITIONS;
+module.exports.MAX_ROUTE_INVALID_POSITION_RATIO = MAX_ROUTE_INVALID_POSITION_RATIO;

@@ -177,6 +177,15 @@ function normalizeFeatureId(value, fallback, context) {
     throw contractError('iServer 要素 id 类型无效', { ...context, category: 'contract' });
 }
 
+function nonNegativeSafeInteger(value) {
+    if (typeof value === 'number') {
+        return Number.isSafeInteger(value) && value >= 0 ? value : null;
+    }
+    if (typeof value !== 'string' || !/^(0|[1-9]\d*)$/.test(value)) return null;
+    const number = Number(value);
+    return Number.isSafeInteger(number) ? number : null;
+}
+
 function normalizeFeature(feature, index, datasetKey, dataset, fields, context) {
     if (!isPlainObject(feature) || feature.type !== 'Feature' || !isPlainObject(feature.geometry)) {
         throw contractError('iServer 要素不是有效的 GeoJSON Feature', { ...context, category: 'contract' });
@@ -191,9 +200,7 @@ function normalizeFeature(feature, index, datasetKey, dataset, fields, context) 
         }
     }
     const smIdField = dataset.fields.find(field => field.toLowerCase() === 'smid');
-    const smId = smIdField && Number.isFinite(Number(rawProperties[smIdField]))
-        ? Number(rawProperties[smIdField])
-        : null;
+    const smId = smIdField ? nonNegativeSafeInteger(rawProperties[smIdField]) : null;
     properties.sourceRef = { datasetName: dataset.name, ...(smId === null ? {} : { smId }) };
 
     return {
@@ -234,12 +241,12 @@ function normalizeNodeId(value, field, context) {
 function normalizeBarrierSourceRef(value, manifest, field, context) {
     if (!isPlainObject(value)) throw contractError(`${field} 必须是对象`, context);
     const datasetName = String(value.datasetName || '').trim();
-    const smId = Number(value.smId);
+    const smId = nonNegativeSafeInteger(value.smId);
     const datasetNames = new Set(Object.values(manifest?.datasets || {}).map(dataset => dataset.name));
     if (!datasetName || !datasetNames.has(datasetName)) {
         throw contractError(`${field}.datasetName 不在 manifest 白名单中`, context);
     }
-    if (!Number.isInteger(smId) || smId < 0) throw contractError(`${field}.smId 必须是非负整数`, context);
+    if (smId === null) throw contractError(`${field}.smId 必须是非负安全整数`, context);
     return { datasetName, smId };
 }
 
@@ -321,11 +328,11 @@ function normalizeRouteSegments(value, manifest, context, options = {}) {
         if (segment.sourceRef !== undefined && segment.sourceRef !== null) {
             if (!isPlainObject(segment.sourceRef)) throw contractError(`segments[${index}].sourceRef 无效`, context);
             const datasetName = String(segment.sourceRef.datasetName || '').trim();
-            const smId = Number(segment.sourceRef.smId);
+            const smId = nonNegativeSafeInteger(segment.sourceRef.smId);
             if (!datasetName || (datasetNames.size && !datasetNames.has(datasetName))) {
                 throw contractError(`segments[${index}].sourceRef.datasetName 无效`, context);
             }
-            if (!Number.isInteger(smId) || smId < 0) {
+            if (smId === null) {
                 throw contractError(`segments[${index}].sourceRef.smId 无效`, context);
             }
             sourceRef = { datasetName, smId };

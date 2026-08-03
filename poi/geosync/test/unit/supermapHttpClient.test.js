@@ -101,6 +101,15 @@ test('transport mapping distinguishes retryable timeout and non-retryable failur
     assert.equal(parameter.code, 8205);
     assert.equal(parameter.category, 'parameter');
     assert.equal(parameter.retryable, false);
+
+    const rateLimit = toSuperMapError(axiosError({
+        status: 429,
+        data: { code: 8201, message: 'raw rate limit body' }
+    }));
+    assert.equal(rateLimit.code, 8201);
+    assert.equal(rateLimit.category, 'rate-limit');
+    assert.equal(rateLimit.retryable, false);
+    assert.equal(JSON.stringify(rateLimit).includes('raw rate limit body'), false);
 });
 
 test('request sends base URL, Basic auth, requestId, timeout and payload only through Axios config', async () => {

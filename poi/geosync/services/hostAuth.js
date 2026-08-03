@@ -288,10 +288,14 @@ function createHostAuth(options = {}) {
     }
 
     async function requireReviewerOrAdmin(req, res, next) {
-        const hasAdminCredential = Boolean(
-            req?.headers?.authorization
-            || String(req?.headers?.cookie || '').includes(`${DEFAULT_COOKIE_NAMES.admin}=`)
-        );
+        let hasAdminCredential = Boolean(req?.headers?.authorization);
+        if (!hasAdminCredential) {
+            try {
+                hasAdminCredential = Boolean(adminCookieRequest(req));
+            } catch {
+                hasAdminCredential = true;
+            }
+        }
         if (hasAdminCredential) return requireAdmin(req, res, next);
         try {
             const principal = await authenticateUserRequest(req);

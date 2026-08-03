@@ -23,11 +23,19 @@ function createFixedWindowRateLimiter(options = {}) {
         }
     }
 
-    function makeRoom(now) {
+    function hasCapacity(now) {
         pruneExpired(now);
-        while (records.size >= maxKeys) {
-            records.delete(records.keys().next().value);
+        return records.size < maxKeys;
+    }
+
+    function capacityRetryAfterSec(now) {
+        let earliestResetAt = Infinity;
+        for (const record of records.values()) {
+            earliestResetAt = Math.min(earliestResetAt, record.resetAt);
         }
+        return Number.isFinite(earliestResetAt)
+            ? Math.max(1, Math.ceil((earliestResetAt - now) / 1000))
+            : Math.max(1, Math.ceil(windowMs / 1000));
     }
 
     function consume(key) {
@@ -35,8 +43,18 @@ function createFixedWindowRateLimiter(options = {}) {
         if (!normalizedKey) throw new TypeError('rate-limit key is required');
         const now = Number(clock());
         let record = records.get(normalizedKey);
-        if (!record || record.resetAt <= now) {
-            makeRoom(now);
+        if (record?.resetAt <= now) {
+            records.delete(normalizedKey);
+            record = null;
+        }
+        if (!record) {
+            if (!hasCapacity(now)) {
+                return Object.freeze({
+                    allowed: false,
+                    remaining: 0,
+                    retryAfterSec: capacityRetryAfterSec(now)
+                });
+            }
             record = { count: 0, resetAt: now + windowMs };
             records.set(normalizedKey, record);
         }

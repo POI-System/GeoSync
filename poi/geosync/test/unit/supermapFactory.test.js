@@ -118,6 +118,54 @@ test('factory forwards the configured iServer response limit to its HTTP client'
     assert.equal(gateway.httpClient.maxResponseBytes, 2048);
 });
 
+test('factory refuses a missing production iServer base without taking down the host service', async () => {
+    const logs = [];
+    const gateway = createSuperMapGateway({
+        env: {
+            NODE_ENV: 'production',
+            SUPERMAP_ENABLED: 'true'
+        },
+        cwd: 'D:\\factory-test',
+        manifestLoader: () => validManifestResult(),
+        axios: { async request() { throw new Error('HTTP must not run'); } },
+        logger: {
+            info() {},
+            warn(message, metadata) { logs.push({ level: 'warn', message, metadata }); },
+            error(message, metadata) { logs.push({ level: 'error', message, metadata }); }
+        }
+    });
+
+    const status = await gateway.getStatus({ requestId: 'missing-production-base' });
+    assert.equal(gateway.enabled, false);
+    assert.equal(status.state, 'offline');
+    assert.deepEqual(logs, [{
+        level: 'error',
+        message: '[GeoSync] [GIS] HTTP client configuration is invalid; GIS is offline',
+        metadata: undefined
+    }]);
+});
+
+test('factory warns before using the loopback iServer default outside production', () => {
+    const warnings = [];
+    const gateway = createSuperMapGateway({
+        env: { SUPERMAP_ENABLED: 'true' },
+        cwd: 'D:\\factory-test',
+        manifestLoader: () => validManifestResult(),
+        axios: { async request() { return { status: 200, data: {} }; } },
+        logger: {
+            info() {},
+            error() {},
+            warn(message, metadata) { warnings.push({ message, metadata }); }
+        }
+    });
+
+    assert.equal(gateway.enabled, true);
+    assert.deepEqual(warnings, [{
+        message: '[GeoSync] [GIS] ISERVER_BASE is not configured; using the development loopback default',
+        metadata: undefined
+    }]);
+});
+
 test('factory warns and uses safe defaults for unknown boolean environment values', () => {
     const warnings = [];
     const gateway = createSuperMapGateway(baseOptions({

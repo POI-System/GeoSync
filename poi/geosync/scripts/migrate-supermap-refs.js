@@ -11,7 +11,6 @@ const {
     runSuperMapRefMigration
 } = require('../services/supermapRefMigration');
 
-const DEFAULT_DRY_RUN_URI = 'mongodb://127.0.0.1:27017/poi_db';
 const MAX_MAPPING_BYTES = 10 * 1024 * 1024;
 const EXIT = {
     OK: 0,
@@ -87,7 +86,7 @@ function usage() {
         '  node geosync/scripts/migrate-supermap-refs.js --mapping <json>',
         '  node geosync/scripts/migrate-supermap-refs.js --mapping <json> --apply',
         '',
-        'Dry-run is the default. Apply mode also requires MONGO_URI to be explicitly configured.',
+        'Dry-run is the default. Both modes require MONGO_URI to be explicitly configured.',
         'Mapping JSON must be an array of {edgeId,datasetName,smId,sourceId?,dataVersion}.'
     ].join('\n');
 }
@@ -123,10 +122,10 @@ async function runCli({
             return EXIT.OK;
         }
         const explicitUri = String(env.MONGO_URI || '').trim();
-        if (args.apply && !explicitUri) {
+        if (!explicitUri) {
             throw new CliInputError(
                 'MONGO_URI_REQUIRED',
-                'apply mode requires an explicitly configured MONGO_URI'
+                'migration requires an explicitly configured MONGO_URI'
             );
         }
 
@@ -135,7 +134,7 @@ async function runCli({
             mongooseInstance.set('autoIndex', false);
             mongooseInstance.set('autoCreate', false);
         }
-        await mongooseInstance.connect(explicitUri || DEFAULT_DRY_RUN_URI, {
+        await mongooseInstance.connect(explicitUri, {
             serverSelectionTimeoutMS: 5000,
             autoIndex: false,
             autoCreate: false

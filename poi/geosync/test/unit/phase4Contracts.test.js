@@ -27,6 +27,13 @@ test('Phase 4 model and event contracts are registered', () => {
         keys.scenicId === 1 && keys.state === 1 && keys['route.segments.edgeId'] === 1));
     assert.ok(models.WalkEdge.schema.indexes().some(([keys]) =>
         keys.scenicId === 1 && keys.status === 1));
+    const barrierEventIndexes = models.BarrierEventRecord.schema.indexes();
+    assert.ok(barrierEventIndexes.some(([keys, options]) =>
+        keys.eventId === 1 && options.unique === true));
+    assert.ok(barrierEventIndexes.some(([keys]) =>
+        keys.state === 1 && keys.leaseUntil === 1));
+    assert.ok(barrierEventIndexes.some(([keys, options]) =>
+        keys.expireAt === 1 && options.expireAfterSeconds === 0));
 
     assert.equal(bus.EVENTS.OPS_IMPACT, 'ops:impact');
     assert.equal(bus.EVENTS.OPS_PROPOSAL_STATUS, 'ops:proposalStatus');

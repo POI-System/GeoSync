@@ -7,11 +7,51 @@ const { BizError } = require('../lib/respond');
 const { NoRouteError } = require('../integrations/supermap/errors');
 const forecast = require('./forecastService');
 const sunlight = require('./sunlight');
-const { dateStrOf, encodePolyline, haversine } = require('../lib/geo');
+const { encodePolyline, haversine } = require('../lib/geo');
 
 const PACE_FACTOR = { relaxed: 1.3, normal: 1.0, tight: 0.8 };
 const WALK_SPEED_MPS = 1.4;
 const PLANNER_OPTIMIZATION_BUDGET_MS = 3000;
+const scenicClockFormatters = new Map();
+
+function scenicClockFormatter(timeZone = CONFIG.scenicTimeZone) {
+    if (!scenicClockFormatters.has(timeZone)) {
+        scenicClockFormatters.set(timeZone, new Intl.DateTimeFormat('en-CA', {
+            timeZone,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            hourCycle: 'h23'
+        }));
+    }
+    return scenicClockFormatters.get(timeZone);
+}
+
+function scenicDateTimeParts(value, timeZone = CONFIG.scenicTimeZone) {
+    const date = new Date(value);
+    if (!Number.isFinite(date.getTime())) return null;
+    const parts = Object.fromEntries(
+        scenicClockFormatter(timeZone)
+            .formatToParts(date)
+            .filter(part => part.type !== 'literal')
+            .map(part => [part.type, Number(part.value)])
+    );
+    return parts;
+}
+
+function scenicMinuteOfDay(value, timeZone = CONFIG.scenicTimeZone) {
+    const parts = scenicDateTimeParts(value, timeZone);
+    return parts ? parts.hour * 60 + parts.minute : NaN;
+}
+
+function scenicDateStr(value, timeZone = CONFIG.scenicTimeZone) {
+    const parts = scenicDateTimeParts(value, timeZone);
+    if (!parts) return '';
+    const pad = number => String(number).padStart(2, '0');
+    return `${parts.year}-${pad(parts.month)}-${pad(parts.day)}`;
+}
 
 /**
  * 生成行程（不落库，routes 层负责保存）
@@ -44,6 +84,9 @@ async function plan({
     const { ExternalPoi, PhotoSpot, Checkin, Campaign } = getModels();
     const mode = accessible ? 'accessible' : shadeFirst ? 'shade' : 'normal';
     const t0 = startAt ? new Date(startAt) : new Date(Date.now() + 10 * 60000);
+    if (!Number.isFinite(t0.getTime())) {
+        throw new BizError(1102, 'startAt 必须是有效日期时间');
+    }
 
     // 0. 候选池 ≤80
     let pois = await ExternalPoi.find({ status: 'approved' }).lean();
@@ -75,7 +118,7 @@ async function plan({
         const k = String(s.poiId);
         if (!spotMap.has(k)) spotMap.set(k, s);
     }
-    const todayStr = dateStrOf(t0);
+    const todayStr = scenicDateStr(t0);
     const windowsOf = poi => {
         const spot = spotMap.get(String(poi._id));
         if (!spot) return null;
@@ -234,7 +277,8 @@ function interestMatch(poi, interests) {
 function withinOpenHours(poi, t) {
     const hrs = poi.visitMeta?.openHours;
     if (!hrs?.length) return true;
-    const mins = t.getHours() * 60 + t.getMinutes();
+    const mins = scenicMinuteOfDay(t);
+    if (!Number.isFinite(mins)) return false;
     return hrs.some(h => {
         const [sh, sm] = h.start.split(':').map(Number);
         const [eh, em] = h.end.split(':').map(Number);
@@ -510,7 +554,7 @@ function aggregateGis(routes, mode) {
         ...first,
         source,
         mode,
-        degraded: entries.some(gis => gis.degraded === true || gis.source === 'local-fallback'),
+        degraded: entries.some(gis => gis.degraded === true || gis.source !== 'iserver'),
         durationMs,
         dataVersion: dataVersions.length === 1 ? dataVersions[0] : null
     };
@@ -521,8 +565,8 @@ function samePosition(left, right) {
 }
 
 function offWindowMin(windows, eta) {
-    const t = new Date(eta);
-    const mins = t.getHours() * 60 + t.getMinutes();
+    const mins = scenicMinuteOfDay(eta);
+    if (!Number.isFinite(mins)) return Infinity;
     let best = Infinity;
     for (const w of windows) {
         const [sh, sm] = w.start.split(':').map(Number);
@@ -542,5 +586,7 @@ module.exports = {
     buildAuthoritativeTimeline,
     defaultEstimateBetween,
     aggregateAuthoritativeRoutes,
-    routeUsable
+    routeUsable,
+    scenicMinuteOfDay,
+    scenicDateStr
 };

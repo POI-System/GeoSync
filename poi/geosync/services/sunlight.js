@@ -2,6 +2,7 @@
 // 05文档 §6：太阳光位 + horizon 查表 + 黄金窗口。纯计算，可单测。
 
 const SunCalc = require('suncalc');
+const { CONFIG } = require('../config');
 const { angleDiff, clamp } = require('../lib/geo');
 
 // suncalc 方位角（南=0，西为正，弧度）→ 北0顺时针度
@@ -29,7 +30,79 @@ function lightOf(delta) {
 }
 
 const pad = n => String(n).padStart(2, '0');
-const hhmm = d => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+const zonedFormatters = new Map();
+
+function zonedFormatter(timeZone = CONFIG.scenicTimeZone) {
+    if (!zonedFormatters.has(timeZone)) {
+        zonedFormatters.set(timeZone, new Intl.DateTimeFormat('en-CA', {
+            timeZone,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hourCycle: 'h23'
+        }));
+    }
+    return zonedFormatters.get(timeZone);
+}
+
+function zonedDateTimeParts(value, timeZone = CONFIG.scenicTimeZone) {
+    const date = value instanceof Date ? value : new Date(value);
+    if (!Number.isFinite(date.getTime())) return null;
+    const parts = Object.fromEntries(
+        zonedFormatter(timeZone)
+            .formatToParts(date)
+            .filter(part => part.type !== 'literal')
+            .map(part => [part.type, Number(part.value)])
+    );
+    return parts;
+}
+
+function dateStrOffset(value, offsetDays = 0, timeZone = CONFIG.scenicTimeZone) {
+    const parts = zonedDateTimeParts(value, timeZone);
+    const offset = Number(offsetDays);
+    if (!parts || !Number.isInteger(offset)) return '';
+    const shifted = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + offset));
+    return `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())}`;
+}
+
+function dateStr(value, timeZone = CONFIG.scenicTimeZone) {
+    return dateStrOffset(value, 0, timeZone);
+}
+
+function hhmm(value, timeZone = CONFIG.scenicTimeZone) {
+    const parts = zonedDateTimeParts(value, timeZone);
+    return parts ? `${pad(parts.hour)}:${pad(parts.minute)}` : '';
+}
+
+function minuteOfDay(value, timeZone = CONFIG.scenicTimeZone) {
+    const parts = zonedDateTimeParts(value, timeZone);
+    return parts ? parts.hour * 60 + parts.minute : NaN;
+}
+
+function zonedLocalNoon(value, timeZone = CONFIG.scenicTimeZone) {
+    const target = zonedDateTimeParts(value, timeZone);
+    if (!target) return null;
+    const desiredLocal = Date.UTC(target.year, target.month - 1, target.day, 12, 0, 0);
+    let guess = desiredLocal;
+
+    // Resolve the UTC instant that formats as 12:00 on the target scenic day.
+    // Iteration handles offsets and daylight-saving transitions without host-TZ math.
+    for (let i = 0; i < 4; i++) {
+        const actual = zonedDateTimeParts(new Date(guess), timeZone);
+        if (!actual) return null;
+        const actualLocal = Date.UTC(
+            actual.year, actual.month - 1, actual.day,
+            actual.hour, actual.minute, actual.second
+        );
+        const correction = desiredLocal - actualLocal;
+        if (correction === 0) break;
+        guess += correction;
+    }
+    return new Date(guess);
+}
 
 /**
  * 当日光位窗口（05文档 §6.2）
@@ -38,11 +111,14 @@ const hhmm = d => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
  * @param weather {cloudy:boolean}|null
  * @returns {windows:[{start,end,light,trueSunset?}], trueSunset, geometricSunset, cloudy}
  */
-function computeWindows(spot, date, weather = null) {
+function computeWindows(spot, date, weather = null, options = {}) {
     const [lng, lat] = spot.geo.coordinates;
     if (weather?.cloudy) return { windows: [], cloudy: true, trueSunset: null, geometricSunset: null };
 
-    const times = SunCalc.getTimes(date, lat, lng);
+    const timeZone = options.timeZone || CONFIG.scenicTimeZone;
+    const dayAnchor = zonedLocalNoon(date, timeZone);
+    if (!dayAnchor) return { windows: [], cloudy: false, trueSunset: null, geometricSunset: null };
+    const times = SunCalc.getTimes(dayAnchor, lat, lng);
     const sunrise = times.sunrise, sunset = times.sunset;
     if (!sunrise || !sunset || isNaN(sunrise)) {
         return { windows: [], cloudy: false, trueSunset: null, geometricSunset: null };
@@ -87,21 +163,21 @@ function computeWindows(spot, date, weather = null) {
 
     return {
         windows: windows.map(w => ({
-            start: hhmm(w.start), end: hhmm(w.end), light: w.light,
+            start: hhmm(w.start, timeZone), end: hhmm(w.end, timeZone), light: w.light,
             startDate: w.start, endDate: w.end,
-            ...(w.light === 'golden' && w.end >= trueSunset ? { trueSunset: hhmm(trueSunset) } : {})
+            ...(w.light === 'golden' && w.end >= trueSunset ? { trueSunset: hhmm(trueSunset, timeZone) } : {})
         })),
         cloudy: false,
-        trueSunset: hhmm(trueSunset),
-        geometricSunset: hhmm(sunset)
+        trueSunset: hhmm(trueSunset, timeZone),
+        geometricSunset: hhmm(sunset, timeZone)
     };
 }
 
 // 到达时刻与窗口的契合度 0~1（planner photoWindowFit 用）
-function windowFit(windows, eta) {
+function windowFit(windows, eta, options = {}) {
     if (!windows?.length) return 0.5; // 无机位/无窗口 → 中性
-    const t = eta instanceof Date ? eta : new Date(eta);
-    const mins = t.getHours() * 60 + t.getMinutes();
+    const mins = minuteOfDay(eta, options.timeZone || CONFIG.scenicTimeZone);
+    if (!Number.isFinite(mins)) return 0;
     let best = 0;
     for (const w of windows) {
         const [sh, sm] = w.start.split(':').map(Number);
@@ -114,4 +190,15 @@ function windowFit(windows, eta) {
     return best;
 }
 
-module.exports = { sunPos, horizonAt, lightOf, computeWindows, windowFit };
+module.exports = {
+    sunPos,
+    horizonAt,
+    lightOf,
+    zonedDateTimeParts,
+    dateStrOffset,
+    dateStr,
+    hhmm,
+    minuteOfDay,
+    computeWindows,
+    windowFit
+};

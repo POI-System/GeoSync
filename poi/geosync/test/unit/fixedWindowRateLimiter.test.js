@@ -26,16 +26,30 @@ test('fixed-window limiter rejects excess attempts and resets after the window',
     assert.equal(limiter.consume('client-a').allowed, true);
 });
 
-test('fixed-window limiter bounds tracked keys and supports explicit clearing', () => {
+test('fixed-window limiter fails closed at key capacity without evicting existing counters', () => {
+    let now = Date.parse('2026-08-03T12:00:00.000Z');
     const limiter = createFixedWindowRateLimiter({
         windowMs: 60 * 1000,
         maxAttempts: 1,
-        maxKeys: 2
+        maxKeys: 2,
+        clock: () => now
     });
-    limiter.consume('client-a');
-    limiter.consume('client-b');
-    limiter.consume('client-c');
+    assert.equal(limiter.consume('client-a').allowed, true);
+    assert.equal(limiter.consume('client-b').allowed, true);
+    assert.deepEqual(limiter.consume('client-c'), {
+        allowed: false,
+        remaining: 0,
+        retryAfterSec: 60
+    });
     assert.equal(limiter.size, 2);
-    limiter.clear('client-c');
+    assert.equal(limiter.consume('client-a').allowed, false, 'client-a was not evicted');
+
+    limiter.clear('client-a');
     assert.equal(limiter.size, 1);
+    assert.equal(limiter.consume('client-c').allowed, true);
+    assert.equal(limiter.size, 2);
+
+    now += 60 * 1000;
+    assert.equal(limiter.size, 0);
+    assert.equal(limiter.consume('client-d').allowed, true);
 });

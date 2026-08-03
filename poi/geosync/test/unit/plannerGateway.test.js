@@ -92,6 +92,7 @@ function route({
     durationSec,
     distanceM,
     source = 'iserver',
+    degraded,
     edgeId,
     snap,
     verifiedAccessible
@@ -106,7 +107,7 @@ function route({
         gis: {
             source,
             mode: 'ignored-by-planner',
-            degraded: source !== 'iserver',
+            degraded: degraded ?? source !== 'iserver',
             requestId: 'gis-test',
             durationMs: source === 'iserver' ? 10 : 20,
             dataVersion: 'v1'
@@ -117,6 +118,28 @@ function route({
         })
     };
 }
+
+test('planner rejects an invalid startAt before querying candidates', async () => {
+    fixturePois = [poi('poi-a', [0.001, 0], 10)];
+    let queryCount = 0;
+    onCandidateQuery = async () => { queryCount++; };
+
+    await assert.rejects(
+        planner.plan({
+            startLocation: [0, 0],
+            startAt: 'not-a-date',
+            hours: 2,
+            openId: 'user-invalid-start-at'
+        }, {
+            estimateBetween: () => ({ walkSec: 60 }),
+            routeBetween: async () => {
+                throw new Error('routeBetween must not run');
+            }
+        }),
+        error => error.code === 1102 && error.httpStatus === 400
+    );
+    assert.equal(queryCount, 0);
+});
 
 test('plan uses synchronous estimates for optimization and one authoritative route per final leg', async () => {
     fixturePois = [
@@ -157,6 +180,7 @@ test('plan uses synchronous estimates for optimization and one authoritative rou
             durationSec: 150,
             distanceM: 200,
             source: 'cache',
+            degraded: false,
             edgeId: 'edge-2',
             snap: { startDistanceM: 3, endDistanceM: 4 }
         });

@@ -7,6 +7,7 @@ NGINX_CONF_SRC=$PROJECT_DIR/nginx.conf
 NGINX_CONF_DST=/etc/nginx/sites-available/poi
 TLS_CERT=/etc/letsencrypt/live/8688988.xyz/fullchain.pem
 TLS_KEY=/etc/letsencrypt/live/8688988.xyz/privkey.pem
+AMAP_JSCODE_SNIPPET=/etc/nginx/snippets/poi-amap-jscode.conf
 
 cd "$PROJECT_DIR"
 
@@ -29,12 +30,24 @@ if [ ! -f "$TLS_CERT" ] || [ ! -f "$TLS_KEY" ]; then
     echo "TLS certificate files are required at $TLS_CERT and $TLS_KEY"
     exit 1
 fi
+if ! sudo test -f "$AMAP_JSCODE_SNIPPET"; then
+    echo "Provision the AMap jscode snippet at $AMAP_JSCODE_SNIPPET"
+    exit 1
+fi
+if [ "$(sudo stat -c '%U:%G %a' "$AMAP_JSCODE_SNIPPET")" != "root:root 600" ]; then
+    echo "The AMap jscode snippet must be owned by root:root with mode 600"
+    exit 1
+fi
+if ! sudo grep -Eq '^[[:space:]]*set[[:space:]]+\$poi_amap_jscode[[:space:]]+"[A-Za-z0-9_-]{16,256}"[[:space:]]*;[[:space:]]*$' "$AMAP_JSCODE_SNIPPET"; then
+    echo "The AMap jscode snippet has an invalid format"
+    exit 1
+fi
 
 echo "=== [4/8] Create runtime directories ==="
 mkdir -p "$PROJECT_DIR/uploads" "$PROJECT_DIR/logs"
 
 echo "=== [5/8] Validate database and administrator session configuration ==="
-node -e "require('dotenv').config(); const missing=['MONGO_URI','ADMIN_USERNAME','ADMIN_PASSWORD','AUTH_SESSION_SECRET'].filter(k => !String(process.env[k] || '').trim()); if (missing.length) { console.error('Missing required production configuration: ' + missing.join(', ')); process.exit(1); }"
+node -e "require('dotenv').config(); const { parseAdminPasswordHash }=require('./geosync/services/adminPassword'); const missing=['MONGO_URI','PUBLIC_HOST','ADMIN_USERNAME','ADMIN_PASSWORD_HASH','AUTH_SESSION_SECRET','AMAP_KEY'].filter(k => !String(process.env[k] || '').trim()); if (missing.length) { console.error('Missing required production configuration: ' + missing.join(', ')); process.exit(1); } let publicHost; try { publicHost = new URL(String(process.env.PUBLIC_HOST).trim()); } catch { console.error('PUBLIC_HOST must be an exact HTTPS origin'); process.exit(1); } if (publicHost.protocol !== 'https:' || !publicHost.hostname || publicHost.username || publicHost.password || publicHost.pathname !== '/' || publicHost.search || publicHost.hash) { console.error('PUBLIC_HOST must be an exact HTTPS origin'); process.exit(1); } const cookieMode=String(process.env.AUTH_COOKIE_SECURE || '').trim().toLowerCase(); if (cookieMode && cookieMode !== 'true') { console.error('AUTH_COOKIE_SECURE must be blank or true in production'); process.exit(1); } if (String(process.env.ADMIN_PASSWORD || '').trim()) { console.error('Legacy ADMIN_PASSWORD is forbidden'); process.exit(1); } try { parseAdminPasswordHash(process.env.ADMIN_PASSWORD_HASH); } catch { console.error('ADMIN_PASSWORD_HASH is invalid'); process.exit(1); }"
 
 echo "=== [6/8] Create required database indexes ==="
 npm run init:indexes

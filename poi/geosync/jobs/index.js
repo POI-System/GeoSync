@@ -197,11 +197,11 @@ async function spotScoreDaily() {
     const horizonBuilder = require('../services/horizonBuilder');
     const spots = await PhotoSpot.find({ status: 'approved' });
     const today = new Date();
-    const todayStr = geo.dateStrOf(today);
+    const todayStr = sunlight.dateStr(today, CONFIG.scenicTimeZone);
 
     for (const spot of spots) {
         // Null keeps the documented no-weather correction without provider context.
-        const result = sunlight.computeWindows(spot, today, null);
+        const result = sunlight.computeWindows(spot, today, null, { timeZone: CONFIG.scenicTimeZone });
         spot.goldenWindows = result.windows.map(w => ({
             date: todayStr, start: w.start, end: w.end, light: w.light,
             trueSunset: w.trueSunset || undefined
@@ -233,8 +233,7 @@ function computeSpotScore(spot, windowResult) {
 // ===== rhoCalibrate（04文档 §3.6）=====
 async function rhoCalibrate() {
     const { Checkin, GeoSetting } = getModels();
-    const y = new Date(Date.now() - 86400000);
-    const yStr = geo.dateStrOf(y);
+    const yStr = sunlight.dateStrOffset(new Date(), -1, CONFIG.scenicTimeZone);
     const setting = await GeoSetting.findOne({ key: 'gateTotal' }).lean();
     const gateTotal = setting?.value?.[yStr];
     if (!gateTotal) return; // 无票务数据 → ρ 保持
@@ -394,8 +393,9 @@ function startJobs(options = {}) {
     }
 
     const scheduledJobs = [];
-    const schedule = (name, expression, fn) => {
-        scheduler.schedule(expression, fn);
+    const schedule = (name, expression, fn, scheduleOptions) => {
+        if (scheduleOptions) scheduler.schedule(expression, fn, scheduleOptions);
+        else scheduler.schedule(expression, fn);
         scheduledJobs.push(name);
     };
     schedule('ciAggregate', '*/10 * * * *', () => runJob('ciAggregate', ciAggregate));
@@ -404,8 +404,18 @@ function startJobs(options = {}) {
         const n = await pairingService.scan();
         if (n) console.log(`[JOB] pairingScan created ${n} pairings`);
     }));
-    schedule('spotScoreDaily', '30 3 * * *', () => runJob('spotScoreDaily', spotScoreDaily));
-    schedule('rhoCalibrate', '0 4 * * *', () => runJob('rhoCalibrate', rhoCalibrate));
+    schedule(
+        'spotScoreDaily',
+        '30 3 * * *',
+        () => runJob('spotScoreDaily', spotScoreDaily),
+        { timezone: CONFIG.scenicTimeZone }
+    );
+    schedule(
+        'rhoCalibrate',
+        '0 4 * * *',
+        () => runJob('rhoCalibrate', rhoCalibrate),
+        { timezone: CONFIG.scenicTimeZone }
+    );
     schedule('minuteSweep', '* * * * *', () => runJob('minuteSweep', minuteSweep));
     crowd.startFlushLoop();
     // 启动即跑一轮聚合（避免冷启动 heatmap 空窗）

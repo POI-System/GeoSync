@@ -9,24 +9,92 @@ const EXIT = Object.freeze({
     FAILURE: 1
 });
 
-const HOST_POI_INDEXES = Object.freeze([
-    Object.freeze({
-        key: Object.freeze({ geo: '2dsphere' }),
-        options: Object.freeze({ sparse: true })
-    }),
-    Object.freeze({
-        key: Object.freeze({ status: 1, 'visitMeta.tags': 1 }),
-        options: Object.freeze({})
-    })
+function hostIndex(key, options = {}) {
+    return Object.freeze({
+        key: Object.freeze({ ...key }),
+        options: Object.freeze({ ...options })
+    });
+}
+
+function hostCollection(collection, indexes) {
+    return Object.freeze({
+        collection,
+        indexes: Object.freeze(indexes)
+    });
+}
+
+// Host schemas live in server.js and are not compiled by the standalone
+// GeoSync index runner. Keep their production indexes explicit here so the
+// application can disable runtime autoIndex without relying on an old database.
+const HOST_INDEX_MANIFEST = Object.freeze([
+    hostCollection('users', [
+        hostIndex({ openId: 1 }, { unique: true })
+    ]),
+    hostCollection('pois', [
+        hostIndex({ userOpenId: 1 }),
+        hostIndex({ status: 1 }),
+        hostIndex({ geo: '2dsphere' }, { sparse: true }),
+        hostIndex({ status: 1, 'visitMeta.tags': 1 })
+    ]),
+    hostCollection('notifications', [
+        hostIndex({ recipientOpenId: 1 }),
+        hostIndex({ type: 1 }),
+        hostIndex({ read: 1 }),
+        hostIndex({ createTime: 1 })
+    ]),
+    hostCollection('chatmessages', [
+        hostIndex({ roomId: 1 }),
+        hostIndex({ fromOpenId: 1 }),
+        hostIndex({ createTime: 1 })
+    ]),
+    hostCollection('chatrooms', [
+        hostIndex({ roomId: 1 }, { unique: true }),
+        hostIndex({ type: 1 }),
+        hostIndex({ poiId: 1 }),
+        hostIndex({ collectorOpenId: 1 }),
+        hostIndex({ reviewerOpenId: 1 }),
+        hostIndex({ lastTime: 1 }),
+        hostIndex({ createTime: 1 })
+    ]),
+    hostCollection('systemsettings', [
+        hostIndex({ key: 1 }, { unique: true })
+    ]),
+    hostCollection('disputes', [
+        hostIndex({ poiId: 1 }),
+        hostIndex({ collectorOpenId: 1 }),
+        hostIndex({ tokenHash: 1 }, { unique: true }),
+        hostIndex({ status: 1 }),
+        hostIndex({ createTime: 1 })
+    ])
 ]);
 
-async function createHostPoiIndexes(ExternalPoi) {
-    if (!ExternalPoi?.collection || typeof ExternalPoi.collection.createIndex !== 'function') {
-        throw new TypeError('ExternalPoi collection with createIndex is required');
+function sanitizedIndexErrorCode(cause) {
+    return /^[A-Z0-9_:-]{1,64}$/.test(String(cause?.code || ''))
+        ? cause.code
+        : 'INDEX_CREATE_FAILED';
+}
+
+async function initializeHostIndexes({ database, log, error }) {
+    if (!database || typeof database.collection !== 'function') {
+        throw new TypeError('MongoDB database with collection access is required');
     }
-    for (const index of HOST_POI_INDEXES) {
-        await ExternalPoi.collection.createIndex(index.key, index.options);
+    let failed = false;
+    for (const entry of HOST_INDEX_MANIFEST) {
+        try {
+            const collection = database.collection(entry.collection);
+            if (!collection || typeof collection.createIndex !== 'function') {
+                throw new TypeError(`Collection ${entry.collection} cannot create indexes`);
+            }
+            for (const index of entry.indexes) {
+                await collection.createIndex(index.key, index.options);
+            }
+            log(`[init-indexes] ${entry.collection} ok`);
+        } catch (cause) {
+            error(`[init-indexes] ${entry.collection} FAILED: ${sanitizedIndexErrorCode(cause)}`);
+            failed = true;
+        }
     }
+    return failed;
 }
 
 async function dropLegacyCapacityIndex(model, log) {
@@ -44,23 +112,21 @@ async function dropLegacyCapacityIndex(model, log) {
     log(`[init-indexes] dropped legacy index ${legacy.name}`);
 }
 
-async function initializeIndexes({ models, log = console.log, error = console.error }) {
-    let failed = false;
+async function initializeIndexes({
+    models,
+    database,
+    log = console.log,
+    error = console.error
+}) {
+    let failed = await initializeHostIndexes({ database, log, error });
     for (const [name, model] of Object.entries(models)) {
-        if (name.startsWith('External') && name !== 'ExternalPoi') continue;
+        if (name.startsWith('External')) continue;
         try {
-            if (name === 'ExternalPoi') {
-                await createHostPoiIndexes(model);
-            } else {
-                if (name === 'CapacityToken') await dropLegacyCapacityIndex(model, log);
-                await model.createIndexes();
-            }
+            if (name === 'CapacityToken') await dropLegacyCapacityIndex(model, log);
+            await model.createIndexes();
             log(`[init-indexes] ${model.collection.name} ok`);
         } catch (cause) {
-            const code = /^[A-Z0-9_:-]{1,64}$/.test(String(cause?.code || ''))
-                ? cause.code
-                : 'INDEX_CREATE_FAILED';
-            error(`[init-indexes] ${model.collection?.name || name} FAILED: ${code}`);
+            error(`[init-indexes] ${model.collection?.name || name} FAILED: ${sanitizedIndexErrorCode(cause)}`);
             failed = true;
         }
     }
@@ -85,7 +151,12 @@ async function runIndexInitialization({
         await mongooseInstance.connect(uri, { autoIndex: false, autoCreate: false });
         connected = true;
         const models = registerModelsFn(mongooseInstance);
-        const exitCode = await initializeIndexes({ models, log, error });
+        const exitCode = await initializeIndexes({
+            models,
+            database: mongooseInstance.connection?.db,
+            log,
+            error
+        });
         log('[init-indexes] done');
         return exitCode;
     } finally {
@@ -106,8 +177,8 @@ if (require.main === module) {
 
 module.exports = {
     EXIT,
-    HOST_POI_INDEXES,
-    createHostPoiIndexes,
+    HOST_INDEX_MANIFEST,
+    initializeHostIndexes,
     initializeIndexes,
     runIndexInitialization
 };

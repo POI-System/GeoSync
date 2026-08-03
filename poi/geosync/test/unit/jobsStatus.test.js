@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { CONFIG } = require('../../config');
 const { startJobs } = require('../../jobs');
 
 test('primary scheduler returns its actual running status and omits placeholder jobs', () => {
@@ -12,8 +13,8 @@ test('primary scheduler returns its actual running status and omits placeholder 
     const status = startJobs({
         env: { NODE_APP_INSTANCE: '0' },
         scheduler: {
-            schedule(expression, fn) {
-                scheduled.push({ expression, fn });
+            schedule(expression, fn, options) {
+                scheduled.push({ expression, fn, options });
                 return { stop() {} };
             }
         },
@@ -42,6 +43,10 @@ test('primary scheduler returns its actual running status and omits placeholder 
     assert.equal(warmups, 1);
     assert.equal(unrefs, 1);
     assert.equal(status.scheduledJobs.includes('trailMining'), false);
+    const spotScoreSchedule = scheduled.find(item => item.expression === '30 3 * * *');
+    assert.deepEqual(spotScoreSchedule.options, { timezone: CONFIG.scenicTimeZone });
+    const rhoSchedule = scheduled.find(item => item.expression === '0 4 * * *');
+    assert.deepEqual(rhoSchedule.options, { timezone: CONFIG.scenicTimeZone });
 });
 
 test('non-primary scheduler reports intentional disablement and schedules nothing', () => {

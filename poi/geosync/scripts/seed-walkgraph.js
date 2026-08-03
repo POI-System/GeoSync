@@ -11,6 +11,13 @@ const fs = require('fs');
 const mongoose = require('mongoose');
 const { registerModels } = require('../models');
 const geo = require('../lib/geo');
+const {
+    normalizeBoolean,
+    normalizeCoordinate,
+    normalizeLineCoordinates,
+    normalizeWalkEdgeMetrics,
+    polylineDistanceM
+} = require('../lib/walkEdgeContract');
 
 const SCENIC_ID = process.env.SCENIC_ID || 'default';
 
@@ -39,7 +46,8 @@ async function main() {
     for (const f of features) {
         if (f.geometry?.type !== 'Point') continue;
         const nodeId = f.properties?.nodeId || `n_${String(++nSeq).padStart(3, '0')}`;
-        const coords = f.geometry.coordinates;
+        const coords = normalizeCoordinate(f.geometry.coordinates, { coerce: true });
+        if (!coords) continue;
         await WalkNode.updateOne(
             { nodeId },
             {
@@ -49,7 +57,7 @@ async function main() {
                     kind: f.properties?.kind || 'junction'
                 }
             },
-            { upsert: true }
+            { upsert: true, runValidators: true }
         );
         nodes.push({ nodeId, coords });
     }
@@ -67,21 +75,39 @@ async function main() {
     let edges = 0, skipped = 0;
     for (const f of features) {
         if (f.geometry?.type !== 'LineString') continue;
-        const coords = f.geometry.coordinates;
+        const coords = normalizeLineCoordinates(f.geometry.coordinates, { coerce: true });
+        if (!coords) { skipped++; continue; }
         const p = f.properties || {};
         const from = p.from || snap(coords[0]);
         const to = p.to || snap(coords[coords.length - 1]);
         if (!from || !to || from === to) { skipped++; continue; }
-        let distanceM = 0;
-        for (let i = 0; i < coords.length - 1; i++) distanceM += geo.haversine(coords[i], coords[i + 1]);
-        distanceM = Math.round(distanceM);
-        const walkSec = Math.round(distanceM / 1.4 * (p.stairs ? 1.6 : 1));
+        const stairs = normalizeBoolean(p.stairs, { coerce: true, defaultValue: false });
+        const accessible = normalizeBoolean(p.accessible, { coerce: true, defaultValue: false });
+        const rawDistanceM = polylineDistanceM(coords);
+        if (stairs === null || accessible === null || rawDistanceM === null) {
+            skipped++;
+            continue;
+        }
+        const distanceM = Math.round(rawDistanceM);
+        const walkSec = Math.round(distanceM / 1.4 * (stairs ? 1.6 : 1));
+        const metrics = normalizeWalkEdgeMetrics({
+            distanceM,
+            walkSec,
+            // GIS contract publishes slope as a percentage, not a 0..1 ratio.
+            slope: p.slopePct ?? p.slope_pct ?? p.slope,
+            shade: p.shade,
+            covered: p.covered
+        }, { geometryDistanceM: distanceM, coerce: true });
+        if (!metrics) { skipped++; continue; }
         const base = {
-            scenicId: SCENIC_ID, distanceM, walkSec,
-            slope: Number(p.slope) || 0, stairs: Boolean(p.stairs),
-            shade: p.shade != null ? Number(p.shade) : 0.5,
-            covered: p.covered != null ? Number(p.covered) : 0,
-            accessible: Boolean(p.accessible),
+            scenicId: SCENIC_ID,
+            distanceM: metrics.distanceM,
+            walkSec: metrics.walkSec,
+            slope: metrics.slope,
+            stairs,
+            shade: metrics.shade,
+            covered: metrics.covered,
+            accessible,
             status: 'open', source: 'import'
         };
         for (const [a, b, geom] of [[from, to, coords], [to, from, [...coords].reverse()]]) {
@@ -89,7 +115,7 @@ async function main() {
             await WalkEdge.updateOne(
                 { edgeId },
                 { $set: { ...base, from: a, to: b, geometry: geom } },
-                { upsert: true }
+                { upsert: true, runValidators: true }
             );
             edges++;
         }

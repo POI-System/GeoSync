@@ -76,6 +76,17 @@ function startCoordinates(value) {
     return [value[0], value[1]];
 }
 
+const INVALID_START_AT = Symbol('invalid-start-at');
+
+function normalizeStartAt(value) {
+    if (value === undefined || value === null || value === '') return undefined;
+    if (!['string', 'number'].includes(typeof value)) return INVALID_START_AT;
+    if (typeof value === 'string' && !value.trim()) return INVALID_START_AT;
+    if (typeof value === 'number' && !Number.isFinite(value)) return INVALID_START_AT;
+    const date = new Date(value);
+    return Number.isFinite(date.getTime()) ? date : INVALID_START_AT;
+}
+
 function routeBetweenOf(req) {
     const routeBetween = req?.app?.locals?.geosync?.routeBetween;
     if (typeof routeBetween !== 'function') {
@@ -213,6 +224,11 @@ router.post('/plan', wrap(async (req, res) => {
     if (!memCache.rateLimit(`plan:${req.openId}`, 3, 60000)) {
         return fail(res, 429, 2101, '规划请求过频，请稍候');
     }
+    const { startLocation, startAt, hours, interests, pace, accessible, shadeFirst } = req.body || {};
+    const normalizedStartAt = normalizeStartAt(startAt);
+    if (normalizedStartAt === INVALID_START_AT) {
+        return fail(res, 400, 1102, 'startAt 必须是有效日期时间');
+    }
     const { Itinerary } = getModels();
     const existing = await Itinerary.findOne({
         openId: req.openId, state: { $in: ['draft', 'active', 'paused'] }
@@ -220,11 +236,10 @@ router.post('/plan', wrap(async (req, res) => {
     if (existing) {
         return fail(res, 400, 1206, '存在未完成行程', { existingId: existing._id });
     }
-    const { startLocation, startAt, hours, interests, pace, accessible, shadeFirst } = req.body || {};
     const origin = startCoordinates(startLocation) || CONFIG.scenicCenter;
     const routeBetween = routeBetweenOf(req);
     const result = await planner.plan({
-        startLocation: origin, startAt, hours: Number(hours),
+        startLocation: origin, startAt: normalizedStartAt, hours: Number(hours),
         interests, pace, accessible: Boolean(accessible), shadeFirst: Boolean(shadeFirst),
         openId: req.openId,
         requestId: req.headers?.['x-request-id']
@@ -233,7 +248,7 @@ router.post('/plan', wrap(async (req, res) => {
     try {
         it = await Itinerary.create({
             scenicId: CONFIG.scenicId, openId: req.openId, activeOwner: req.openId,
-            date: geo.dateStrOf(startAt || new Date()),
+            date: geo.dateStrOf(normalizedStartAt || new Date()),
             startLocation: origin ? { type: 'Point', coordinates: origin } : null,
             preferences: { pace: pace || 'normal', interests: interests || [], hours: Number(hours), accessible: Boolean(accessible), shadeFirst: Boolean(shadeFirst) },
             stops: result.stops,

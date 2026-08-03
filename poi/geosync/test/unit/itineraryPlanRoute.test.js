@@ -183,6 +183,7 @@ test('plan injects the request-scoped resolver and serializes canonical plus leg
     assert.equal(planCall.input.requestId, 'request-plan');
     assert.deepEqual(planCall.input.startLocation, [118, 32]);
     assert.equal(planCall.input.shadeFirst, true);
+    assert.equal(planCall.input.startAt.toISOString(), '2026-08-02T01:00:00.000Z');
 
     assert.equal(createdPayload.openId, 'user-1');
     assert.equal(createdPayload.activeOwner, 'user-1');
@@ -205,4 +206,32 @@ test('plan injects the request-scoped resolver and serializes canonical plus leg
     assert.equal(data.stops[0].segments[0].sourceRef.datasetName, 'WalkEdge@GeoSync');
     assert.deepEqual(data.stops[0].snap, { startDistanceM: 1, endDistanceM: 2 });
     assert.equal(data.stops[0].pathGeometry, 'legacy-stop-path');
+});
+
+test('plan rejects an invalid startAt before planner or persistence work', async () => {
+    planCall = null;
+    createdPayload = null;
+    const req = {
+        method: 'POST',
+        originalUrl: '/api/itinerary/plan',
+        openId: 'user-invalid-start-at',
+        headers: {},
+        body: {
+            startLocation: [118, 32],
+            startAt: 'not-a-date',
+            hours: 2
+        },
+        app: { locals: { geosync: { routeBetween: async () => canonicalStop } } }
+    };
+    const res = response();
+    let nextError;
+
+    await planHandler(req, res, error => { nextError = error; });
+
+    assert.equal(nextError, undefined);
+    assert.equal(res.statusCode, 400);
+    assert.equal(res.body.success, false);
+    assert.equal(res.body.code, 1102);
+    assert.equal(planCall, null);
+    assert.equal(createdPayload, null);
 });

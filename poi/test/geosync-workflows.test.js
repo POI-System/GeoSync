@@ -162,6 +162,51 @@ function leanQuery(value) {
     return { lean: async () => value };
 }
 
+function barrierEventRecordModel() {
+    const records = new Map();
+    function matches(record, filter) {
+        if (!record) return false;
+        for (const [key, expected] of Object.entries(filter || {})) {
+            if (key === '$or') {
+                if (!expected.some(condition => matches(record, condition))) return false;
+            } else if (expected && typeof expected === 'object' && '$lte' in expected) {
+                if (new Date(record[key] || 0) > new Date(expected.$lte)) return false;
+            } else if (record[key] !== expected) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return {
+        findOne(filter) {
+            const record = records.get(filter.eventId);
+            return leanQuery(record ? structuredClone(record) : null);
+        },
+        async findOneAndUpdate(filter, update, options = {}) {
+            let record = records.get(filter.eventId) || null;
+            if (!matches(record, filter)) {
+                if (!options.upsert) return null;
+                if (record) {
+                    const error = new Error('duplicate eventId');
+                    error.code = 11000;
+                    throw error;
+                }
+                record = {
+                    eventId: filter.eventId,
+                    payloadHash: filter.payloadHash,
+                    ...(update.$setOnInsert || {})
+                };
+            }
+            Object.assign(record, structuredClone(update.$set || {}));
+            for (const [key, value] of Object.entries(update.$inc || {})) {
+                record[key] = Number(record[key] || 0) + Number(value);
+            }
+            records.set(record.eventId, record);
+            return structuredClone(record);
+        }
+    };
+}
+
 function responseHarness() {
     return {
         statusCode: 200,
@@ -372,7 +417,8 @@ test('GeoSync Phase 5 cross-module workflows', { concurrency: false }, async t =
                         version: itinerary.version + 1
                     };
                 }
-            }
+            },
+            BarrierEventRecord: barrierEventRecordModel()
         };
 
         await routeBetween(

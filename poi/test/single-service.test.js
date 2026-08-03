@@ -9,6 +9,9 @@ const net = require('node:net');
 const path = require('node:path');
 
 const POI_ROOT = path.resolve(__dirname, '..');
+const TEST_ADMIN_PASSWORD = 'phase5-password-2026';
+const TEST_ADMIN_PASSWORD_HASH = '$scrypt$v=1$ln=15,r=8,p=3$'
+    + 'cGhhc2U1LXRlc3Qtc2FsdA$SfaAtmf0OyIUgNuRkV16XX6BdcUReNmk4eFLEPxP2a4';
 
 function countOf(source, pattern) {
     return (source.match(pattern) || []).length;
@@ -81,6 +84,11 @@ async function stopChild(child) {
 test('POI server contains one production runtime and attaches GeoSync before listen', async () => {
     const source = await readFile(path.join(POI_ROOT, 'server.js'), 'utf8');
     const geosyncSource = await readFile(path.join(POI_ROOT, 'geosync', 'index.js'), 'utf8');
+    const portalSource = await readFile(path.join(POI_ROOT, 'portal.html'), 'utf8');
+    const legacyEntrySources = await Promise.all(
+        ['index.html', 'admin.html', 'chat.html']
+            .map(fileName => readFile(path.join(POI_ROOT, fileName), 'utf8'))
+    );
     assert.equal(countOf(source, /mongoose\.connect\s*\(/g), 1);
     assert.match(
         source,
@@ -130,23 +138,102 @@ test('POI server contains one production runtime and attaches GeoSync before lis
         /finally\s*\{\s*if \(stateReservation\) oauthStateStore\.release\(stateReservation\)/,
         'failed OAuth exchanges must release their state reservation'
     );
+    assert.doesNotMatch(source, /redirectWithOpenId/,
+        'OAuth redirects must not serialize OpenID into the portal URL');
+    assert.match(oauthCallbackSource, /res\.redirect\(committedFlow\.redirect\)/,
+        'the browser callback must redirect only to the committed safe target');
+
+    const authStatusAt = source.indexOf("app.get('/auth/status'");
+    const socketAuthAt = source.indexOf('function normalizeSocketString', authStatusAt);
+    assert.ok(authStatusAt >= 0 && socketAuthAt > authStatusAt);
+    const authStatusSource = source.slice(authStatusAt, socketAuthAt);
+    assert.match(authStatusSource, /res\.json\(\{\s*status:\s*'ok'\s*\}\)/,
+        'QR completion must return only an opaque success status');
+    assert.doesNotMatch(authStatusSource, /res\.json\(\{[^}]*openid/i,
+        'QR polling must not serialize OpenID');
+
+    assert.match(portalSource, /\/api\/auth\/session\?_t=/,
+        'the portal must bootstrap identity from the signed server session');
+    assert.doesNotMatch(portalSource, /params\.get\(\s*['"]openid['"]\s*\)/i);
+    assert.doesNotMatch(portalSource, /searchParams\.set\(\s*['"]openid['"]/i);
+    assert.doesNotMatch(
+        portalSource,
+        /localStorage\.(?:getItem|setItem)\(\s*['"]user_?openid['"]/i
+    );
+    assert.doesNotMatch(portalSource, /\bonOpenId\b|\bdata\.openid\b/);
+    const portalLogoutAt = portalSource.indexOf('async function handleLogout()');
+    const portalRenderAt = portalSource.indexOf('\n      return (', portalLogoutAt);
+    assert.ok(portalLogoutAt >= 0 && portalRenderAt > portalLogoutAt,
+        'portal must define a bounded async logout handler');
+    const portalLogoutSource = portalSource.slice(portalLogoutAt, portalRenderAt);
+    assert.match(portalLogoutSource, /fetch\(['"]\/api\/auth\/logout['"][\s\S]*?method:\s*['"]POST['"]/,
+        'portal logout must ask the server to clear the signed session');
+    assert.match(portalLogoutSource,
+        /serverLogoutConfirmed\s*\?\s*['"]anonymous['"]\s*:\s*['"]unavailable['"]/,
+        'an unconfirmed server logout must remain observable');
+    assert.match(portalLogoutSource, /setOpenId\(['"]['"]\)/,
+        'portal logout must clear the in-memory identity');
+    assert.doesNotMatch(portalSource, /io\(\s*\{\s*query:\s*\{\s*openId/i,
+        'Socket authentication must use the signed cookie, not an OpenID query');
+    assert.doesNotMatch(portalSource,
+        /\/api\/(?:poi\/my|notifications|chat\/rooms|chat\/history)[^\s'"`]*openId/i,
+        'signed user APIs must not copy OpenID into request URLs');
+    assert.doesNotMatch(portalSource, /formData\.append\(\s*['"]userOpenId['"]/i);
+    assert.doesNotMatch(portalSource, /JSON\.stringify\(\{[^\n}]*\bopenId\b/i,
+        'signed user APIs must not duplicate OpenID in JSON bodies');
+    assert.doesNotMatch(portalSource, /emit\(\s*['"]chatMessage['"][^\n}]*\bopenId\b/i);
+    for (const legacyEntrySource of legacyEntrySources) {
+        assert.match(legacyEntrySource, /localStorage\.removeItem\(\s*['"]user_openid['"]\s*\)/);
+        assert.match(legacyEntrySource, /localStorage\.removeItem\(\s*['"]userOpenId['"]\s*\)/);
+        assert.doesNotMatch(legacyEntrySource, /params\.get\(\s*['"]openid['"]\s*\)/i);
+        assert.doesNotMatch(legacyEntrySource, /searchParams\.set\(\s*['"]openid['"]/i);
+        assert.doesNotMatch(
+            legacyEntrySource,
+            /localStorage\.(?:getItem|setItem)\(\s*['"]user_?openid['"]/i
+        );
+    }
+    assert.match(portalSource, /serviceHost:\s*`\$\{window\.location\.origin\}\/\_AMapService`/);
+    assert.doesNotMatch(portalSource, /securityJsCode|config\?\.amap\?\.securityCode/);
+    assert.doesNotMatch(source, /AMAP_SEC|securityCode/);
+    assert.match(
+        portalSource,
+        /sessionStatus === 'anonymous'[\s\S]+\/auth\/wechat/,
+        'the portal must start OAuth only after session bootstrap confirms anonymity'
+    );
 
     const requireAt = source.indexOf("require('./geosync')");
     const poiSchemaExtensionAt = source.indexOf('addHostPoiGeoSyncFields(poiSchema)');
     const poiModelAt = source.indexOf("mongoose.model('POI', poiSchema)");
     const attachAt = source.indexOf('geosync.attach({');
     const shutdownAt = source.indexOf('installGracefulShutdown({');
-    const staticAt = source.indexOf('app.use(express.static(__dirname');
+    const staticAt = source.indexOf('app.use(express.static(publicRoot');
     const listenAt = source.indexOf('server.listen(');
     assert.ok(requireAt >= 0, 'GeoSync must be loaded from poi/geosync');
+    assert.match(source,
+        /const runtimeAutoIndexEnabled = CONFIG\.nodeEnv !== 'production';/,
+        'runtime index creation must remain enabled outside production');
+    assert.match(source,
+        /mongoose\.set\('autoIndex', runtimeAutoIndexEnabled\);/,
+        'the global Mongoose autoIndex policy must use the environment gate');
+    assert.match(source,
+        /mongoose\.connect\(CONFIG\.mongoUri,\s*\{[\s\S]*?autoIndex: runtimeAutoIndexEnabled[\s\S]*?\}\)/,
+        'the connection must receive the same production autoIndex policy');
     assert.ok(
         poiSchemaExtensionAt > requireAt && poiModelAt > poiSchemaExtensionAt,
         'the host POI schema must receive GeoSync fields before model compilation'
     );
     assert.doesNotMatch(source, /mongoose\.model\(['"]AdminUser['"]|adminUserSchema/,
         'the runtime must not compile a disconnected administrator credential store');
+    assert.doesNotMatch(source, /@alicloud\/ocr20191230|RecognizeCharacterRequest|recognizeCharacter\(/,
+        'the retired OCR SDK and its vulnerable dependency chain must not return');
+    assert.match(source, /passwordHash:\s*process\.env\.ADMIN_PASSWORD_HASH/);
+    assert.doesNotMatch(source, /timingSafeEqualText\([^\n]*password/,
+        'administrator passwords must be verified by the configured KDF');
     assert.ok(attachAt > requireAt, 'GeoSync must be attached after it is loaded');
     assert.ok(attachAt < staticAt, 'GeoSync API routes must be mounted before static files');
+    assert.doesNotMatch(source, /express\.static\(__dirname/,
+        'the repository root must never be a generic public static directory');
+    assert.match(source, /const publicRoot = path\.join\(__dirname, 'public'\)/);
     assert.ok(attachAt < listenAt, 'GeoSync must be attached before server.listen');
     assert.ok(
         shutdownAt > attachAt && shutdownAt < listenAt,
@@ -195,7 +282,8 @@ test('single POI process serves old and GeoSync endpoints without exposing backe
             MONGO_STARTUP_FAIL_FAST: 'false',
             ADMIN_TOKEN: '',
             ADMIN_USERNAME: 'phase1-admin',
-            ADMIN_PASSWORD: 'phase1-password',
+            ADMIN_PASSWORD: '',
+            ADMIN_PASSWORD_HASH: TEST_ADMIN_PASSWORD_HASH,
             GEOSYNC_BACKGROUND_ENABLED: 'false',
             SUPERMAP_ENABLED: 'true',
             SUPERMAP_MANIFEST_PATH: './config/supermap-manifest.test-missing.json',
@@ -210,8 +298,8 @@ test('single POI process serves old and GeoSync endpoints without exposing backe
             SMTP_HOST: '',
             SMTP_USER: '',
             SMTP_PASS: '',
-            AMAP_KEY: '',
-            AMAP_SEC: '',
+            AMAP_KEY: 'public-amap-test-key',
+            AMAP_SEC: 'legacy-jscode-must-not-be-exposed',
             ISERVER_USERNAME: '',
             ISERVER_PASSWORD: ''
         },
@@ -226,7 +314,16 @@ test('single POI process serves old and GeoSync endpoints without exposing backe
         const base = `http://127.0.0.1:${port}`;
         const oldConfigResponse = await waitForResponse(`${base}/api/client-config`);
         assert.equal(oldConfigResponse.status, 200);
-        assert.equal((await oldConfigResponse.json()).success, true);
+        const oldConfig = await oldConfigResponse.json();
+        assert.equal(oldConfig.success, true);
+        assert.deepEqual(oldConfig.amap, { key: 'public-amap-test-key' });
+        const serializedOldConfig = JSON.stringify(oldConfig);
+        for (const forbidden of [
+            'securityCode', 'securityJsCode', 'AMAP_SEC', 'jscode',
+            'legacy-jscode-must-not-be-exposed'
+        ]) {
+            assert.equal(serializedOldConfig.includes(forbidden), false);
+        }
 
         const geoConfigResponse = await fetch(`${base}/api/geosync/client-config`);
         assert.equal(geoConfigResponse.status, 200);
@@ -277,16 +374,28 @@ test('single POI process serves old and GeoSync endpoints without exposing backe
         const loginResponse = await fetch(`${base}/api/admin/login`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ username: 'phase1-admin', password: 'phase1-password' })
+            body: JSON.stringify({ username: 'phase1-admin', password: TEST_ADMIN_PASSWORD })
         });
         assert.equal(loginResponse.status, 503);
         assert.equal(Object.hasOwn(await loginResponse.json(), 'token'), false);
 
-        const portalResponse = await fetch(`${base}/portal.html`);
-        assert.equal(portalResponse.status, 200);
+        for (const publicPath of ['/', '/index.html', '/portal.html?v=test', '/admin.html', '/chat.html']) {
+            const response = await fetch(`${base}${publicPath}`);
+            assert.equal(response.status, 200, `${publicPath} must remain publicly available`);
+        }
+        const portalHeadResponse = await fetch(`${base}/portal.html`, { method: 'HEAD' });
+        assert.equal(portalHeadResponse.status, 200);
         const socketClientResponse = await fetch(`${base}/socket.io/socket.io.js`);
         assert.equal(socketClientResponse.status, 200);
-        for (const privatePath of ['/server.js', '/package.json', '/geosync/index.js']) {
+        for (const privatePath of [
+            '/server.js',
+            '/package.json',
+            '/geosync/index.js',
+            '/test/fixtures/private.html',
+            '/node_modules/bignumber.js/doc/API.html',
+            '/login.png',
+            '/focous.png'
+        ]) {
             const response = await fetch(`${base}${privatePath}`);
             assert.equal(response.status, 404, `${privatePath} must not be publicly served`);
         }
@@ -294,6 +403,58 @@ test('single POI process serves old and GeoSync endpoints without exposing backe
         assert.doesNotMatch(output, /OverwriteModelError|Cannot find module|EADDRINUSE/);
     } finally {
         await stopChild(child);
+    }
+});
+
+test('production refuses a non-origin public host or an explicit Secure-cookie downgrade', {
+    timeout: 10000
+}, async () => {
+    const cases = [
+        { publicHost: 'http://127.0.0.1:3000', cookieSecure: '' },
+        { publicHost: 'https://example.test', cookieSecure: 'false' },
+        { publicHost: 'https://reviewer:public-host-password@example.test', cookieSecure: '' },
+        { publicHost: 'https://example.test/oauth', cookieSecure: '' },
+        { publicHost: 'https://example.test?next=portal', cookieSecure: '' },
+        { publicHost: 'https://example.test/#fragment', cookieSecure: '' }
+    ];
+
+    for (const [index, testCase] of cases.entries()) {
+        const child = spawn(process.execPath, ['server.js'], {
+            cwd: POI_ROOT,
+            windowsHide: true,
+            env: {
+                ...process.env,
+                PORT: String(await reservePort()),
+                HOST: '127.0.0.1',
+                NODE_ENV: 'production',
+                PUBLIC_HOST: testCase.publicHost,
+                CORS_ORIGIN: testCase.publicHost,
+                AUTH_COOKIE_SECURE: testCase.cookieSecure,
+                AUTH_SESSION_SECRET: 'cookie-gate-session-secret-Q7m2V9x4K6p1R8c3N5h0',
+                ADMIN_PASSWORD: '',
+                ADMIN_PASSWORD_HASH: TEST_ADMIN_PASSWORD_HASH,
+                MONGO_URI: `mongodb://127.0.0.1:1/poi_cookie_gate_${index}`
+            },
+            stdio: ['ignore', 'pipe', 'pipe']
+        });
+        let output = '';
+        child.stdout.on('data', chunk => { output += chunk.toString(); });
+        child.stderr.on('data', chunk => { output += chunk.toString(); });
+
+        try {
+            const exit = once(child, 'exit');
+            const timeout = new Promise((_, reject) => {
+                setTimeout(() => reject(new Error('insecure production process did not exit')), 5000);
+            });
+            const [code, signal] = await Promise.race([exit, timeout]);
+            assert.equal(code, 1);
+            assert.equal(signal, null);
+            assert.match(output, /AUTH_COOKIE_SECURE_REQUIRED/);
+            assert.doesNotMatch(output,
+                /cookie-gate-session-secret|poi_cookie_gate|public-host-password|next=portal/);
+        } finally {
+            await stopChild(child);
+        }
     }
 });
 
@@ -309,16 +470,17 @@ test('production Mongo initial connection failure exits with sanitized diagnosti
             PORT: String(port),
             HOST: '127.0.0.1',
             NODE_ENV: 'production',
-            PUBLIC_HOST: `http://127.0.0.1:${port}`,
-            CORS_ORIGIN: `http://127.0.0.1:${port}`,
+            PUBLIC_HOST: `https://127.0.0.1:${port}`,
+            CORS_ORIGIN: `https://127.0.0.1:${port}`,
             MONGO_URI: 'mongodb://sensitive-user:sensitive-password@127.0.0.1:1/poi_fail_fast',
             MONGO_STARTUP_FAIL_FAST: '',
             AUTH_SESSION_SECRET: 'fail-fast-session-secret-Q7m2V9x4K6p1R8c3N5h0',
             AUTH_SIGN_REQUIRED: 'true',
-            AUTH_COOKIE_SECURE: 'false',
+            AUTH_COOKIE_SECURE: '',
             ADMIN_TOKEN: '',
             ADMIN_USERNAME: 'fail-fast-admin',
-            ADMIN_PASSWORD: 'fail-fast-password',
+            ADMIN_PASSWORD: '',
+            ADMIN_PASSWORD_HASH: TEST_ADMIN_PASSWORD_HASH,
             GEOSYNC_BACKGROUND_ENABLED: 'false',
             SUPERMAP_ENABLED: 'false',
             SCENIC_ID: 'fail-fast-test',
@@ -359,6 +521,78 @@ test('production Mongo initial connection failure exits with sanitized diagnosti
     }
 });
 
+test('legacy plaintext administrator password disables login without leaking secrets', {
+    timeout: 20000
+}, async () => {
+    const port = await reservePort();
+    const legacyPassword = 'legacy-admin-password-secret-sentinel';
+    const adminCredential = 'legacy-test-admin-token-R8m3Q7v2N9x5K4p6D1s0F7h2';
+    const child = spawn(process.execPath, ['server.js'], {
+        cwd: POI_ROOT,
+        windowsHide: true,
+        env: {
+            ...process.env,
+            PORT: String(port),
+            HOST: '127.0.0.1',
+            NODE_ENV: 'test',
+            PUBLIC_HOST: `http://127.0.0.1:${port}`,
+            CORS_ORIGIN: `http://127.0.0.1:${port}`,
+            MONGO_URI: 'mongodb://127.0.0.1:1/poi_legacy_admin_password_test',
+            MONGO_STARTUP_FAIL_FAST: 'false',
+            AUTH_SESSION_SECRET: 'legacy-password-session-secret-Q7m2V9x4K6p1R8c3',
+            AUTH_SIGN_REQUIRED: 'true',
+            AUTH_COOKIE_SECURE: 'false',
+            ADMIN_TOKEN: adminCredential,
+            ADMIN_USERNAME: 'legacy-password-admin',
+            ADMIN_PASSWORD: legacyPassword,
+            ADMIN_PASSWORD_HASH: TEST_ADMIN_PASSWORD_HASH,
+            GEOSYNC_BACKGROUND_ENABLED: 'false',
+            SUPERMAP_ENABLED: 'false',
+            SCENIC_ID: 'legacy-password-test',
+            SCENIC_CENTER: '120,30',
+            POSITION_HMAC_SECRET: 'legacy-password-position-secret-N8p3V6c1Q9m4',
+            WX_APPID: '',
+            WX_SECRET: '',
+            ALIYUN_AK: '',
+            ALIYUN_SK: '',
+            SMTP_HOST: '',
+            SMTP_USER: '',
+            SMTP_PASS: '',
+            AMAP_KEY: '',
+            AMAP_SEC: ''
+        },
+        stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let output = '';
+    child.stdout.on('data', chunk => { output += chunk.toString(); });
+    child.stderr.on('data', chunk => { output += chunk.toString(); });
+
+    try {
+        const base = `http://127.0.0.1:${port}`;
+        await waitForResponse(`${base}/api/client-config`);
+        const login = await fetch(`${base}/api/admin/login`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+                username: 'legacy-password-admin',
+                password: TEST_ADMIN_PASSWORD
+            })
+        });
+        assert.equal(login.status, 503);
+        assert.equal(Object.hasOwn(await login.json(), 'token'), false);
+
+        const recovery = await fetch(`${base}/api/admin/geosync/gis/status`, {
+            headers: { authorization: `Bearer ${adminCredential}` }
+        });
+        assert.equal(recovery.status, 200);
+        assert.match(output, /ADMIN_PASSWORD_PLAINTEXT_FORBIDDEN/);
+        assert.doesNotMatch(output, new RegExp(legacyPassword));
+        assert.equal(output.includes(TEST_ADMIN_PASSWORD_HASH), false);
+    } finally {
+        await stopChild(child);
+    }
+});
+
 test('configured host auth uses HttpOnly cookies and rejects unsafe credential transports', {
     timeout: 25000
 }, async () => {
@@ -379,10 +613,12 @@ test('configured host auth uses HttpOnly cookies and rejects unsafe credential t
             MONGO_STARTUP_FAIL_FAST: 'false',
             AUTH_SESSION_SECRET: 'integration-session-secret-Z9x4P2m8V6c1R7k5Q3h0',
             AUTH_SIGN_REQUIRED: 'true',
-            AUTH_COOKIE_SECURE: 'false',
+            AUTH_COOKIE_SECURE: '',
+            AUTH_FLOW_MAX_PENDING_PER_NETWORK: '2',
             ADMIN_TOKEN: adminCredential,
             ADMIN_USERNAME: 'phase5-admin',
-            ADMIN_PASSWORD: 'phase5-password',
+            ADMIN_PASSWORD: '',
+            ADMIN_PASSWORD_HASH: TEST_ADMIN_PASSWORD_HASH,
             SCREEN_TOKEN: screenCredential,
             SCREEN_SESSION_TTL_S: '120',
             GEOSYNC_BACKGROUND_ENABLED: 'false',
@@ -468,7 +704,7 @@ test('configured host auth uses HttpOnly cookies and rejects unsafe credential t
         const loginResponse = await fetch(`${base}/api/admin/login`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ username: 'phase5-admin', password: 'phase5-password' })
+            body: JSON.stringify({ username: 'phase5-admin', password: TEST_ADMIN_PASSWORD })
         });
         assert.equal(loginResponse.status, 200);
         const loginBody = await loginResponse.json();
@@ -481,6 +717,8 @@ test('configured host auth uses HttpOnly cookies and rejects unsafe credential t
         assert.ok(adminSetCookie);
         assert.match(adminSetCookie, /HttpOnly/);
         assert.match(adminSetCookie, /SameSite=Lax/);
+        assert.doesNotMatch(adminSetCookie, /(?:^|;\s*)Secure(?:;|$)/i,
+            'blank AUTH_COOKIE_SECURE must derive false from an HTTP PUBLIC_HOST');
         assert.doesNotMatch(adminSetCookie, new RegExp(adminCredential));
         const adminCookie = cookiePair(adminSetCookie);
 
@@ -514,6 +752,7 @@ test('configured host auth uses HttpOnly cookies and rejects unsafe credential t
         assert.match(screenSetCookie, /Path=\/api\/screen/);
         assert.match(screenSetCookie, /Max-Age=120/);
         assert.match(screenSetCookie, /HttpOnly/);
+        assert.doesNotMatch(screenSetCookie, /(?:^|;\s*)Secure(?:;|$)/i);
         assert.doesNotMatch(screenSetCookie, new RegExp(screenCredential));
         const screenCookie = cookiePair(screenSetCookie);
 
@@ -568,6 +807,7 @@ test('configured host auth uses HttpOnly cookies and rejects unsafe credential t
         assert.ok(oauthCookieHeader);
         assert.match(oauthCookieHeader, /HttpOnly/);
         assert.match(oauthCookieHeader, /Path=\/auth\/wechat\/callback/);
+        assert.doesNotMatch(oauthCookieHeader, /(?:^|;\s*)Secure(?:;|$)/i);
         const oauthLocation = new URL(oauthStart.headers.get('location'));
         const oauthState = oauthLocation.searchParams.get('state');
         assert.ok(oauthState && oauthState.length >= 32);
@@ -589,11 +829,15 @@ test('configured host auth uses HttpOnly cookies and rejects unsafe credential t
         assert.match(qrClaimSetCookie, /HttpOnly/);
         assert.match(qrClaimSetCookie, /SameSite=Strict/);
         assert.match(qrClaimSetCookie, /Path=\/auth\/status/);
+        assert.doesNotMatch(qrClaimSetCookie, /(?:^|;\s*)Secure(?:;|$)/i);
         const qrBody = await qrResponse.json();
         assert.match(qrBody.sid, /^[a-f0-9]{32}$/);
-        const qrState = new URL(qrBody.qrUrl).searchParams.get('state');
+        const qrAuthorizeUrl = new URL(qrBody.qrUrl);
+        const qrState = qrAuthorizeUrl.searchParams.get('state');
         assert.ok(qrState && qrState.length >= 32);
         assert.notEqual(qrState, 'qr');
+        const qrCallbackUrl = new URL(qrAuthorizeUrl.searchParams.get('redirect_uri'));
+        assert.equal(qrCallbackUrl.searchParams.get('sid'), qrBody.sid);
 
         const unboundQrStatus = await fetch(
             `${base}/auth/status?sid=${encodeURIComponent(qrBody.sid)}`
@@ -605,6 +849,14 @@ test('configured host auth uses HttpOnly cookies and rejects unsafe credential t
         );
         assert.equal(boundQrStatus.status, 200);
         assert.deepEqual(await boundQrStatus.json(), { status: 'pending' });
+
+        const quotaBlocked = await fetch(`${base}/auth/wechat?redirect=/portal.html`, {
+            redirect: 'manual'
+        });
+        assert.equal(quotaBlocked.status, 429,
+            'browser and QR flows from one network must share the pending quota');
+        const retryAfter = Number(quotaBlocked.headers.get('retry-after'));
+        assert.ok(Number.isInteger(retryAfter) && retryAfter >= 1 && retryAfter <= 300);
 
         assert.doesNotMatch(output, new RegExp(adminCredential));
         assert.doesNotMatch(output, new RegExp(screenCredential));

@@ -172,7 +172,7 @@
   <div id="root"></div>
 
   <script type="text/babel" data-presets="poi-react-classic">
-    const { createContext, useContext, useEffect, useMemo, useRef, useState } = React;
+    const { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } = React;
 
     const ROLE_API = { collector: 'collector', verifier: 'reviewer' };
     const ROLE_UI = { collector: 'collector', reviewer: 'verifier' };
@@ -750,20 +750,26 @@
 
     function getInitialParams() {
       const params = new URLSearchParams(location.search);
-      const openId = params.get('openid') || localStorage.getItem('user_openid') || localStorage.getItem('userOpenId') || '';
       const roleParam = params.get('role') || localStorage.getItem('userRole') || '';
       return {
-        openId,
         role: ROLE_UI[roleParam] || roleParam || null,
         tab: params.get('tab') || '',
         editPoi: params.get('editPoi') || ''
       };
     }
 
-    function saveOpenId(openId) {
-      if (!openId) return;
-      localStorage.setItem('user_openid', openId);
-      localStorage.setItem('userOpenId', openId);
+    function clearLegacyIdentityStorage() {
+      localStorage.removeItem('user_openid');
+      localStorage.removeItem('userOpenId');
+      const url = new URL(window.location.href);
+      let changed = false;
+      for (const key of [...url.searchParams.keys()]) {
+        if (key.toLowerCase() === 'openid') {
+          url.searchParams.delete(key);
+          changed = true;
+        }
+      }
+      if (changed) history.replaceState(null, '', url.pathname + url.search + url.hash);
     }
 
     function apiRole(role) { return ROLE_API[role] || 'collector'; }
@@ -888,11 +894,10 @@
       amapLoaderPromise = (async () => {
         const config = await fetchJson('/api/client-config?_t=' + Date.now());
         const key = config?.amap?.key;
-        const securityCode = config?.amap?.securityCode;
         if (!key) throw new Error('AMap key missing');
-        if (securityCode) {
-          window._AMapSecurityConfig = { securityJsCode: securityCode };
-        }
+        window._AMapSecurityConfig = {
+          serviceHost: `${window.location.origin}/_AMapService`
+        };
         await new Promise((resolve, reject) => {
           const script = document.createElement('script');
           script.src = `https://webapi.amap.com/maps?v=2.0&key=${encodeURIComponent(key)}`;
@@ -978,8 +983,9 @@
     function App() {
       const initial = useMemo(getInitialParams, []);
       const disputeToken = useMemo(() => new URLSearchParams(window.location.search).get('disputeToken') || '', []);
-      const [openId, setOpenId] = useState(initial.openId);
-      const [appState, setAppState] = useState(initial.openId ? (initial.role ? 'main' : 'landing') : 'landing');
+      const [openId, setOpenId] = useState('');
+      const [sessionStatus, setSessionStatus] = useState('loading');
+      const [appState, setAppState] = useState('landing');
       const [role, setRole] = useState(initial.role);
       const [initialTab] = useState(initial.tab);
       const [initialEditPoi] = useState(initial.editPoi);
@@ -1001,6 +1007,44 @@
         document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
       }, [lang]);
 
+      const restoreSession = useCallback(async () => {
+        clearLegacyIdentityStorage();
+        try {
+          const response = await fetch('/api/auth/session?_t=' + Date.now(), { cache: 'no-store' });
+          const payload = await response.json().catch(() => ({}));
+          if (response.status === 401) {
+            setOpenId('');
+            setSessionStatus('anonymous');
+            setAppState('landing');
+            return false;
+          }
+          if (!response.ok || payload.success === false || !payload.data?.openId) {
+            throw new Error(payload.message || `Request failed: ${response.status}`);
+          }
+          const restoredOpenId = String(payload.data.openId);
+          const preferredRole = initial.role;
+          const preferredRoleMatches = preferredRole
+            && apiRole(preferredRole) === payload.data.role;
+          setOpenId(restoredOpenId);
+          setSessionStatus('authenticated');
+          if (preferredRoleMatches) {
+            setRole(preferredRole);
+            setAppState('main');
+          } else {
+            setRole(null);
+            setAppState('landing');
+          }
+          return true;
+        } catch (_error) {
+          setOpenId('');
+          setSessionStatus('unavailable');
+          setAppState('landing');
+          return false;
+        }
+      }, [initial.role]);
+
+      useEffect(() => { void restoreSession(); }, [restoreSession]);
+
       useEffect(() => {
         if (!openId || !role) return;
         const boundRole = apiRole(role);
@@ -1010,17 +1054,13 @@
         fetchJson('/api/user/bind-role', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ openId, role: boundRole })
+          body: JSON.stringify({ role: boundRole })
         }).catch(err => {
           roleBindKeyRef.current = '';
           console.warn('[bind-role:init]', err);
         });
       }, [openId, role]);
 
-      function handleOpenId(value) {
-        setOpenId(value);
-        saveOpenId(value);
-      }
       async function handleLogin(selectedRole) {
         if (!openId) {
           alert(t('wechatAuthRequired'));
@@ -1029,16 +1069,36 @@
         await fetchJson('/api/user/bind-role', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ openId, role: apiRole(selectedRole) })
+          body: JSON.stringify({ role: apiRole(selectedRole) })
         });
         localStorage.setItem('userRole', selectedRole);
         setRole(selectedRole);
         setAppState('main');
       }
-      function handleLogout() {
-        localStorage.removeItem('userRole');
-        setRole(null);
-        setAppState('landing');
+      async function handleLogout() {
+        let serverLogoutConfirmed = false;
+        try {
+          const response = await fetch('/api/auth/logout', {
+            method: 'POST',
+            cache: 'no-store',
+            headers: { Accept: 'application/json' }
+          });
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok || payload.success !== true) {
+            throw new Error(`Logout request failed: ${response.status}`);
+          }
+          serverLogoutConfirmed = true;
+        } catch (error) {
+          console.warn('[auth:logout] server logout was not confirmed', error?.message || 'network error');
+        } finally {
+          clearLegacyIdentityStorage();
+          localStorage.removeItem('userRole');
+          roleBindKeyRef.current = '';
+          setOpenId('');
+          setRole(null);
+          setSessionStatus(serverLogoutConfirmed ? 'anonymous' : 'unavailable');
+          setAppState('landing');
+        }
       }
 
       return (
@@ -1053,7 +1113,7 @@
           <div className="relative z-10 w-full min-h-screen text-slate-100 font-[500] flex">
             {disputeToken ? <DisputeResolvePage token={disputeToken} /> : (
               <>
-                {appState === 'landing' && <HeroLandingPage openId={openId} onOpenId={handleOpenId} onLogin={handleLogin} />}
+                {appState === 'landing' && <HeroLandingPage openId={openId} sessionStatus={sessionStatus} onSessionReady={restoreSession} onLogin={handleLogin} />}
                 {appState === 'main' && <MainLayout role={role || 'collector'} openId={openId} initialTab={initialTab} initialEditPoi={initialEditPoi} onLogout={handleLogout} />}
               </>
             )}
@@ -1110,7 +1170,6 @@
         url.searchParams.set('tab', 'collect');
         url.searchParams.set('editPoi', poiId);
         url.searchParams.set('role', 'collector');
-        if (detail?.collectorOpenId) url.searchParams.set('openid', detail.collectorOpenId);
         window.location.href = url.toString();
       }
 
@@ -1178,28 +1237,51 @@
       );
     }
 
-    function HeroLandingPage({ openId, onOpenId, onLogin }) {
+    function HeroLandingPage({ openId, sessionStatus, onSessionReady, onLogin }) {
       const { t } = useLang();
       const qrRef = useRef(null);
       const pollRef = useRef(null);
+      const authFlowRef = useRef(0);
+      const redirectStartedRef = useRef(false);
       const [statusKey, setStatusKey] = useState(openId ? 'deviceAuthenticated' : 'initializingWechat');
       const [statusText, setStatusText] = useState('');
       const [qrReady, setQrReady] = useState(false);
       const [loggingRole, setLoggingRole] = useState('');
-      const isWeChat = /MicroMessenger/i.test(navigator.userAgent);
+      const isWeChat = useMemo(() => /MicroMessenger/i.test(navigator.userAgent), []);
 
-      useEffect(() => {
-        if (openId) return;
-        if (isWeChat) {
-          setStatusKey('redirectingWechat');
-          location.href = '/auth/wechat?redirect=' + encodeURIComponent('/portal.html');
-          return;
+      const pollStatus = useCallback(async (sid, flowId) => {
+        if (authFlowRef.current !== flowId) return;
+        try {
+          const data = await fetchJson('/auth/status?sid=' + encodeURIComponent(sid) + '&_t=' + Date.now());
+          if (authFlowRef.current !== flowId) return;
+          if (data.status === 'ok') {
+            const restored = await onSessionReady();
+            if (authFlowRef.current !== flowId) return;
+            if (restored) {
+              setStatusKey('authComplete');
+              setStatusText('');
+            } else {
+              setStatusKey('networkWaiting');
+              setStatusText('');
+            }
+            return;
+          }
+          if (data.status === 'expired') {
+            setStatusKey('qrExpired');
+            setStatusText('');
+            return;
+          }
+        } catch (_error) {
+          if (authFlowRef.current !== flowId) return;
+          setStatusKey('networkWaiting');
+          setStatusText('');
         }
-        initQrLogin();
-        return () => clearTimeout(pollRef.current);
-      }, []);
+        if (authFlowRef.current === flowId) {
+          pollRef.current = setTimeout(() => pollStatus(sid, flowId), 2000);
+        }
+      }, [onSessionReady]);
 
-      async function initQrLogin() {
+      const initQrLogin = useCallback(async flowId => {
         clearTimeout(pollRef.current);
         setQrReady(false);
         setStatusKey('generatingQr');
@@ -1207,6 +1289,7 @@
         if (qrRef.current) qrRef.current.innerHTML = '';
         try {
           const data = await fetchJson('/auth/wechat/qr?_t=' + Date.now());
+          if (authFlowRef.current !== flowId) return;
           if (window.QRCode && qrRef.current) {
             new QRCode(qrRef.current, {
               text: data.qrUrl,
@@ -1217,31 +1300,64 @@
           }
           setQrReady(true);
           setStatusKey('scanToAuth');
-          pollStatus(data.sid);
-        } catch (err) {
-          setStatusText(err.message || t('qrInitFailed'));
-        }
-      }
-      async function pollStatus(sid) {
-        try {
-          const data = await fetchJson('/auth/status?sid=' + encodeURIComponent(sid) + '&_t=' + Date.now());
-          if (data.status === 'ok' && data.openid) {
-            setStatusKey('authComplete');
-            setStatusText('');
-            onOpenId(data.openid);
-            return;
-          }
-          if (data.status === 'expired') {
-            setStatusKey('qrExpired');
-            setStatusText('');
-            return;
-          }
-        } catch (_err) {
-          setStatusKey('networkWaiting');
+          void pollStatus(data.sid, flowId);
+        } catch (_error) {
+          if (authFlowRef.current !== flowId) return;
+          setStatusKey('qrInitFailed');
           setStatusText('');
         }
-        pollRef.current = setTimeout(() => pollStatus(sid), 2000);
-      }
+      }, [pollStatus]);
+
+      useEffect(() => {
+        clearTimeout(pollRef.current);
+        const flowId = ++authFlowRef.current;
+        setStatusText('');
+
+        if (openId || sessionStatus === 'authenticated') {
+          setQrReady(false);
+          setStatusKey('deviceAuthenticated');
+        } else if (sessionStatus === 'loading') {
+          setQrReady(false);
+          setStatusKey('initializingWechat');
+        } else if (sessionStatus === 'unavailable') {
+          setQrReady(false);
+          setStatusKey('networkWaiting');
+        } else if (sessionStatus === 'anonymous') {
+          if (isWeChat) {
+            if (!redirectStartedRef.current) {
+              redirectStartedRef.current = true;
+              setStatusKey('redirectingWechat');
+              location.href = '/auth/wechat?redirect=' + encodeURIComponent('/portal.html');
+            }
+          } else {
+            void initQrLogin(flowId);
+          }
+        }
+
+        return () => {
+          if (authFlowRef.current === flowId) authFlowRef.current += 1;
+          clearTimeout(pollRef.current);
+        };
+      }, [initQrLogin, isWeChat, openId, sessionStatus]);
+
+      const refreshAuthorization = useCallback(async () => {
+        clearTimeout(pollRef.current);
+        const flowId = ++authFlowRef.current;
+        if (sessionStatus === 'unavailable') {
+          setQrReady(false);
+          setStatusKey('initializingWechat');
+          setStatusText('');
+          const restored = await onSessionReady();
+          if (authFlowRef.current === flowId && !restored) {
+            setStatusKey('networkWaiting');
+          }
+          return;
+        }
+        if (sessionStatus === 'anonymous' && !isWeChat) {
+          await initQrLogin(flowId);
+        }
+      }, [initQrLogin, isWeChat, onSessionReady, sessionStatus]);
+
       async function submitRole(role) {
         setLoggingRole(role);
         try { await onLogin(role); }
@@ -1273,7 +1389,7 @@
                 </div>
                 <p className="text-xs text-blue-100/60 uppercase tracking-widest min-h-[1.25rem]">{statusText || t(statusKey)}</p>
                 {!openId && !isWeChat && (
-                  <button onClick={initQrLogin} className="mt-5 liquid-glass px-5 py-3 rounded-full text-xs uppercase tracking-widest text-white">
+                  <button onClick={refreshAuthorization} disabled={sessionStatus === 'loading'} className="mt-5 liquid-glass px-5 py-3 rounded-full text-xs uppercase tracking-widest text-white disabled:opacity-40 disabled:cursor-not-allowed">
                     {t('refreshQr')}
                   </button>
                 )}
@@ -1330,7 +1446,7 @@
       useEffect(() => { loadPois(); }, [role, openId]);
       useEffect(() => {
         if (!window.io || !openId) return;
-        const socket = io({ query: { openId } });
+        const socket = io();
         socketRef.current = socket;
         socket.on('newPoi', loadPois);
         socket.on('poiStatusChanged', loadPois);
@@ -1345,7 +1461,7 @@
           const publicUrl = `/api/poi/all?_t=${stamp}`;
           const workUrl = role === 'verifier'
             ? `/api/admin/list?page=1&size=80&_t=${stamp}`
-            : `/api/poi/my?openId=${encodeURIComponent(openId)}&page=1&size=80&_t=${stamp}`;
+            : `/api/poi/my?page=1&size=80&_t=${stamp}`;
           const [publicData, workData] = await Promise.all([
             fetchJson(publicUrl),
             fetchJson(workUrl)
@@ -1614,7 +1730,6 @@
           formData.append('description', [desc.trim(), category ? `人工分类：${category}` : ''].filter(Boolean).join('\n'));
           formData.append('lng', location.lng);
           formData.append('lat', location.lat);
-          formData.append('userOpenId', openId);
           if (file) formData.append('poiImage', file, 'poi-upload.jpg');
           const data = await fetchJson(isEditing ? '/api/poi/update' : '/api/submit-poi', { method: 'POST', body: formData });
           setIsSubmitted(true);
@@ -1783,7 +1898,7 @@
           await fetchJson('/api/admin/approve-poi', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: poi.rawId || poi.id, action: isApproved ? 'approved' : 'rejected', rejectReason, openId })
+            body: JSON.stringify({ id: poi.rawId || poi.id, action: isApproved ? 'approved' : 'rejected', rejectReason })
           });
           setSelectedPoi(null);
           reloadPois();
@@ -1802,7 +1917,7 @@
           await fetchJson('/api/poi/dispute', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: poi.rawId || poi.id, openId, reason })
+            body: JSON.stringify({ id: poi.rawId || poi.id, reason })
           });
           alert(t('disputeSubmitted'));
           reloadPois();
@@ -2245,7 +2360,7 @@
       useEffect(() => { loadNotifications(); loadChatRooms(); loadChatHistory(groupRoomId); }, [openId, groupRoomId]);
       useEffect(() => {
         if (!window.io || !openId) return;
-        const socket = io({ query: { openId } });
+        const socket = io();
         socketRef.current = socket;
         socket.on('connect', () => { setSocketReady(true); socket.emit('setNickname', { nickname: `${role === 'verifier' ? 'Verifier' : 'Collector'}-${openId.slice(-4)}` }); });
         socket.on('disconnect', () => setSocketReady(false));
@@ -2262,7 +2377,7 @@
       async function loadNotifications() {
         if (!openId) return;
         try {
-          const data = await fetchJson(`/api/notifications?openId=${encodeURIComponent(openId)}&page=1&size=80&_t=${Date.now()}`);
+          const data = await fetchJson(`/api/notifications?page=1&size=80&_t=${Date.now()}`);
           setNotifications(data.data || []);
           setUnreadCount(data.unreadCount || 0);
         } catch (err) { console.warn('[notifications]', err); }
@@ -2270,19 +2385,19 @@
       async function loadChatRooms() {
         if (!openId) return;
         try {
-          const data = await fetchJson(`/api/chat/rooms?openId=${encodeURIComponent(openId)}&_t=${Date.now()}`);
+          const data = await fetchJson(`/api/chat/rooms?_t=${Date.now()}`);
           setChatRooms(data.data || []);
         } catch (err) { console.warn('[rooms]', err); }
       }
       async function loadChatHistory(roomId) {
         try {
-          const data = await fetchJson(`/api/chat/history?roomId=${encodeURIComponent(roomId)}&openId=${encodeURIComponent(openId)}&size=100&_t=${Date.now()}`);
+          const data = await fetchJson(`/api/chat/history?roomId=${encodeURIComponent(roomId)}&size=100&_t=${Date.now()}`);
           setChatLogs(prev => ({ ...prev, [roomId]: data.data || [] }));
         } catch (err) { console.warn('[history]', err); }
       }
       async function markRead() {
         try {
-          await fetchJson('/api/notifications/read', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ openId }) });
+          await fetchJson('/api/notifications/read', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
           setNotifications(prev => prev.map(item => ({ ...item, read: true })));
           setUnreadCount(0);
         } catch (_err) {}
@@ -2313,7 +2428,7 @@
         if (!roomId) return;
         const text = (input[roomId] || '').trim();
         if (!text || !socketRef.current) return;
-        socketRef.current.emit('chatMessage', { text, roomId, openId });
+        socketRef.current.emit('chatMessage', { text, roomId });
         setInput(prev => ({ ...prev, [roomId]: '' }));
       }
       const roomId = activeRoomId();

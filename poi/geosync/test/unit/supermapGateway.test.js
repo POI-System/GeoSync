@@ -345,6 +345,37 @@ test('queryFeatures enforces allowlists and returns only normalized fields', asy
     });
 });
 
+test('queryFeatures never coerces blank or unsafe SmID values to zero', async () => {
+    const rawSmIds = [null, '', '  ', '01', -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '12'];
+    const client = new MockHttpClient({
+        fixtures: {
+            queryFeatures: {
+                status: 200,
+                data: {
+                    type: 'FeatureCollection',
+                    features: rawSmIds.map((SmID, index) => ({
+                        type: 'Feature',
+                        id: `poi-${index}`,
+                        geometry: { type: 'Point', coordinates: [120, 30] },
+                        properties: { SmID }
+                    }))
+                }
+            }
+        }
+    });
+
+    const result = await gateway({ httpClient: client }).queryFeatures({ datasetKey: 'poi' });
+    for (let index = 0; index < rawSmIds.length - 1; index++) {
+        assert.deepEqual(result.features[index].properties.sourceRef, {
+            datasetName: 'TestPoi@TestDatasource'
+        });
+    }
+    assert.deepEqual(result.features.at(-1).properties.sourceRef, {
+        datasetName: 'TestPoi@TestDatasource',
+        smId: 12
+    });
+});
+
 test('queryFeatures rejects raw filters, unknown datasets, fields, and out-of-range bounds', async () => {
     const instance = gateway();
     await assert.rejects(

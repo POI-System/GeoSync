@@ -42,7 +42,7 @@ router.get('/', wrap(async (req, res) => {
     }
     if (req.query.sort === 'score') spots.sort((a, b) => b.score - a.score);
 
-    const todayStr = geo.dateStrOf(new Date());
+    const todayStr = sunlight.dateStr(new Date(), CONFIG.scenicTimeZone);
     const heat = crowdService.getHeatmapSnapshot();
     ok(res, {
         items: spots.map(s => ({
@@ -65,12 +65,13 @@ router.get('/:id/golden', wrap(async (req, res) => {
     if (!spot || spot.status !== 'approved') throw new BizError(4101, '机位不存在或未过审', 404);
 
     // Null keeps the documented no-weather correction without provider context.
-    const result = sunlight.computeWindows(spot, new Date(), null);
+    const now = new Date();
+    const result = sunlight.computeWindows(spot, now, null, { timeZone: CONFIG.scenicTimeZone });
     if (!result.windows.length && !result.cloudy) {
         return fail(res, 400, 4102, '今日无光位窗口');
     }
     ok(res, {
-        date: geo.dateStrOf(new Date()),
+        date: sunlight.dateStr(now, CONFIG.scenicTimeZone),
         windows: result.windows.map(w => ({
             start: w.start, end: w.end, light: w.light,
             ...(w.trueSunset ? { trueSunset: w.trueSunset, geometricSunset: result.geometricSunset } : {}),

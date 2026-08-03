@@ -17,6 +17,58 @@ function leanQuery(value) {
     return { lean: async () => value };
 }
 
+function eventRecordMatches(record, filter) {
+    if (!record) return false;
+    for (const [key, expected] of Object.entries(filter || {})) {
+        if (key === '$or') {
+            if (!expected.some(condition => eventRecordMatches(record, condition))) return false;
+            continue;
+        }
+        if (expected && typeof expected === 'object' && !Array.isArray(expected)) {
+            if ('$lte' in expected) {
+                if (new Date(record[key] || 0).getTime() > new Date(expected.$lte).getTime()) return false;
+                continue;
+            }
+        }
+        if (record[key] !== expected) return false;
+    }
+    return true;
+}
+
+function createBarrierEventModel(records = new Map()) {
+    return {
+        records,
+        findOne(filter) {
+            const record = records.get(filter.eventId);
+            return leanQuery(record ? structuredClone(record) : null);
+        },
+        async findOneAndUpdate(filter, update, options = {}) {
+            let record = records.get(filter.eventId) || null;
+            const matched = eventRecordMatches(record, filter);
+            if (!matched) {
+                if (!options.upsert) return null;
+                if (record) {
+                    const error = new Error('duplicate eventId');
+                    error.code = 11000;
+                    error.codeName = 'DuplicateKey';
+                    throw error;
+                }
+                record = {
+                    eventId: filter.eventId,
+                    payloadHash: filter.payloadHash,
+                    ...(update.$setOnInsert || {})
+                };
+            }
+            if (update.$set) Object.assign(record, structuredClone(update.$set));
+            for (const [key, value] of Object.entries(update.$inc || {})) {
+                record[key] = Number(record[key] || 0) + Number(value);
+            }
+            records.set(record.eventId, record);
+            return structuredClone(record);
+        }
+    };
+}
+
 function edge(edgeId, datasetName = 'walk_edges_test', smId = 1) {
     return {
         scenicId: 'scenic-test',
@@ -52,6 +104,7 @@ function makeHarness(options = {}) {
     };
     const edges = options.edges || [];
     const itineraries = options.itineraries || [];
+    const barrierEventModel = options.barrierEventModel || createBarrierEventModel();
     const models = {
         WalkEdge: {
             find(filter) {
@@ -69,7 +122,8 @@ function makeHarness(options = {}) {
                 if (options.updateImpl) return options.updateImpl(filter, update, queryOptions);
                 return { _id: filter._id, version: Number(filter.version) + 1 };
             }
-        }
+        },
+        BarrierEventRecord: barrierEventModel
     };
     const routeBetween = options.routeBetween || (async () => null);
     const coordinator = createBarrierRerouteCoordinator({
@@ -106,14 +160,17 @@ function makeHarness(options = {}) {
             state.impacts.push(impact);
             if (options.onImpact) await options.onImpact(impact);
         },
-        clock: () => NOW,
+        clock: options.clock || (() => NOW),
         idFactory: options.idFactory || (({ event, itinerary }) =>
             `proposal-${event.eventId}-${String(itinerary._id)}`),
         proposalTtlMs: 10 * 60000,
-        eventDedupeLimit: 32,
+        eventOwnerId: options.eventOwnerId || 'barrier-test-worker',
+        eventLeaseMs: options.eventLeaseMs || 60 * 1000,
+        eventHeartbeatMs: options.eventHeartbeatMs || 20 * 1000,
+        eventRetentionMs: options.eventRetentionMs || 7 * 24 * 60 * 60 * 1000,
         itineraryConcurrency: options.itineraryConcurrency
     });
-    return { coordinator, state, routeBetween };
+    return { coordinator, state, routeBetween, barrierEventModel };
 }
 
 test('closed barrier snapshot queries the scenic set, validates, deduplicates, and sorts it', async () => {
@@ -706,6 +763,245 @@ test('duplicate event IDs share the first execution and produce no repeated side
     assert.equal(harness.state.reloads, 1);
     assert.equal(harness.state.walkEdgeFilters.length, 1);
     assert.equal(harness.state.itineraryFilters.length, 1);
+    assert.equal(harness.state.impacts.length, 1);
+});
+
+test('concurrent in-memory dedupe rejects conflicting payload reuse', async () => {
+    let releaseReload;
+    let markReloadStarted;
+    const reloadStarted = new Promise(resolve => { markReloadStarted = resolve; });
+    const harness = makeHarness({
+        onReload: () => {
+            markReloadStarted();
+            return new Promise(resolve => { releaseReload = resolve; });
+        }
+    });
+    const first = harness.coordinator.processGraphEvent({
+        eventId: 'event-concurrent-conflict',
+        scenicId: 'scenic-test',
+        edgeId: 'edge-a',
+        operation: 'close'
+    });
+    await reloadStarted;
+
+    await assert.rejects(
+        harness.coordinator.processGraphEvent({
+            eventId: 'event-concurrent-conflict',
+            scenicId: 'scenic-test',
+            edgeId: 'edge-b',
+            operation: 'close'
+        }),
+        error => error?.code === 'BARRIER_EVENT_ID_CONFLICT'
+    );
+
+    releaseReload();
+    const result = await first;
+    assert.equal(result.accepted, true);
+    assert.equal(harness.state.invalidations, 1);
+    assert.equal(harness.state.reloads, 1);
+});
+
+test('Mongo event leases dedupe concurrent coordinators and retain completed replays', async () => {
+    const barrierEventModel = createBarrierEventModel();
+    let releaseReload;
+    let markReloadStarted;
+    const reloadStarted = new Promise(resolve => { markReloadStarted = resolve; });
+    const first = makeHarness({
+        barrierEventModel,
+        eventOwnerId: 'worker-a',
+        onReload: () => {
+            markReloadStarted();
+            return new Promise(resolve => { releaseReload = resolve; });
+        }
+    });
+    const second = makeHarness({
+        barrierEventModel,
+        eventOwnerId: 'worker-b'
+    });
+    const event = {
+        eventId: 'event-cross-instance',
+        scenicId: 'scenic-test',
+        edgeId: 'edge-a',
+        operation: 'close'
+    };
+
+    const acceptedTask = first.coordinator.processGraphEvent(event);
+    await reloadStarted;
+    const inProgressDuplicate = await second.coordinator.processGraphEvent(event);
+
+    assert.equal(inProgressDuplicate.accepted, false);
+    assert.equal(inProgressDuplicate.duplicate, true);
+    assert.equal(inProgressDuplicate.persisted, true);
+    assert.equal(inProgressDuplicate.inProgress, true);
+    assert.equal(second.state.invalidations, 0);
+    assert.equal(second.state.reloads, 0);
+
+    releaseReload();
+    const accepted = await acceptedTask;
+    assert.equal(accepted.accepted, true);
+    const completedDuplicate = await second.coordinator.processGraphEvent(event);
+    assert.equal(completedDuplicate.duplicate, true);
+    assert.equal(completedDuplicate.completed, true);
+    assert.equal(second.state.invalidations, 0);
+
+    const record = barrierEventModel.records.get(event.eventId);
+    assert.equal(record.state, 'completed');
+    assert.equal(record.attempts, 1);
+    assert.equal(record.ownerId, null);
+    assert.ok(record.completedAt instanceof Date);
+    assert.ok(record.expireAt > record.completedAt);
+});
+
+test('failed persistent events are reclaimable without repeating itinerary proposal side effects', async () => {
+    const barrierEventModel = createBarrierEventModel();
+    let currentItinerary = {
+        _id: 'it-recovery',
+        version: 1,
+        state: 'active',
+        pendingProposal: null,
+        rerouteLog: [],
+        stops: [mutableStop('recovery', 'edge-closed')]
+    };
+    const shared = {
+        barrierEventModel,
+        edges: [edge('edge-closed', 'walk_edges_test', 91)],
+        itineraries: () => [structuredClone(currentItinerary)],
+        rebuildTimeline: async () => [mutableStop('recovery-safe', 'edge-safe')],
+        updateImpl(filter, update) {
+            currentItinerary = {
+                ...currentItinerary,
+                pendingProposal: structuredClone(update.$set.pendingProposal),
+                version: currentItinerary.version + 1
+            };
+            return structuredClone(currentItinerary);
+        }
+    };
+    const first = makeHarness({
+        ...shared,
+        eventOwnerId: 'worker-failing',
+        onImpact: async () => { throw new Error('impact transport unavailable'); }
+    });
+    const event = {
+        eventId: 'event-recovery',
+        scenicId: 'scenic-test',
+        edgeId: 'edge-closed',
+        operation: 'close'
+    };
+
+    await assert.rejects(first.coordinator.processGraphEvent(event), /impact transport unavailable/);
+    const failedRecord = barrierEventModel.records.get(event.eventId);
+    assert.equal(failedRecord.state, 'failed');
+    assert.equal(failedRecord.attempts, 1);
+    assert.equal(first.state.updates.length, 1);
+    assert.equal(first.state.published.length, 1);
+
+    const second = makeHarness({
+        ...shared,
+        eventOwnerId: 'worker-recovery'
+    });
+    const recovered = await second.coordinator.processGraphEvent(event);
+
+    assert.equal(recovered.accepted, true);
+    assert.equal(recovered.proposedCount, 1);
+    assert.equal(recovered.outcomes[0].code, 'EVENT_ALREADY_APPLIED');
+    assert.equal(recovered.outcomes[0].replayed, true);
+    assert.equal(second.state.updates.length, 0);
+    assert.equal(second.state.published.length, 0);
+    assert.equal(second.state.impacts.length, 1);
+    const completedRecord = barrierEventModel.records.get(event.eventId);
+    assert.equal(completedRecord.state, 'completed');
+    assert.equal(completedRecord.attempts, 2);
+    assert.equal(completedRecord.lastErrorCode, null);
+});
+
+test('an expired Mongo event lease can be reclaimed after an owner stops renewing', async () => {
+    const barrierEventModel = createBarrierEventModel();
+    const event = {
+        eventId: 'event-expired-lease',
+        scenicId: 'scenic-test',
+        edgeId: 'edge-expired',
+        operation: 'open'
+    };
+    const initial = makeHarness({ barrierEventModel, eventOwnerId: 'worker-initial' });
+    await initial.coordinator.processGraphEvent(event);
+    const record = barrierEventModel.records.get(event.eventId);
+    record.state = 'processing';
+    record.ownerId = 'worker-dead';
+    record.leaseUntil = new Date(NOW.getTime() - 1);
+    record.completedAt = null;
+    record.outcome = null;
+
+    const recovery = makeHarness({ barrierEventModel, eventOwnerId: 'worker-takeover' });
+    const result = await recovery.coordinator.processGraphEvent(event);
+
+    assert.equal(result.accepted, true);
+    assert.equal(recovery.state.invalidations, 1);
+    assert.equal(record.attempts, 2);
+    assert.equal(record.state, 'completed');
+    assert.equal(record.ownerId, null);
+});
+
+test('lease renewal loss fails closed before itinerary queries or writes continue', async () => {
+    const barrierEventModel = createBarrierEventModel();
+    const updateRecord = barrierEventModel.findOneAndUpdate.bind(barrierEventModel);
+    let renewalCalls = 0;
+    barrierEventModel.findOneAndUpdate = async (filter, update, options) => {
+        const isRenewal = filter.ownerId
+            && filter.state === 'processing'
+            && update.$set?.leaseUntil
+            && update.$set?.state === undefined;
+        if (isRenewal) {
+            renewalCalls++;
+            return null;
+        }
+        return updateRecord(filter, update, options);
+    };
+    const harness = makeHarness({
+        barrierEventModel,
+        eventOwnerId: 'worker-lease-loss',
+        eventLeaseMs: 3000,
+        eventHeartbeatMs: 10,
+        onReload: () => new Promise(resolve => setTimeout(resolve, 35))
+    });
+
+    await assert.rejects(
+        harness.coordinator.processGraphEvent({
+            eventId: 'event-lease-loss',
+            scenicId: 'scenic-test',
+            edgeId: 'edge-a',
+            operation: 'close'
+        }),
+        error => error?.code === 'BARRIER_EVENT_LEASE_LOST'
+    );
+
+    assert.ok(renewalCalls >= 1);
+    assert.equal(harness.state.itineraryFilters.length, 0);
+    assert.equal(harness.state.updates.length, 0);
+    const record = barrierEventModel.records.get('event-lease-loss');
+    assert.equal(record.state, 'failed');
+    assert.equal(record.lastErrorCode, 'BARRIER_EVENT_LEASE_LOST');
+});
+
+test('persistent dedupe rejects conflicting payload reuse for the same eventId', async () => {
+    const harness = makeHarness({ eventOwnerId: 'worker-conflict' });
+    await harness.coordinator.processGraphEvent({
+        eventId: 'event-conflict',
+        scenicId: 'scenic-test',
+        edgeId: 'edge-a',
+        operation: 'close'
+    });
+
+    await assert.rejects(
+        harness.coordinator.processGraphEvent({
+            eventId: 'event-conflict',
+            scenicId: 'scenic-test',
+            edgeId: 'edge-b',
+            operation: 'close'
+        }),
+        error => error?.code === 'BARRIER_EVENT_ID_CONFLICT'
+    );
+    assert.equal(harness.state.invalidations, 1);
+    assert.equal(harness.state.reloads, 1);
     assert.equal(harness.state.impacts.length, 1);
 });
 

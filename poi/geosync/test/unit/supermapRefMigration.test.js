@@ -236,7 +236,7 @@ test('apply continues after per-edge failures and sanitizes write errors', async
     });
 });
 
-test('CLI requires an explicit mapping path and MONGO_URI before apply connects', async () => {
+test('CLI requires an explicit mapping path and MONGO_URI before either mode connects', async () => {
     assert.throws(
         () => parseArgs([]),
         error => error.code === 'MAPPING_PATH_REQUIRED'
@@ -247,34 +247,40 @@ test('CLI requires an explicit mapping path and MONGO_URI before apply connects'
         mappingPath: 'mapping.json'
     });
 
-    const stderr = captureStream();
-    let connectCalls = 0;
-    const code = await runCli({
-        argv: ['--mapping', 'mapping.json', '--apply'],
-        env: {},
-        stderr: stderr.stream,
-        stdout: captureStream().stream,
-        mongooseInstance: {
-            connect: async () => { connectCalls++; },
-            disconnect: async () => {}
-        }
-    });
+    for (const argv of [
+        ['--mapping', 'mapping.json'],
+        ['--mapping', 'mapping.json', '--apply']
+    ]) {
+        const stderr = captureStream();
+        let connectCalls = 0;
+        const code = await runCli({
+            argv,
+            env: {},
+            stderr: stderr.stream,
+            stdout: captureStream().stream,
+            mongooseInstance: {
+                connect: async () => { connectCalls++; },
+                disconnect: async () => {}
+            }
+        });
 
-    assert.equal(code, EXIT.INPUT_ERROR);
-    assert.equal(connectCalls, 0);
-    assert.equal(JSON.parse(stderr.value()).code, 'MONGO_URI_REQUIRED');
+        assert.equal(code, EXIT.INPUT_ERROR);
+        assert.equal(connectCalls, 0);
+        assert.equal(JSON.parse(stderr.value()).code, 'MONGO_URI_REQUIRED');
+    }
 });
 
 test('SuperMap dry-run disables automatic collection and index creation', async () => {
     const stdout = captureStream();
     const stderr = captureStream();
     const settings = [];
+    let connectUri;
     let connectOptions;
     let disconnectCalls = 0;
     let migrationInput;
     const code = await runCli({
         argv: ['--mapping', 'mapping.json'],
-        env: {},
+        env: { MONGO_URI: 'mongodb://db.internal/poi-test' },
         stdout: stdout.stream,
         stderr: stderr.stream,
         fileSystem: {
@@ -283,7 +289,10 @@ test('SuperMap dry-run disables automatic collection and index creation', async 
         },
         mongooseInstance: {
             set: (key, value) => settings.push([key, value]),
-            async connect(_uri, options) { connectOptions = options; },
+            async connect(uri, options) {
+                connectUri = uri;
+                connectOptions = options;
+            },
             async disconnect() { disconnectCalls++; }
         },
         registerModelsFn: () => ({ WalkEdge: { sentinel: true } }),
@@ -298,6 +307,7 @@ test('SuperMap dry-run disables automatic collection and index creation', async 
     });
 
     assert.equal(code, EXIT.OK);
+    assert.equal(connectUri, 'mongodb://db.internal/poi-test');
     assert.deepEqual(settings, [['autoIndex', false], ['autoCreate', false]]);
     assert.equal(connectOptions.autoIndex, false);
     assert.equal(connectOptions.autoCreate, false);

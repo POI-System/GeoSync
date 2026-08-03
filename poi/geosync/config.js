@@ -24,6 +24,18 @@ function bool(v, def) {
     return def;
 }
 
+function timeZone(v, def = 'Asia/Shanghai') {
+    const value = String(v || def).trim() || def;
+    try {
+        new Intl.DateTimeFormat('en-US', { timeZone: value }).format(0);
+    } catch (cause) {
+        const error = new Error('SCENIC_TIME_ZONE must be a valid IANA time-zone identifier', { cause });
+        error.code = 'GEOSYNC_SCENIC_TIME_ZONE_INVALID';
+        throw error;
+    }
+    return value;
+}
+
 const nodeEnv = String(process.env.NODE_ENV || 'development').trim().toLowerCase();
 const requestedSignedAuth = bool(process.env.AUTH_SIGN_REQUIRED, true);
 
@@ -31,6 +43,7 @@ const CONFIG = {
     nodeEnv,
     isProduction: nodeEnv === 'production',
     scenicId: process.env.SCENIC_ID || 'default',
+    scenicTimeZone: timeZone(process.env.SCENIC_TIME_ZONE),
     scenicCenter: parseCenter(process.env.SCENIC_CENTER),          // [lng,lat] | null
     fenceRadiusM: num(process.env.SCENIC_FENCE_RADIUS_M, 3000),
     positionMinIntervalS: num(process.env.POSITION_MIN_INTERVAL_S, 30),
@@ -58,7 +71,7 @@ const CONFIG = {
     llm: {
         url: process.env.LLM_API_URL || '',
         key: process.env.LLM_API_KEY || '',
-        model: process.env.LLM_MODEL || 'claude-sonnet-5'
+        model: String(process.env.LLM_MODEL || '').trim()
     },
     demTileDir: process.env.DEM_TILE_DIR || './dem',
     holidayApiUrl: process.env.HOLIDAY_API_URL || '',
@@ -72,8 +85,8 @@ const CONFIG = {
 CONFIG.features = {
     rain: Boolean(CONFIG.rain.url && CONFIG.rain.key),
     weather: Boolean(CONFIG.weather.url && CONFIG.weather.key),
-    nlEdit: Boolean(CONFIG.llm.url && CONFIG.llm.key),
-    guide: Boolean(CONFIG.llm.url && CONFIG.llm.key),
+    nlEdit: Boolean(CONFIG.llm.url && CONFIG.llm.key && CONFIG.llm.model),
+    guide: Boolean(CONFIG.llm.url && CONFIG.llm.key && CONFIG.llm.model),
     pairing: true
 };
 
@@ -106,4 +119,4 @@ function validateOnBoot() {
     if (CONFIG.simMode) warn('SIM_MODE 已开启 —— 生产环境必须关闭！');
 }
 
-module.exports = { CONFIG, validateOnBoot, bool };
+module.exports = { CONFIG, validateOnBoot, bool, timeZone };

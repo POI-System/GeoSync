@@ -99,6 +99,14 @@ class OAuthStateStore {
         return true;
     }
 
+    cancel(state) {
+        const normalizedState = String(state || '').trim();
+        const entry = this.records.get(normalizedState);
+        if (!entry || entry.reservation) return null;
+        this.records.delete(normalizedState);
+        return entry.record;
+    }
+
     _reservedEntry(reservation) {
         if (!reservation || typeof reservation !== 'object') return null;
         const entry = this.records.get(reservation.state);

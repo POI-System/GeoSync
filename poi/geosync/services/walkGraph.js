@@ -2,9 +2,13 @@
 // 05文档 §7 A* + 01文档 §5 内存图。启动加载，graph:update 事件重载。
 
 const { haversine, encodePolyline } = require('../lib/geo');
+const {
+    normalizeBoolean,
+    normalizeWalkEdgeMetrics
+} = require('../lib/walkEdgeContract');
 const { getModels } = require('../models');
 
-const WALK_SPEED = 1.4; // m/s，可采纳启发式用
+const WALK_SPEED = 1.4; // m/s，连接段和直线估算使用
 const MAX_SNAP_DISTANCE_M = 200;
 const AUTHORITATIVE_SNAP_DISTANCE_M = 10;
 const VERIFIED_CONNECTOR_DISTANCE_M = 0.01;
@@ -21,39 +25,60 @@ async function loadIntoMemory() {
     const g = { nodes: new Map(), adj: new Map() };
     for (const n of nodes) {
         const coordinate = validCoordinate(n.geo?.coordinates);
-        if (!coordinate || !n.nodeId) continue;
-        g.nodes.set(n.nodeId, { lng: coordinate[0], lat: coordinate[1], kind: n.kind });
-        g.adj.set(n.nodeId, []);
+        const nodeId = typeof n.nodeId === 'string' ? n.nodeId.trim() : '';
+        if (!coordinate || !nodeId) continue;
+        g.nodes.set(nodeId, { lng: coordinate[0], lat: coordinate[1], kind: n.kind });
+        g.adj.set(nodeId, []);
     }
+    let acceptedEdges = 0;
+    let skippedEdges = 0;
     for (const e of edges) {
-        const fromNode = g.nodes.get(e.from);
-        const toNode = g.nodes.get(e.to);
-        const walkSec = finiteNonNegative(e.walkSec);
-        if (!g.adj.has(e.from) || !toNode || walkSec === null || !e.edgeId) continue;
+        const from = typeof e.from === 'string' ? e.from.trim() : '';
+        const to = typeof e.to === 'string' ? e.to.trim() : '';
+        const edgeId = typeof e.edgeId === 'string' ? e.edgeId.trim() : '';
+        const status = typeof e.status === 'string' ? e.status.trim() : '';
+        const fromNode = g.nodes.get(from);
+        const toNode = g.nodes.get(to);
+        if (!fromNode || !toNode || !edgeId || !['open', 'closed'].includes(status)) {
+            skippedEdges++;
+            continue;
+        }
         const geometry = edgeGeometry(e.geometry, fromNode, toNode);
-        const configuredDistanceM = finiteNonNegative(e.distanceM);
-        g.adj.get(e.from).push({
-            edgeId: String(e.edgeId), from: e.from, to: e.to,
-            walkSec,
-            distanceM: configuredDistanceM === null ? polylineDistance(geometry) : configuredDistanceM,
-            slope: e.slope, stairs: e.stairs, shade: e.shade, covered: e.covered,
-            accessible: e.accessible, accessibleVerified: e.accessibleVerified,
+        const metrics = normalizeWalkEdgeMetrics(e, {
+            geometryDistanceM: polylineDistance(geometry)
+        });
+        const stairs = normalizeBoolean(e.stairs, { defaultValue: false });
+        const accessible = normalizeBoolean(e.accessible, { defaultValue: false });
+        const accessibleVerified = normalizeBoolean(e.accessibleVerified, { defaultValue: false });
+        if (!metrics || stairs === null || accessible === null || accessibleVerified === null) {
+            skippedEdges++;
+            continue;
+        }
+        g.adj.get(from).push({
+            edgeId, from, to,
+            walkSec: metrics.walkSec,
+            distanceM: metrics.distanceM,
+            slope: metrics.slope,
+            stairs,
+            shade: metrics.shade,
+            covered: metrics.covered,
+            accessible,
+            accessibleVerified,
             geometry,
             sourceRef: loadedSourceRef(e.sourceRef),
-            dynamicFactor: e.status === 'closed' ? Infinity : 1
+            dynamicFactor: status === 'closed' ? Infinity : 1
         });
+        acceptedEdges++;
     }
     graph = g;
     loaded = g.nodes.size > 0;
-    console.log(`[GeoSync] [GRAPH] loaded ${nodes.length} nodes / ${edges.length} edges`);
+    console.log(`[GeoSync] [GRAPH] loaded ${g.nodes.size} nodes / ${acceptedEdges} edges`);
+    if (skippedEdges) {
+        console.warn(`[GeoSync] [GRAPH] skipped ${skippedEdges} invalid edges`);
+    }
 }
 
 function isReady() { return loaded; }
-
-function finiteNonNegative(value) {
-    const number = Number(value);
-    return Number.isFinite(number) && number >= 0 ? number : null;
-}
 
 function validCoordinate(value) {
     if (!Array.isArray(value) || value.length !== 2 || !value.every(Number.isFinite)) return null;
@@ -137,13 +162,20 @@ function modeFactor(edge, mode) {
     if (mode === 'accessible') {
         if (edge.stairs) return Infinity;
         let f = 1;
-        if (edge.slope > 0.08) f *= 3;
+        if (edge.slope > 8) f *= 3; // slope 的契约单位是百分比
         if (!edge.accessibleVerified && edge.accessible) f *= 1.2; // 仅人工标注未实证
         if (!edge.accessible && !edge.accessibleVerified) return Infinity;
         return f;
     }
     if (mode === 'shade') return 1.5 - (edge.shade ?? 0.5);
     return 1;
+}
+
+function weightedEdgeCost(edge, mode) {
+    const factor = edge.dynamicFactor * modeFactor(edge, mode);
+    if (!Number.isFinite(factor) || factor < 0) return null;
+    const cost = edge.walkSec * factor;
+    return Number.isFinite(cost) && cost >= 0 ? cost : null;
 }
 
 // 最小堆（简单二叉堆，图规模 ~300 节点足够）
@@ -179,7 +211,8 @@ class MinHeap {
     get size() { return this.a.length; }
 }
 
-// A*：返回图路径及分段/可达性来源；options 可携带完整 barrier edgeId 集合。
+// Dijkstra（A* 的 h=0 特例）：所有模式只需保证边权非负即可获得最短路。
+// options 可携带完整 barrier edgeId 集合；保留 astar 导出名以兼容既有调用方。
 function astar(fromNodeId, toNodeId, mode = 'standard', options = {}) {
     if (!graph.nodes.has(fromNodeId) || !graph.nodes.has(toNodeId)) return null;
     const blockedEdgeIds = barrierEdgeIds(options);
@@ -191,15 +224,10 @@ function astar(fromNodeId, toNodeId, mode = 'standard', options = {}) {
             accessibility: { graphEdgesVerified: true, unverifiedEdgeIds: [] }
         };
     }
-    const target = graph.nodes.get(toNodeId);
-    const h = id => {
-        const n = graph.nodes.get(id);
-        return haversine([n.lng, n.lat], [target.lng, target.lat]) / WALK_SPEED;
-    };
     const open = new MinHeap();
     const gScore = new Map([[fromNodeId, 0]]);
     const cameFrom = new Map(); // nodeId → {prev, edge}
-    open.push({ id: fromNodeId, f: h(fromNodeId) });
+    open.push({ id: fromNodeId, f: 0 });
     const closed = new Set();
 
     while (open.size) {
@@ -209,13 +237,14 @@ function astar(fromNodeId, toNodeId, mode = 'standard', options = {}) {
         closed.add(cur);
         for (const edge of (graph.adj.get(cur) || [])) {
             if (blockedEdgeIds.has(edge.edgeId)) continue;
-            const factor = edge.dynamicFactor * modeFactor(edge, mode);
-            if (!Number.isFinite(factor)) continue;
-            const tentative = gScore.get(cur) + edge.walkSec * factor;
+            const edgeCost = weightedEdgeCost(edge, mode);
+            if (edgeCost === null) continue;
+            const tentative = gScore.get(cur) + edgeCost;
+            if (!Number.isFinite(tentative)) continue;
             if (tentative < (gScore.get(edge.to) ?? Infinity)) {
                 gScore.set(edge.to, tentative);
                 cameFrom.set(edge.to, { prev: cur, edge });
-                open.push({ id: edge.to, f: tentative + h(edge.to) });
+                open.push({ id: edge.to, f: tentative });
             }
         }
     }

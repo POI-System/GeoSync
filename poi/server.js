@@ -13,6 +13,7 @@ const { Server } = require('socket.io');
 const geosync = require('./geosync');
 const { addHostPoiGeoSyncFields } = require('./geosync/services/hostPoiSchema');
 const { OAuthStateStore } = require('./geosync/services/oauthState');
+const { OAuthFlowQuota } = require('./geosync/services/oauthFlowQuota');
 const { serializePublicPoi } = require('./geosync/services/publicPoiProjection');
 const { createHostSocketRoomSync } = require('./geosync/services/hostSocketRooms');
 const { createFixedWindowRateLimiter } = require('./geosync/services/fixedWindowRateLimiter');
@@ -21,6 +22,11 @@ const { installGracefulShutdown } = require('./geosync/services/gracefulShutdown
 const {
     getAdminSessionRevocationModel
 } = require('./geosync/services/adminSessionRevocation');
+const {
+    AdminPasswordError,
+    AdminPasswordBusyError,
+    createAdminPasswordVerifier
+} = require('./geosync/services/adminPassword');
 const {
     COLLECTOR_TEMPLATE_LABEL,
     normalizeAudience,
@@ -47,6 +53,11 @@ const OAUTH_STATE_COOKIE_NAME = 'poi_oauth_state';
 const QR_CLAIM_COOKIE_NAME = 'poi_qr_login_claim';
 const AUTH_FLOW_TTL_MS = 5 * 60 * 1000;
 const AUTH_FLOW_MAX_PENDING = 2048;
+const AUTH_FLOW_MAX_PENDING_PER_NETWORK = boundedPositiveInteger(
+    process.env.AUTH_FLOW_MAX_PENDING_PER_NETWORK,
+    8,
+    64
+);
 
 function boundedPositiveInteger(value, fallback, max) {
     const parsed = Number(value);
@@ -65,7 +76,6 @@ function normalizeTrustProxy(value) {
     return raw;
 }
 
-const Ocr20191230 = require('@alicloud/ocr20191230');
 const OcrApi20210707 = require('@alicloud/ocr-api20210707');
 const OpenApi = require('@alicloud/openapi-client');
 const { RuntimeOptions } = require('@alicloud/tea-util');
@@ -78,8 +88,9 @@ const CONFIG = {
     mongoUri: process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/poi_db',
     adminToken: String(process.env.ADMIN_TOKEN || '').trim(),
     admin: {
-        username: process.env.ADMIN_USERNAME || '',
-        password: process.env.ADMIN_PASSWORD || ''
+        username: String(process.env.ADMIN_USERNAME || '').trim(),
+        passwordHash: process.env.ADMIN_PASSWORD_HASH || '',
+        legacyPasswordConfigured: Boolean(process.env.ADMIN_PASSWORD)
     },
     trustProxy: normalizeTrustProxy(process.env.TRUST_PROXY),
     authSessionSecret: process.env.AUTH_SESSION_SECRET || '',
@@ -121,8 +132,7 @@ const CONFIG = {
     },
 
     amap: {
-        key: process.env.AMAP_KEY || '',
-        securityCode: process.env.AMAP_SEC || ''
+        key: process.env.AMAP_KEY || ''
     },
 
     smtp: {
@@ -135,14 +145,58 @@ const CONFIG = {
         defaultTestEmail: process.env.DEFAULT_TEST_EMAIL || ''
     }
 };
-CONFIG.authCookieSecure = process.env.AUTH_COOKIE_SECURE === undefined
-    ? CONFIG.publicHost.startsWith('https://')
-    : String(process.env.AUTH_COOKIE_SECURE).toLowerCase() !== 'false';
+function normalizePublicOrigin(value) {
+    try {
+        const url = new URL(String(value || '').trim());
+        if (!['http:', 'https:'].includes(url.protocol)
+            || !url.hostname
+            || url.username
+            || url.password
+            || url.pathname !== '/'
+            || url.search
+            || url.hash) {
+            return null;
+        }
+        return url.origin;
+    } catch {
+        return null;
+    }
+}
+
+const normalizedPublicHost = normalizePublicOrigin(CONFIG.publicHost);
+const publicHostUsesHttps = normalizedPublicHost?.startsWith('https://') === true;
+if (normalizedPublicHost) {
+    CONFIG.publicHost = normalizedPublicHost;
+    if (!String(process.env.CORS_ORIGIN || '').trim()) {
+        CONFIG.corsOrigin = normalizedPublicHost;
+    }
+}
+const authCookieSecureValue = String(process.env.AUTH_COOKIE_SECURE || '').trim().toLowerCase();
+CONFIG.authCookieSecure = authCookieSecureValue === ''
+    ? publicHostUsesHttps
+    : authCookieSecureValue !== 'false';
+if (CONFIG.nodeEnv === 'production'
+    && (!normalizedPublicHost || !publicHostUsesHttps || !CONFIG.authCookieSecure)) {
+    const error = new Error(
+        'AUTH_COOKIE_SECURE_REQUIRED: production authentication requires an exact HTTPS PUBLIC_HOST origin and Secure cookies'
+    );
+    error.code = 'AUTH_COOKIE_SECURE_REQUIRED';
+    throw error;
+}
+
+const adminPasswordVerifier = createAdminPasswordVerifier({
+    encodedHash: CONFIG.admin.passwordHash,
+    legacyPasswordConfigured: CONFIG.admin.legacyPasswordConfigured,
+    maxConcurrent: 2
+});
+if (CONFIG.admin.username && !adminPasswordVerifier.configured) {
+    console.warn(
+        '[Auth] administrator password login unavailable:',
+        adminPasswordVerifier.configurationError?.code || 'ADMIN_PASSWORD_HASH_INVALID'
+    );
+}
 
 const ocrEnabled = Boolean(CONFIG.aliyun.accessKeyId && CONFIG.aliyun.accessKeySecret);
-const ocrClient = ocrEnabled
-    ? new Ocr20191230.default(new OpenApi.Config(CONFIG.aliyun))
-    : null;
 const ocrApiClient = ocrEnabled
     ? new OcrApi20210707.default(new OpenApi.Config({
         accessKeyId: CONFIG.aliyun.accessKeyId,
@@ -156,10 +210,13 @@ const ocrRuntime = new RuntimeOptions({
 });
 if (!ocrEnabled) console.warn('[OCR] 未配置阿里云 AK/SK,自动分类将跳过');
 
+const runtimeAutoIndexEnabled = CONFIG.nodeEnv !== 'production';
 mongoose.set('bufferCommands', false);
+mongoose.set('autoIndex', runtimeAutoIndexEnabled);
 
 void monitorInitialMongoConnection(mongoose.connect(CONFIG.mongoUri, {
-    serverSelectionTimeoutMS: 5000
+    serverSelectionTimeoutMS: 5000,
+    autoIndex: runtimeAutoIndexEnabled
 }), {
     nodeEnv: CONFIG.nodeEnv,
     failFastOverride: process.env.MONGO_STARTUP_FAIL_FAST,
@@ -340,8 +397,7 @@ app.get('/api/client-config', (_req, res) => {
     res.json({
         success: true,
         amap: {
-            key: CONFIG.amap.key,
-            securityCode: CONFIG.amap.securityCode
+            key: CONFIG.amap.key
         }
     });
 });
@@ -457,26 +513,15 @@ function extractOcrText(resp) {
 }
 
 async function recognizeUploadedImageText(file) {
-    const publicHost = CONFIG.publicHost.replace(/\/+$/, '');
-    const publicImageUrl = `${publicHost}/uploads/${file.filename}`;
-    if (ocrApiClient) {
-        try {
-            const request = new OcrApi20210707.RecognizeAllTextRequest({
-                body: fs.createReadStream(file.path),
-                type: 'General'
-            });
-            const resp = await ocrApiClient.recognizeAllTextWithOptions(request, ocrRuntime);
-            const text = extractOcrText(resp);
-            if (text) return text;
-        } catch (e) {
-            console.warn('[OCR RecognizeAllText Skip]', e.message);
-        }
-    }
-    const request = new Ocr20191230.RecognizeCharacterRequest({
-        imageURL: publicImageUrl
+    if (!ocrApiClient) return '';
+    const request = new OcrApi20210707.RecognizeAllTextRequest({
+        body: fs.createReadStream(file.path),
+        type: 'General'
     });
-    const resp = await ocrClient.recognizeCharacter(request, ocrRuntime);
-    return extractOcrText(resp);
+    const resp = await ocrApiClient.recognizeAllTextWithOptions(request, ocrRuntime);
+    const text = extractOcrText(resp);
+    if (!text) throw new Error('OCR response did not contain recognized text');
+    return text;
 }
 
 async function recognizeGeoSyncPhoto(photoUrl) {
@@ -958,10 +1003,11 @@ app.post('/api/admin/login', async (req, res) => {
     res.set('Cache-Control', 'no-store');
     try {
         const { username, password } = req.body;
-        if (!username || !password) {
+        if (typeof username !== 'string' || !username
+            || typeof password !== 'string' || !password) {
             return res.status(400).json({ success: false, message: '参数不足' });
         }
-        if (!CONFIG.admin.username || !CONFIG.admin.password) {
+        if (!CONFIG.admin.username || !adminPasswordVerifier.configured) {
             return res.status(503).json({ success: false, message: '管理员账号未配置' });
         }
         const networkKey = requestNetworkKey(req);
@@ -971,8 +1017,21 @@ app.post('/api/admin/login', async (req, res) => {
             adminLoginIpLimiter.consume(networkKey),
             adminLoginAccountLimiter.consume(pairKey)
         )) return;
-        const usernameMatched = timingSafeEqualText(String(username), CONFIG.admin.username);
-        const passwordMatched = timingSafeEqualText(String(password), CONFIG.admin.password);
+        const usernameMatched = timingSafeEqualText(username, CONFIG.admin.username);
+        let passwordMatched;
+        try {
+            passwordMatched = await adminPasswordVerifier.verify(password);
+        } catch (error) {
+            if (error instanceof AdminPasswordBusyError) res.set('Retry-After', '1');
+            if (error instanceof AdminPasswordError) {
+                console.error('[admin-login] password verification unavailable:', error.code);
+                return res.status(503).json({
+                    success: false,
+                    message: 'Administrator authentication is temporarily unavailable'
+                });
+            }
+            throw error;
+        }
         const envAdminMatched = usernameMatched && passwordMatched;
         if (!envAdminMatched) {
             return res.status(401).json({ success: false, message: '账号密码错误' });
@@ -1748,29 +1807,72 @@ app.get('/api/chat/history', requireUser, async (req, res) => {
 
 const qrSessions = new Map();
 const oauthStateStore = new OAuthStateStore({ ttlMs: AUTH_FLOW_TTL_MS });
+const oauthFlowQuota = new OAuthFlowQuota({
+    ttlMs: AUTH_FLOW_TTL_MS,
+    maxTotal: AUTH_FLOW_MAX_PENDING,
+    maxPerNetwork: AUTH_FLOW_MAX_PENDING_PER_NETWORK
+});
+const browserOAuthLeases = new Map();
 const QR_TTL_MS = AUTH_FLOW_TTL_MS;
 const PORTAL_VERSION = process.env.PORTAL_VERSION || 'ui-i18n-chat-20260512-1131';
+
+function releaseBrowserOAuthLease(state) {
+    const lease = browserOAuthLeases.get(state);
+    if (!lease) return false;
+    browserOAuthLeases.delete(state);
+    oauthFlowQuota.release(lease);
+    return true;
+}
+
+function deleteQrSession(sid) {
+    const session = qrSessions.get(sid);
+    if (!session) return null;
+    qrSessions.delete(sid);
+    oauthFlowQuota.release(session.quotaLease);
+    return session;
+}
+
+function acquireOAuthFlow(req, res, kind, jsonResponse = false) {
+    const result = oauthFlowQuota.tryAcquire({
+        networkKey: requestNetworkKey(req),
+        kind
+    });
+    if (result.allowed) return result.lease;
+    res.set('Retry-After', String(result.retryAfterSec));
+    if (jsonResponse) res.status(429).json({ status: 'busy' });
+    else res.status(429).send('Too many pending authorization requests');
+    return null;
+}
 
 function appendPortalVersion(target) {
     const rawTarget = String(target || '/portal.html');
     try {
         const url = new URL(rawTarget, CONFIG.publicHost);
+        for (const key of [...url.searchParams.keys()]) {
+            if (key.toLowerCase() === 'openid') url.searchParams.delete(key);
+        }
         if (url.pathname.endsWith('/portal.html') && !url.searchParams.has('v')) {
             url.searchParams.set('v', PORTAL_VERSION);
         }
         return url.pathname + url.search + url.hash;
     } catch (_e) {
-        const separator = rawTarget.includes('?') ? '&' : '?';
-        return rawTarget.includes('v=') ? rawTarget : `${rawTarget}${separator}v=${PORTAL_VERSION}`;
+        return `/portal.html?v=${encodeURIComponent(PORTAL_VERSION)}`;
     }
 }
 
 setInterval(() => {
     const now = Date.now();
     for (const [sid, sess] of qrSessions) {
-        if (sess.expiresAt <= now) qrSessions.delete(sid);
+        if (sess.expiresAt <= now) deleteQrSession(sid);
+    }
+    for (const [state, lease] of browserOAuthLeases) {
+        if (lease.expiresAt <= now) {
+            browserOAuthLeases.delete(state);
+            oauthFlowQuota.release(lease);
+        }
     }
     oauthStateStore.prune();
+    oauthFlowQuota.prune();
 }, 60 * 1000).unref();
 
 function normalizeAuthQuery(value, maxLength = 4096) {
@@ -1827,27 +1929,32 @@ function hashQrClaim(value) {
     return crypto.createHash('sha256').update(String(value), 'utf8').digest('hex');
 }
 
-function redirectWithOpenId(target, openId) {
-    const url = new URL(target || '/portal.html', CONFIG.publicHost);
-    url.searchParams.set('openid', openId);
-    return url.pathname + url.search + url.hash;
-}
-
 app.get('/auth/wechat', (req, res) => {
     if (!hostAuth.configured || !CONFIG.wechat.appId || !CONFIG.wechat.appSecret) {
         return res.status(503).send('WeChat authorization is not configured');
     }
     if (!enforceRateLimit(res, oauthIssueLimiter.consume(requestNetworkKey(req)))) return;
-    if (oauthStateStore.size >= AUTH_FLOW_MAX_PENDING) {
-        return res.status(429).send('Too many pending authorization requests');
-    }
+    const quotaLease = acquireOAuthFlow(req, res, 'browser');
+    if (!quotaLease) return;
     const redirect = appendPortalVersion(req.query.redirect || '/portal.html');
-    const issued = oauthStateStore.issue({ kind: 'browser', redirect });
-    appendCookie(res, serializeSessionCookie(
-        OAUTH_STATE_COOKIE_NAME,
-        issued.state,
-        oauthStateCookieOptions()
-    ));
+    let issued;
+    try {
+        issued = oauthStateStore.issue({ kind: 'browser', redirect });
+        browserOAuthLeases.set(issued.state, quotaLease);
+        appendCookie(res, serializeSessionCookie(
+            OAUTH_STATE_COOKIE_NAME,
+            issued.state,
+            oauthStateCookieOptions()
+        ));
+    } catch {
+        if (issued) {
+            oauthStateStore.cancel(issued.state);
+            releaseBrowserOAuthLease(issued.state);
+        } else {
+            oauthFlowQuota.release(quotaLease);
+        }
+        return res.status(503).send('WeChat authorization is temporarily unavailable');
+    }
     res.redirect(buildWechatAuthorizeUrl(
         `${CONFIG.publicHost}/auth/wechat/callback`,
         issued.state
@@ -1867,7 +1974,7 @@ app.get('/auth/wechat/callback', async (req, res) => {
         if (sid) {
             const session = /^[a-f0-9]{32}$/i.test(sid) ? qrSessions.get(sid) : null;
             if (!session || session.expiresAt <= Date.now()) {
-                qrSessions.delete(sid);
+                if (session) deleteQrSession(sid);
                 return res.status(400).send('Invalid or expired OAuth state');
             }
             flow = oauthStateStore.reserve(state, { kind: 'qr', subject: sid });
@@ -1915,10 +2022,11 @@ app.get('/auth/wechat/callback', async (req, res) => {
         if (sid) {
             const sess = qrSessions.get(sid);
             if (!sess || sess.expiresAt <= Date.now() || sess.status !== 'pending') {
-                if (sess?.expiresAt <= Date.now()) qrSessions.delete(sid);
+                if (sess?.expiresAt <= Date.now()) deleteQrSession(sid);
                 return res.status(400).send('Invalid or expired OAuth state');
             }
             if (!oauthStateStore.commit(stateReservation)) {
+                deleteQrSession(sid);
                 return res.status(400).send('Invalid or expired OAuth state');
             }
             stateReservation = null;
@@ -1935,11 +2043,15 @@ app.get('/auth/wechat/callback', async (req, res) => {
         }
 
         const committedFlow = oauthStateStore.commit(stateReservation);
-        if (!committedFlow) return res.status(400).send('Invalid or expired OAuth state');
+        if (!committedFlow) {
+            releaseBrowserOAuthLease(stateReservation.state);
+            return res.status(400).send('Invalid or expired OAuth state');
+        }
+        releaseBrowserOAuthLease(stateReservation.state);
         stateReservation = null;
         clearOAuthStateCookie(res);
         hostAuth.issueUserSession(res, user);
-        res.redirect(redirectWithOpenId(committedFlow.redirect, user.openId));
+        res.redirect(committedFlow.redirect);
     } catch (e) {
         console.error('[wechat callback]', e?.name || 'Error');
         const status = e instanceof HostAuthError ? e.httpStatus : 500;
@@ -1957,24 +2069,30 @@ app.get('/auth/wechat/qr', (req, res) => {
         return res.status(503).json({ status: 'unavailable' });
     }
     if (!enforceRateLimit(res, oauthIssueLimiter.consume(requestNetworkKey(req)))) return;
-    if (oauthStateStore.size >= AUTH_FLOW_MAX_PENDING
-        || qrSessions.size >= AUTH_FLOW_MAX_PENDING) {
-        return res.status(429).json({ status: 'busy' });
-    }
+    const quotaLease = acquireOAuthFlow(req, res, 'qr', true);
+    if (!quotaLease) return;
     const sid = crypto.randomBytes(16).toString('hex');
     const claim = crypto.randomBytes(24).toString('base64url');
-    qrSessions.set(sid, {
-        status: 'pending',
-        openid: null,
-        claimHash: hashQrClaim(claim),
-        expiresAt: Date.now() + QR_TTL_MS
-    });
-    const issued = oauthStateStore.issue({ kind: 'qr', subject: sid });
-    appendCookie(res, serializeSessionCookie(
-        QR_CLAIM_COOKIE_NAME,
-        claim,
-        qrClaimCookieOptions()
-    ));
+    let issued;
+    try {
+        issued = oauthStateStore.issue({ kind: 'qr', subject: sid });
+        qrSessions.set(sid, {
+            status: 'pending',
+            openid: null,
+            claimHash: hashQrClaim(claim),
+            quotaLease,
+            expiresAt: quotaLease.expiresAt
+        });
+        appendCookie(res, serializeSessionCookie(
+            QR_CLAIM_COOKIE_NAME,
+            claim,
+            qrClaimCookieOptions()
+        ));
+    } catch {
+        if (issued) oauthStateStore.cancel(issued.state);
+        if (!deleteQrSession(sid)) oauthFlowQuota.release(quotaLease);
+        return res.status(503).json({ status: 'unavailable' });
+    }
 
     const qrUrl = buildWechatAuthorizeUrl(
         `${CONFIG.publicHost}/auth/wechat/callback?sid=${encodeURIComponent(sid)}`,
@@ -2005,7 +2123,7 @@ app.get('/auth/status', async (req, res) => {
         return res.status(403).json({ status: 'invalid' });
     }
     if (sess.expiresAt <= Date.now()) {
-        qrSessions.delete(sid);
+        deleteQrSession(sid);
         clearQrClaimCookie(res);
         return res.json({ status: 'expired' });
     }
@@ -2017,9 +2135,9 @@ app.get('/auth/status', async (req, res) => {
     try {
         const user = await ensureOAuthUser(sess.openid);
         hostAuth.issueUserSession(res, user);
-        qrSessions.delete(sid);
+        deleteQrSession(sid);
         clearQrClaimCookie(res);
-        return res.json({ status: 'ok', openid: user.openId });
+        return res.json({ status: 'ok' });
     } catch (e) {
         if (qrSessions.has(sid)) sess.status = 'ok';
         const status = e instanceof HostAuthError ? e.httpStatus : 503;
@@ -2177,29 +2295,51 @@ installGracefulShutdown({
 });
 
 app.use('/uploads', express.static(uploadDir));
-app.use((req, res, next) => {
-    if (req.path === '/' || req.path.endsWith('.html')) {
+const publicRoot = path.join(__dirname, 'public');
+const legacyPublicEntries = new Map([
+    ['/', 'index.html'],
+    ['/index.html', 'index.html'],
+    ['/portal.html', 'portal.html'],
+    ['/admin.html', 'admin.html'],
+    ['/chat.html', 'chat.html']
+]);
+const publicAppEntries = new Map([
+    ['/tour', 'tour.html'],
+    ['/tour.html', 'tour.html'],
+    ['/ops', 'ops.html'],
+    ['/ops.html', 'ops.html'],
+    ['/screen', 'screen.html'],
+    ['/screen.html', 'screen.html']
+]);
+
+function servePublicEntry(root, fileName) {
+    return (_req, res, next) => {
         res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
         res.set('Pragma', 'no-cache');
         res.set('Expires', '0');
         res.set('Surrogate-Control', 'no-store');
-    }
-    next();
-});
-const publicStaticExtensions = new Set([
-    '.html', '.css', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp',
-    '.ico', '.woff', '.woff2', '.ttf', '.webmanifest'
-]);
-app.use((req, res, next) => {
-    if (req.path === '/' || publicStaticExtensions.has(path.extname(req.path).toLowerCase())) {
-        return next();
-    }
-    return res.status(404).end();
-});
-app.use(express.static(__dirname, {
+        res.sendFile(fileName, { root, dotfiles: 'deny', lastModified: false }, error => {
+            if (!error) return;
+            if (error.code === 'ENOENT' || error.statusCode === 404) return next();
+            return next(error);
+        });
+    };
+}
+
+for (const [route, fileName] of legacyPublicEntries) {
+    app.get(route, servePublicEntry(__dirname, fileName));
+}
+for (const [route, fileName] of publicAppEntries) {
+    app.get(route, servePublicEntry(publicRoot, fileName));
+}
+app.use(express.static(publicRoot, {
+    index: false,
+    dotfiles: 'deny',
+    redirect: false,
     etag: false,
     lastModified: false
 }));
+app.use((_req, res) => res.status(404).end());
 
 server.listen(CONFIG.port, CONFIG.host, () => {
     console.log(`[Server] http://${CONFIG.host}:${CONFIG.port}`);

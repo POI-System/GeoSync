@@ -243,6 +243,19 @@ test('findPathWithBarriers requires barriers and sends sorted unique normalized 
     );
     assert.equal(client.history.length, 0);
 
+    for (const smId of [null, '', ' ', -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+        await assert.rejects(
+            gateway.findPathWithBarriers(routeInput({
+                barriers: [{
+                    edgeId: 'EDGE_INVALID',
+                    sourceRef: { datasetName: WALK_EDGE_DATASET, smId }
+                }]
+            })),
+            error => error.code === 8205 && error.category === 'parameter'
+        );
+    }
+    assert.equal(client.history.length, 0);
+
     const sourceRef1 = { datasetName: WALK_EDGE_DATASET, smId: 1 };
     const sourceRef2 = { datasetName: WALK_EDGE_DATASET, smId: 2 };
     const result = await gateway.findPathWithBarriers(routeInput({

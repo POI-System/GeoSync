@@ -6,7 +6,9 @@ const normalizeGeometry = require('../../integrations/supermap/normalizers');
 const {
     normalizeRouteGeometry,
     normalizeRouteGeometryWithMeta,
-    MAX_GEOMETRY_POSITIONS
+    MAX_GEOMETRY_POSITIONS,
+    MAX_ROUTE_INVALID_POSITIONS,
+    MAX_ROUTE_INVALID_POSITION_RATIO
 } = normalizeGeometry;
 const { GeometryNormalizationError } = require('../../integrations/supermap/errors');
 
@@ -23,6 +25,8 @@ test('default and gateway-facing named exports share the same normalizer', () =>
     assert.strictEqual(normalizeGeometry.normalizeGeoJSONGeometry, normalizeGeometry);
     assert.equal(typeof normalizeRouteGeometry, 'function');
     assert.equal(typeof normalizeRouteGeometryWithMeta, 'function');
+    assert.equal(MAX_ROUTE_INVALID_POSITIONS, 4);
+    assert.equal(MAX_ROUTE_INVALID_POSITION_RATIO, 0.5);
 });
 
 test('normalizes Points to EPSG:4326 pairs rounded to six decimals', () => {
@@ -205,6 +209,112 @@ test('route normalizer accepts coordinate arrays, drops invalid points, rounds, 
         coordinates: [[120.123457, 30.123457], [120.2, 30.2]]
     });
     assert.deepEqual(input[0], [120.123456789, 30.123456789]);
+});
+
+test('route invalid-position budget accepts exact boundaries and rejects count or ratio overflow', () => {
+    const valid = Array.from({ length: 6 }, (_value, index) => [
+        120 + index * 0.001,
+        30 + index * 0.001
+    ]);
+    const invalid = [
+        null,
+        ['private-coordinate', 30],
+        [999, 999],
+        [120],
+        { lng: 120, lat: 30 }
+    ];
+
+    const exactCountBoundary = [
+        valid[0], invalid[0], valid[1], invalid[1], valid[2],
+        invalid[2], valid[3], invalid[3], valid[4]
+    ];
+    assert.equal(exactCountBoundary.length, 9);
+    assert.equal(
+        normalizeRouteGeometry(exactCountBoundary).coordinates.length,
+        5,
+        'four invalid positions remain within both limits'
+    );
+
+    const exactRatioBoundary = [valid[0], invalid[0], invalid[1], valid[1]];
+    assert.equal(
+        normalizeRouteGeometry(exactRatioBoundary).coordinates.length,
+        2,
+        'a 50% invalid ratio is accepted at the documented boundary'
+    );
+
+    const countOverflow = [
+        valid[0], invalid[0], valid[1], invalid[1], valid[2], invalid[2],
+        valid[3], invalid[3], valid[4], invalid[4], valid[5]
+    ];
+    let countError;
+    try {
+        normalizeRouteGeometry(countOverflow, {
+            operation: 'findPath',
+            requestId: 'invalid-count-budget'
+        });
+    } catch (error) {
+        countError = error;
+    }
+    assert.equal(is8206(countError), true);
+    assert.equal(countError.message, 'Route geometry contains too many invalid positions');
+
+    const ratioOverflow = [valid[0], invalid[0], invalid[1], invalid[2], valid[1]];
+    let ratioError;
+    try {
+        normalizeRouteGeometry(ratioOverflow, {
+            operation: 'findPath',
+            requestId: 'invalid-ratio-budget'
+        });
+    } catch (error) {
+        ratioError = error;
+    }
+    assert.equal(is8206(ratioError), true);
+    assert.equal(ratioError.message, 'Route geometry contains too many invalid positions');
+
+    const serialized = JSON.stringify([countError.toJSON(), ratioError.toJSON()]);
+    assert.doesNotMatch(serialized, /private-coordinate|999/);
+    assert.match(serialized, /invalid-count-budget/);
+    assert.match(serialized, /invalid-ratio-budget/);
+});
+
+test('invalid-position budget is evaluated for the selected axis order', () => {
+    const raw = [
+        [120, 30],
+        [30, 120],
+        [30.1, 120.1],
+        [30.2, 120.2],
+        [30.3, 120.3],
+        [30.4, 120.4],
+        [120.1, 30.1]
+    ];
+
+    const result = normalizeRouteGeometryWithMeta(raw);
+    assert.equal(result.axisSwapped, true);
+    assert.deepEqual(result.geometry.coordinates, [
+        [120, 30],
+        [120.1, 30.1],
+        [120.2, 30.2],
+        [120.3, 30.3],
+        [120.4, 30.4]
+    ]);
+});
+
+test('tolerated invalid positions do not change endpoint-based direction correction', () => {
+    const result = normalizeRouteGeometryWithMeta([
+        [120.2, 30.2],
+        null,
+        [120.1, 30.1],
+        [120, 30]
+    ], {
+        start: [120, 30],
+        end: [120.2, 30.2]
+    });
+
+    assert.equal(result.reversed, true);
+    assert.equal(result.axisSwapped, false);
+    assert.deepEqual(result.geometry.coordinates, [
+        [120, 30], [120.1, 30.1], [120.2, 30.2]
+    ]);
 });
 
 test('route normalizer corrects axis order using WGS84 validity', () => {

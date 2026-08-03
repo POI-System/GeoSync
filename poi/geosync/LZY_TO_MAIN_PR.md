@@ -47,8 +47,20 @@ GeoSync is attached through dependency injection before static files and before
 - Add full closed-edge snapshots, barrier fingerprints, per-scenic serialization,
   idempotent graph-event handling, reroute proposals, and operations impact/status
   contracts.
+- Persist graph-event ownership in MongoDB with a unique `eventId`, canonical
+  payload hash, bounded lease, heartbeat, stale-owner recovery, conflict
+  detection, and seven-day TTL cleanup so multiple application instances cannot
+  independently apply the same closure event.
 - Bound one graph event to six concurrent itinerary rebuilds by default while
   preserving result order and per-scenic event serialization.
+- Use one validated WalkEdge contract for meters, seconds, slope percentage, and
+  zero-to-one ratios across seed, administrator mutation, migration, and runtime
+  routing. Administrator node creation enforces WGS84 ranges, and edge create/
+  patch requires geometry endpoints to remain anchored within five meters of
+  `from/to`. Local fallback now uses Dijkstra over weighted edge travel time.
+- Protect route replacement with a versioned compare-and-set that writes
+  `geometry + distanceM + walkSec` together and returns HTTP 409/code 8102 for a
+  stale snapshot instead of overwriting a newer itinerary.
 - Make natural-language itinerary edits explicit preview-only responses until the
   complete edit vocabulary can participate in versioned route/preference commits;
   previews no longer occupy `pendingProposal` or block executable proposals.
@@ -86,12 +98,44 @@ GeoSync is attached through dependency injection before static files and before
 - Restrict itinerary proposal/progress Socket payloads to documented public
   fields; full OpenIDs, tokens, raw proposals, routes, and barrier mappings stay
   internal.
+- Remove OpenID from browser OAuth redirect URLs and QR polling success payloads.
+  The portal now restores identity only through `GET /api/auth/session` backed by
+  the signed HttpOnly `poi_user_session` cookie, and starts OAuth only after an
+  explicit anonymous response so session outages cannot create redirect loops.
+- Remove OpenID from Portal request URLs, request bodies, Socket queries, and the
+  three legacy entry wrappers. Portal logout now calls `POST /api/auth/logout`
+  and keeps an unconfirmed network failure observable instead of claiming that
+  the server cookie was cleared.
+- Bound pending browser and QR OAuth flows with one shared per-network quota
+  (`AUTH_FLOW_MAX_PENDING_PER_NETWORK`, default `8`) in addition to the global
+  `2048` cap, while retaining the server-bound `sid` plus HttpOnly QR claim.
 - Remove the plaintext `init-admin.js` path and disconnected `AdminUser` model;
   administrator identity is environment/session based.
-- Harden production delivery so Nginx proxies public files through the Node
-  allowlist instead of exposing `/opt/poi`, aligns TLS preflight paths with the
-  active Let's Encrypt configuration, fixes the deployment directory contract,
-  and enforces Node.js 20 or newer.
+- Replace plaintext administrator password configuration with a versioned scrypt
+  `ADMIN_PASSWORD_HASH`, a stdin-only hash tool, fail-closed legacy variable
+  handling, and a backup-protected dry-run-first cleanup tool for inert historical
+  `adminusers` rows.
+- Keep AMap `securityJsCode` entirely out of browser configuration. The browser
+  uses the same-origin `/_AMapService/` host while Nginx injects the rotated
+  secret from a root-only snippet into a fixed AMap upstream and strips
+  credential-bearing headers.
+- Replace the repository-root static mount with exact routes for the five legacy
+  entry URLs and a general static root restricted to `poi/public`. Private HTML,
+  source, package documentation, and unrelated repository assets now return 404.
+- Harden production delivery by aligning TLS preflight paths with the active
+  Let's Encrypt configuration, fixing the deployment directory contract, and
+  enforcing Node.js 20 or newer.
+- Disable Mongoose runtime `autoIndex` in production and add an explicit
+  deployment manifest for 25 host indexes across seven collections plus all
+  declared GeoSync indexes.
+- Add a dependency-free Node test runner that works on Node 20 and Windows without
+  shell globs, remove the obsolete AliCloud OCR package fallback, and upgrade
+  `nodemailer` and `node-cron` through their reviewed current contracts.
+- Apply `SCENIC_TIME_ZONE` consistently to opening windows, sunlight output,
+  photospot dates, DST-aware daily offsets, and scheduled daily jobs. Derive blank
+  `AUTH_COOKIE_SECURE` from the public host, require a credential-free exact
+  HTTPS origin in production, reject downgraded cookies, and enable LLM
+  features only when URL, key, and an explicit model are all configured.
 - Complete the placeholder-only environment template for background jobs,
   reroute/alert notification channels, tuning, optional providers, upload paths,
   and development-only simulation controls.
@@ -114,6 +158,10 @@ Updated or added HTTP surfaces include:
 - `POST /api/admin/geosync/gis/route-test`
 - `POST /api/admin/screen/session`
 - `POST /api/admin/screen/logout`
+- `GET /api/auth/session`
+- `GET /auth/wechat`
+- `GET /auth/wechat/qr`
+- `GET /auth/status`
 
 Operations event contracts include:
 
@@ -162,6 +210,7 @@ counts, and refuses to overwrite a record changed after planning.
 Run from `D:\poi项目\poi` after all changes are stable:
 
 ```powershell
+& 'D:\nodejs\npm.cmd' ci
 & 'D:\nodejs\npm.cmd' run check:syntax
 & 'D:\nodejs\npm.cmd' run test:geosync
 & 'D:\nodejs\npm.cmd' run test:integration
@@ -174,19 +223,25 @@ Evidence captured on August 3, 2026 after `npm ci`:
 - `npm ci`: passed from the committed lock file.
 - `check:syntax`: passed.
 - Legacy root GeoSync suite before removal: 67 passed, 0 failed.
-- GeoSync unit suite: 364 passed, 0 failed.
-- Integration suite: 14 passed, 0 failed.
-- Combined unit and integration suite: 378 passed, 0 failed.
+- GeoSync unit suite: 465 passed, 0 failed.
+- Integration suite: 16 passed, 0 failed.
+- Combined unit and integration suite: 481 passed, 0 failed.
 - `git diff --check`: passed with only the existing Windows LF/CRLF conversion
   notices and no whitespace errors.
-- Production dependency audit: failed with 14 package findings, including 4
-  high, 10 moderate, 0 low, and 0 critical.
+- Production dependency audit: passed with 0 vulnerabilities.
 
 ## Security Review
 
 - No default administrator token remains.
 - No plaintext administrator initializer or disconnected administrator database
   model remains.
+- Browser administrator login accepts only the versioned scrypt
+  `ADMIN_PASSWORD_HASH`; the legacy plaintext `ADMIN_PASSWORD` variable disables
+  password login rather than falling back. Hash generation reads stdin only and
+  administrator KDF work is concurrency bounded.
+- Historical `adminusers` rows remain completely outside runtime authentication.
+  A dry-run-first cleanup command reports only collection existence/count and
+  requires backup plus an exact confirmation before dropping that one collection.
 - Production requires signed user identity; legacy `X-Open-Id` compatibility is
   available only when explicitly enabled outside production.
 - User and administrator sessions are signed, expiring, and transported through
@@ -236,7 +291,13 @@ Evidence captured on August 3, 2026 after `npm ci`:
 - Dataset/field allowlists and bounded feature counts are manifest-controlled.
 - Request IDs and GIS logs are sanitized; raw upstream responses are not logged.
 - Nginx cannot serve `.env`, application source, package metadata, GeoSync
-  internals, or PM2 logs directly; only the dedicated uploads alias bypasses Node.
+  internals, private HTML, or PM2 logs directly. Only the dedicated uploads alias
+  bypasses Node; exact legacy entry routes and the `poi/public` root remain the
+  complete static surface.
+- AMap jscode is absent from client configuration and browser source. Nginx reads
+  it from a root-owned mode-0600 snippet, proxies only to the fixed AMap host,
+  strips Cookie and Authorization, sanitizes Referer, disables caching, and
+  suppresses access logging for that location.
 - The development-only standalone entry logs connection state and sanitized error
   codes without printing the MongoDB endpoint or query options.
 - Accessible routing cannot use unverified local fallback.
@@ -263,32 +324,16 @@ health interpretation, error handling, and application rollback.
 
 ## Residual Risks and External Blockers
 
-- This is a backend-only authentication rollout. Existing portal code may retain
-  an OpenID in `localStorage` after the signed HttpOnly `poi_user_session` cookie
-  is missing or expires. The stored OpenID no longer grants authority, but the
-  portal may still render authenticated state while protected requests return
-  HTTP 401. Deployed users must re-authorize after rollout and whenever the
-  cookie is lost.
-- Portal user logout/session-expiry recovery is absent. The current logout
-  handler changes only browser-visible role/UI state and does not call
-  `POST /api/auth/logout`; on a shared device, clearing or changing visible state
-  can leave the signed HttpOnly user cookie active. The frontend follow-up must
-  bootstrap through `GET /api/auth/session`, recover from HTTP 401, clear stale
-  display state, and call `POST /api/auth/logout` for sign-out.
 - Administrator cleanup is also absent. The non-credential `cookie-session`
   marker stored in `sessionStorage` can remain after the signed
   `poi_admin_session` cookie expires, while clearing or abandoning the marker
   does not clear a still-valid HttpOnly administrator cookie. The frontend must
   recover from stale session state and HTTP 401/403 responses, close stale
   administrator UI, and call `POST /api/admin/logout` for explicit sign-out.
-- Full OpenID transport remains a privacy and logging risk. Complete OpenIDs
-  still cross OAuth redirect URLs, the `/auth/status` QR polling response,
-  localStorage, portal navigation and POI/notification/chat request URLs, form
-  fields, and Socket query strings. The backend no longer trusts those values as
-  authority, but the transport and storage exposure remains. Frontend follow-up
-  should derive identity from `GET /api/auth/session` and remove these identity
-  transports. Until that work lands, operators must communicate re-authorization
-  and monitor authentication failures without logging full OpenIDs.
+- The backend retains selected compatibility/mismatch identity fields for older
+  independently deployed clients, although the tracked Portal and legacy entry
+  wrappers no longer send them. Removing those accepted fields entirely requires
+  a coordinated public-contract change with every external frontend owner.
 - Reviewer rollout requires an authoritative identity inventory before
   `REVIEWER_OPENIDS` is populated. Historical `role='reviewer'` and
   `reviewerSubscribed=true` rows are not trusted and must be cleaned through a
@@ -297,37 +342,40 @@ health interpretation, error handling, and application rollback.
   return to reviewer mode because entitlement remains allowlist-controlled.
 - No real iServer integration has been executed. Unit and integration coverage
   uses Mock/internal contracts only.
+- The upstream owner must confirm whether authoritative responses may contain
+  `[lng,lat,z]`; the reviewed public contract currently accepts only
+  two-dimensional `[lng,lat]` coordinates.
 - Automated shutdown coverage exercises SIGTERM/SIGINT, repeated-signal
   idempotence, phase failures, and the total timeout through injected process and
   timer boundaries. Windows `child.kill()` cannot execute the production POSIX
   signal path, so a real Linux/PM2 restart with in-flight HTTP and Socket work is
   still a deployment gate.
-- Administrator revocation schema, hashing, fail-closed reads/writes, restart
-  persistence semantics, and TTL index metadata are covered locally. Staging
-  must still verify TTL cleanup and cross-instance logout against the deployed
-  MongoDB topology before enabling more than one application instance.
+- Administrator revocation and barrier-event lease/heartbeat schemas, fail-closed
+  reads/writes, recovery semantics, and TTL metadata are covered locally. Staging
+  must still verify TTL cleanup, cross-instance logout, stale event recovery, and
+  single event ownership against the deployed MongoDB topology.
 - Real validation still requires the actual base, published service paths,
   validated manifest, account permissions, representative raw responses, and an
   authoritative WalkEdge mapping with matching `dataVersion`.
 - The currently seeded graph has no proven authoritative sourceRef mapping.
   Local fallback must not be described as deployable until migration dry-run and
   apply succeed against real data.
-- Event delivery and barrier dedupe queues are process-local. MongoDB route and
-  lifecycle state is durable, but there is no transactional outbox or shared
-  message broker. Operators and clients must reload authoritative state after
-  reconnect or restart.
-- Production dependencies contain 14 package findings: 4 high, 10 moderate, 0
-  low, and 0 critical. The remaining high findings are `nodemailer` plus the
-  legacy AliCloud `@alicloud/oss-baseclient`, nested `@alicloud/credentials`, and
-  `json-bigint` chain. Available audit remediation crosses reviewed major-version
-  boundaries, so remediation or an approved time-bounded exception is required
-  before production release. Do not apply forced or major upgrades without
-  focused compatibility work and the full regression.
-- The final verified branch was pushed to `origin/LZY` on August 3, 2026, and
-  GitHub Pull Request #1 was opened from `LZY` to `main` through an approved API
-  workflow. The `gh` executable remains unavailable, but it is no longer a
-  delivery blocker. This pull request must remain the review and merge boundary;
-  do not push or merge `main` directly.
+- Barrier-event ownership and dedupe are Mongo-backed, but Socket event delivery
+  still has no transactional outbox or shared broker. Operations clients must
+  reload authoritative MongoDB-backed API state after reconnect or restart.
+- The AMap owner must rotate the formerly exposed jscode, restrict the Web JS key
+  domain allowlist, and provide the root-only Nginx snippet. Deployment must apply
+  the CDN no-cache rule, pass `nginx -t`, reload, and complete a real-browser map
+  smoke test.
+- Historical `adminusers` removal is an operator-controlled production data
+  change. The cleanup command defaults to dry-run and has not dropped the
+  collection; backup and exact confirmation remain required.
+- Real OCR, SMTP, AMap, tourist, operations-screen, and multi-instance MongoDB
+  end-to-end validation remains a deployment gate.
+- GitHub Pull Request #1 remains the `LZY` to `main` review boundary. This P2
+  batch is deliverable only after its final clean-install gates pass and its
+  commit is non-force-pushed to `origin/LZY`; do not push or merge `main`
+  directly.
 
 ## Rollback Plan
 

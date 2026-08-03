@@ -32,7 +32,7 @@ function edge(edgeId, from, to, options = {}) {
         distanceM: options.distanceM ?? 80,
         geometry: options.geometry || [],
         status: options.status || 'open',
-        slope: options.slope || 0,
+        slope: options.slope ?? 0,
         stairs: Boolean(options.stairs),
         shade: options.shade ?? 0.5,
         accessible: options.accessible !== false,
@@ -196,6 +196,108 @@ test('barriers select an alternate graph route with canonical segments, sources,
         barriers: blockedAll,
         dataVersion: 'graph-v1'
     }), null);
+});
+
+test('shade routing uses the true minimum weighted path when the old heuristic would overestimate', async () => {
+    const nodes = [
+        node('S', [0, 0]),
+        node('A', [0.0005, 0.0006]),
+        node('G', [0.001, 0])
+    ];
+    await loadGraph(nodes, [
+        edge('SG', 'S', 'G', { walkSec: 80, distanceM: 111, shade: 0.5 }),
+        edge('SA', 'S', 'A', { walkSec: 60, distanceM: 87, shade: 1 }),
+        edge('AG', 'A', 'G', { walkSec: 60, distanceM: 87, shade: 1 })
+    ]);
+
+    const route = walkGraph.astar('S', 'G', 'shade');
+    assert.deepStrictEqual(route.edgeIds, ['SA', 'AG']);
+    assert.equal(route.walkSec, 120, 'reported duration remains the unweighted baseline');
+});
+
+test('standard routing remains optimal for unusually fast but still plausible positive edges', async () => {
+    const nodes = [
+        node('S', [0, 0]),
+        node('A', [0.0005, 0.0006]),
+        node('G', [0.001, 0])
+    ];
+    await loadGraph(nodes, [
+        edge('SG', 'S', 'G', { walkSec: 80, distanceM: 111 }),
+        edge('SA', 'S', 'A', { walkSec: 35, distanceM: 87 }),
+        edge('AG', 'A', 'G', { walkSec: 35, distanceM: 87 })
+    ]);
+
+    const route = walkGraph.astar('S', 'G', 'standard');
+    assert.deepStrictEqual(route.edgeIds, ['SA', 'AG']);
+    assert.equal(route.walkSec, 70);
+});
+
+test('accessible slope threshold uses percentage units', async () => {
+    const nodes = [
+        node('S', [0, 0]),
+        node('A', [0.0005, 0.0006]),
+        node('G', [0.001, 0])
+    ];
+    const alternatives = [
+        edge('SA', 'S', 'A', { walkSec: 35, distanceM: 87, accessibleVerified: true }),
+        edge('AG', 'A', 'G', { walkSec: 35, distanceM: 87, accessibleVerified: true })
+    ];
+
+    await loadGraph(nodes, [
+        edge('SG', 'S', 'G', {
+            walkSec: 60,
+            distanceM: 111,
+            slope: 0.09,
+            accessibleVerified: true
+        }),
+        ...alternatives
+    ]);
+    assert.deepStrictEqual(
+        walkGraph.astar('S', 'G', 'accessible').edgeIds,
+        ['SG'],
+        '0.09 means 0.09%, not a 9% ratio'
+    );
+
+    await loadGraph(nodes, [
+        edge('SG', 'S', 'G', {
+            walkSec: 60,
+            distanceM: 111,
+            slope: 9,
+            accessibleVerified: true
+        }),
+        ...alternatives
+    ]);
+    assert.deepStrictEqual(walkGraph.astar('S', 'G', 'accessible').edgeIds, ['SA', 'AG']);
+});
+
+test('graph loading rejects non-finite, negative, out-of-range, and unit-inconsistent edge weights', async () => {
+    const nodes = [node('A', [0, 0]), node('B', [0.001, 0])];
+    const invalidEdges = [
+        edge('negative-time', 'A', 'B', { walkSec: -1, distanceM: 111 }),
+        edge('nan-time', 'A', 'B', { walkSec: NaN, distanceM: 111 }),
+        edge('infinite-time', 'A', 'B', { walkSec: Infinity, distanceM: 111 }),
+        edge('negative-shade', 'A', 'B', { walkSec: 80, distanceM: 111, shade: -0.1 }),
+        edge('excess-shade', 'A', 'B', { walkSec: 80, distanceM: 111, shade: 1.1 }),
+        edge('nan-slope', 'A', 'B', { walkSec: 80, distanceM: 111, slope: NaN }),
+        edge('meters-per-millisecond', 'A', 'B', { walkSec: 1, distanceM: 111 }),
+        edge('milliseconds-not-seconds', 'A', 'B', { walkSec: 80000, distanceM: 111 }),
+        edge('nan-distance', 'A', 'B', { walkSec: 80, distanceM: NaN }),
+        edge('kilometers-not-meters', 'A', 'B', { walkSec: 80, distanceM: 0.111 })
+    ];
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => warnings.push(args.join(' '));
+    try {
+        await loadGraph(nodes, [
+            ...invalidEdges,
+            edge('valid', 'A', 'B', { walkSec: 80, distanceM: 111, shade: 0 })
+        ]);
+    } finally {
+        console.warn = originalWarn;
+    }
+
+    assert.deepStrictEqual(walkGraph.astar('A', 'B', 'shade').edgeIds, ['valid']);
+    assert.match(warnings.join('\n'), /skipped 10 invalid edges/);
 });
 
 test('local fallback trusts only traversed edges from the requested graph data version', async () => {

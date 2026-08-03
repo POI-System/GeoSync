@@ -9,6 +9,17 @@ const { ok, accepted, fail, wrap, BizError } = require('../lib/respond');
 const { requireAdmin } = require('../lib/auth');
 const memCache = require('../lib/memCache');
 const geo = require('../lib/geo');
+const {
+    normalizeBoolean,
+    normalizeCoordinate,
+    normalizeDistanceM,
+    normalizeLineCoordinates,
+    normalizeSlopePct,
+    normalizeUnitRatio,
+    normalizeWalkEdgeMetrics,
+    normalizeWalkSec,
+    polylineDistanceM
+} = require('../lib/walkEdgeContract');
 const bus = require('../lib/eventBus');
 const crowdService = require('../services/crowdService');
 const forecastService = require('../services/forecastService');
@@ -33,6 +44,73 @@ function sanitizeCloseReason(value) {
         .replace(/\s+/g, ' ')
         .trim()
         .slice(0, 100);
+}
+
+const EDGE_BOOLEAN_FIELDS = new Set([
+    'stairs', 'accessible', 'accessibleVerified'
+]);
+const EDGE_ENDPOINT_TOLERANCE_M = 5;
+const EDGE_PATCH_NORMALIZERS = Object.freeze({
+    walkSec: value => normalizeWalkSec(value, { coerce: true }),
+    distanceM: value => normalizeDistanceM(value, { coerce: true }),
+    slope: value => normalizeSlopePct(value, { coerce: true, defaultValue: null }),
+    shade: value => normalizeUnitRatio(value, { coerce: true }),
+    covered: value => normalizeUnitRatio(value, { coerce: true }),
+    stairs: value => normalizeBoolean(value, { coerce: true }),
+    accessible: value => normalizeBoolean(value, { coerce: true }),
+    accessibleVerified: value => normalizeBoolean(value, { coerce: true }),
+    geometry: value => normalizeLineCoordinates(value, { coerce: true })
+});
+
+function normalizeEdgePatch(body) {
+    const patch = {};
+    for (const [field, normalize] of Object.entries(EDGE_PATCH_NORMALIZERS)) {
+        if (body?.[field] === undefined) continue;
+        const value = normalize(body[field]);
+        if (value === null) return null;
+        patch[field] = value;
+    }
+    return patch;
+}
+
+function edgeGeometryDistanceM(edge) {
+    const coordinates = normalizeLineCoordinates(edge?.geometry, { coerce: true });
+    if (coordinates) {
+        const distanceM = polylineDistanceM(coordinates);
+        if (distanceM !== null) return Math.round(distanceM);
+    }
+    return normalizeDistanceM(edge?.distanceM, { coerce: true });
+}
+
+function validMergedEdgeMetrics(edge) {
+    const metrics = normalizeWalkEdgeMetrics(edge, {
+        geometryDistanceM: edgeGeometryDistanceM(edge),
+        coerce: true
+    });
+    if (!metrics) return false;
+    for (const field of EDGE_BOOLEAN_FIELDS) {
+        if (normalizeBoolean(edge?.[field], { coerce: true, defaultValue: false }) === null) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function nodeCoordinate(node) {
+    return normalizeCoordinate(node?.geo?.coordinates);
+}
+
+function geometryAnchorsEdge(coordinates, fromNode, toNode) {
+    const from = nodeCoordinate(fromNode);
+    const to = nodeCoordinate(toNode);
+    const geometry = normalizeLineCoordinates(coordinates);
+    if (!from || !to || !geometry) return false;
+    const startDistanceM = geo.haversine(from, geometry[0]);
+    const endDistanceM = geo.haversine(to, geometry[geometry.length - 1]);
+    return Number.isFinite(startDistanceM)
+        && Number.isFinite(endDistanceM)
+        && startDistanceM <= EDGE_ENDPOINT_TOLERANCE_M
+        && endDistanceM <= EDGE_ENDPOINT_TOLERANCE_M;
 }
 
 function canonicalSourceRef(value) {
@@ -159,11 +237,12 @@ router.get('/graph', wrap(async (req, res) => {
 router.post('/graph/node', wrap(async (req, res) => {
     const { WalkNode } = getModels();
     const { lng, lat, kind } = req.body || {};
-    if (!Number.isFinite(lng) || !Number.isFinite(lat)) return fail(res, 400, 1101, '经纬度缺失');
+    const coordinates = normalizeCoordinate([lng, lat]);
+    if (!coordinates) return fail(res, 400, 1101, '经纬度必须是有效的 WGS84 坐标');
     const nodeId = 'n_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const node = await WalkNode.create({
         scenicId: CONFIG.scenicId, nodeId,
-        geo: { type: 'Point', coordinates: [lng, lat] },
+        geo: { type: 'Point', coordinates },
         kind: ['junction', 'poi-gate', 'facility'].includes(kind) ? kind : 'junction'
     });
     await walkGraph.loadIntoMemory();
@@ -174,42 +253,113 @@ router.post('/graph/node', wrap(async (req, res) => {
 router.post('/graph/edge', wrap(async (req, res) => {
     const { WalkNode, WalkEdge } = getModels();
     const { from, to, geometry, stairs, slope, shade, covered, accessible, bidirectional = true } = req.body || {};
+    const fromNodeId = typeof from === 'string' ? from.trim() : '';
+    const toNodeId = typeof to === 'string' ? to.trim() : '';
+    if (!fromNodeId || !toNodeId || fromNodeId === toNodeId) {
+        return fail(res, 400, 1101, '路段端点无效');
+    }
     const [nFrom, nTo] = await Promise.all([
-        WalkNode.findOne({ nodeId: from }).lean(), WalkNode.findOne({ nodeId: to }).lean()
+        WalkNode.findOne({ nodeId: fromNodeId }).lean(),
+        WalkNode.findOne({ nodeId: toNodeId }).lean()
     ]);
     if (!nFrom || !nTo) return fail(res, 404, 8101, '端点节点不存在');
-    let coords = Array.isArray(geometry) && geometry.length >= 2 ? geometry
-        : [nFrom.geo.coordinates, nTo.geo.coordinates];
-    let distanceM = 0;
-    for (let i = 0; i < coords.length - 1; i++) distanceM += geo.haversine(coords[i], coords[i + 1]);
-    distanceM = Math.round(distanceM);
-    const walkSec = Math.round(distanceM / 1.4 * (stairs ? 1.6 : 1));
+    const fromCoordinate = nodeCoordinate(nFrom);
+    const toCoordinate = nodeCoordinate(nTo);
+    if (!fromCoordinate || !toCoordinate) {
+        return fail(res, 400, 1101, '端点节点坐标无效');
+    }
+    const fallbackGeometry = [fromCoordinate, toCoordinate];
+    const coords = normalizeLineCoordinates(
+        geometry === undefined ? fallbackGeometry : geometry,
+        { coerce: true }
+    );
+    const normalizedStairs = normalizeBoolean(stairs, { coerce: true, defaultValue: false });
+    const normalizedAccessible = normalizeBoolean(accessible, { coerce: true, defaultValue: false });
+    const normalizedBidirectional = normalizeBoolean(bidirectional, { coerce: true, defaultValue: true });
+    if (!coords || normalizedStairs === null || normalizedAccessible === null || normalizedBidirectional === null) {
+        return fail(res, 400, 1101, '路段字段值无效');
+    }
+    if (!geometryAnchorsEdge(coords, nFrom, nTo)) {
+        return fail(res, 400, 1101, '路段几何首尾未锚定到指定节点');
+    }
+    const rawDistanceM = polylineDistanceM(coords);
+    if (rawDistanceM === null) return fail(res, 400, 1101, '路段几何无效');
+    const distanceM = Math.round(rawDistanceM);
+    const walkSec = Math.round(distanceM / 1.4 * (normalizedStairs ? 1.6 : 1));
+    const metrics = normalizeWalkEdgeMetrics({
+        distanceM,
+        walkSec,
+        slope,
+        shade,
+        covered
+    }, { geometryDistanceM: distanceM, coerce: true });
+    if (!metrics) return fail(res, 400, 1101, '路段数值超出允许范围');
 
     const mk = (a, b, geom) => ({
         scenicId: CONFIG.scenicId,
         edgeId: 'e_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-        from: a, to: b, geometry: geom, distanceM, walkSec,
-        slope: Number(slope) || 0, stairs: Boolean(stairs),
-        shade: geo.clamp(Number(shade) || 0.5, 0, 1),
-        covered: geo.clamp(Number(covered) || 0, 0, 1),
-        accessible: Boolean(accessible), status: 'open', source: 'manual'
+        from: a,
+        to: b,
+        geometry: geom,
+        distanceM: metrics.distanceM,
+        walkSec: metrics.walkSec,
+        slope: metrics.slope,
+        stairs: normalizedStairs,
+        shade: metrics.shade,
+        covered: metrics.covered,
+        accessible: normalizedAccessible,
+        status: 'open',
+        source: 'manual'
     });
-    const docs = [mk(from, to, coords)];
-    if (bidirectional) docs.push(mk(to, from, [...coords].reverse()));
+    const docs = [mk(fromNodeId, toNodeId, coords)];
+    if (normalizedBidirectional) docs.push(mk(toNodeId, fromNodeId, [...coords].reverse()));
     const created = await WalkEdge.insertMany(docs);
     await walkGraph.loadIntoMemory();
-    ok(res, { edgeIds: created.map(e => e.edgeId), distanceM, walkSec });
+    ok(res, {
+        edgeIds: created.map(e => e.edgeId),
+        distanceM: metrics.distanceM,
+        walkSec: metrics.walkSec
+    });
 }));
 
 // PATCH /graph/edge/:edgeId
 router.patch('/graph/edge/:edgeId', wrap(async (req, res) => {
-    const { WalkEdge } = getModels();
-    const ALLOW = ['walkSec', 'slope', 'stairs', 'shade', 'covered', 'accessible', 'accessibleVerified', 'geometry', 'distanceM'];
-    const patch = {};
-    for (const k of ALLOW) if (req.body?.[k] !== undefined) patch[k] = req.body[k];
+    const { WalkNode, WalkEdge } = getModels();
+    const patch = normalizeEdgePatch(req.body);
+    if (!patch) return fail(res, 400, 1101, '路段字段值无效');
     if (!Object.keys(patch).length) return fail(res, 400, 1101, '无可更新字段');
-    const edge = await WalkEdge.findOneAndUpdate({ edgeId: req.params.edgeId }, { $set: patch }, { new: true });
-    if (!edge) return fail(res, 404, 8101, '边不存在');
+    const current = await WalkEdge.findOne({ edgeId: req.params.edgeId }).lean();
+    if (!current) return fail(res, 404, 8101, '边不存在');
+    const [nFrom, nTo] = await Promise.all([
+        WalkNode.findOne({ nodeId: current.from }).lean(),
+        WalkNode.findOne({ nodeId: current.to }).lean()
+    ]);
+    if (!nFrom || !nTo) return fail(res, 400, 1101, '路段端点节点不存在');
+    const merged = { ...current, ...patch };
+    if (!geometryAnchorsEdge(merged.geometry, nFrom, nTo)) {
+        return fail(res, 400, 1101, '路段几何首尾未锚定到指定节点');
+    }
+    if (!validMergedEdgeMetrics(merged)) {
+        return fail(res, 400, 1101, '路段距离、耗时或属性单位不一致');
+    }
+    const metricSnapshot = {
+        edgeId: req.params.edgeId,
+        geometry: current.geometry,
+        walkSec: current.walkSec,
+        distanceM: Object.hasOwn(current, 'distanceM')
+            ? current.distanceM
+            : { $exists: false }
+    };
+    const edge = await WalkEdge.findOneAndUpdate(
+        metricSnapshot,
+        { $set: patch },
+        { new: true, runValidators: true }
+    );
+    if (!edge) {
+        const latest = await WalkEdge.findOne({ edgeId: req.params.edgeId }).lean();
+        if (!latest) return fail(res, 404, 8101, '边不存在');
+        return fail(res, 409, 8102, '路段已被其他请求修改，请重试');
+    }
     await walkGraph.loadIntoMemory();
     ok(res, edge);
 }));

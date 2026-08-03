@@ -101,6 +101,31 @@ test('expired reservations cannot commit or return to the available pool', () =>
     assert.equal(store.size, 0);
 });
 
+test('issuance cancellation removes only an unreserved OAuth state', () => {
+    const store = new OAuthStateStore({
+        clock: () => 5000,
+        randomBytes: deterministicBytes(),
+        ttlMs: 5000
+    });
+    const browser = store.issue({ kind: 'browser', redirect: '/portal.html' });
+    const qr = store.issue({ kind: 'qr', subject: 'sid-a' });
+
+    const cancelled = store.cancel(browser.state);
+    assert.equal(cancelled.kind, 'browser');
+    assert.equal(cancelled.redirect, '/portal.html');
+    assert.equal(store.cancel(browser.state), null);
+    assert.equal(store.size, 1);
+
+    const reservation = store.reserve(qr.state, { kind: 'qr', subject: 'sid-a' });
+    assert.ok(reservation);
+    assert.equal(store.cancel(qr.state), null,
+        'an issuance rollback must not cancel an active callback reservation');
+    assert.equal(store.size, 1);
+    assert.equal(store.release(reservation), true);
+    assert.equal(store.cancel(qr.state).subject, 'sid-a');
+    assert.equal(store.size, 0);
+});
+
 test('constructor and issue reject unsafe configuration', () => {
     assert.throws(() => new OAuthStateStore({ ttlMs: 0 }), /ttlMs/);
     const store = new OAuthStateStore({ randomBytes: deterministicBytes() });

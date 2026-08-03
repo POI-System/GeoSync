@@ -121,6 +121,26 @@ test('applyProposal drop 标记跳过', () => {
     assert.notStrictEqual(barrier[0], barrierSource[0]);
 });
 
+test('proposalDiff previews persisted barrier reroute stops', () => {
+    const before = mkStops();
+    const after = mkStops();
+    after[1].poiId = 'poi-rerouted';
+    after[2].state = 'skipped';
+
+    assert.deepStrictEqual(engine.proposalDiff({ stops: before }, {
+        type: 'barrierReroute',
+        payload: {
+            eventId: 'graph-event-1',
+            stops: after,
+            route: { private: true },
+            barriers: [{ edgeId: 'private-edge' }]
+        }
+    }), {
+        before: ['poi0', 'poi1', 'poi2', 'poi3'],
+        after: ['poi0', 'poi-rerouted', 'poi3']
+    });
+});
+
 test('applyProposal rainShift 只重排可变站点，不跨过 arrived', () => {
     const stops = mkStops();
     stops[1].state = 'arrived';
@@ -165,15 +185,23 @@ test('interestMatch 命中奖励', () => {
 
 test('offWindowMin 窗口内为0', () => {
     const wins = [{ start: '09:30', end: '10:10' }];
-    assert.strictEqual(planner.offWindowMin(wins, new Date(2026, 6, 6, 9, 45)), 0);
-    assert.ok(planner.offWindowMin(wins, new Date(2026, 6, 6, 12, 0)) > 60);
+    assert.strictEqual(planner.offWindowMin(wins, new Date('2026-07-06T01:45:00.000Z')), 0);
+    assert.ok(planner.offWindowMin(wins, new Date('2026-07-06T04:00:00.000Z')) > 60);
+});
+
+test('planner uses the scenic IANA time zone instead of the server local time zone', () => {
+    const instant = new Date('2026-07-06T01:45:00.000Z');
+    assert.strictEqual(planner.scenicMinuteOfDay(instant, 'Asia/Shanghai'), 9 * 60 + 45);
+    assert.strictEqual(planner.scenicDateStr(instant, 'Asia/Shanghai'), '2026-07-06');
+    assert.strictEqual(planner.scenicMinuteOfDay(instant, 'America/Los_Angeles'), 18 * 60 + 45);
+    assert.strictEqual(planner.scenicDateStr(instant, 'America/Los_Angeles'), '2026-07-05');
 });
 
 test('windowFit 契合度', () => {
     const wins = [{ start: '16:40', end: '17:25' }];
-    assert.strictEqual(sunlight.windowFit(wins, new Date(2026, 6, 6, 17, 0)), 1);
+    assert.strictEqual(sunlight.windowFit(wins, new Date('2026-07-06T09:00:00.000Z')), 1);
     assert.strictEqual(sunlight.windowFit(null, new Date()), 0.5);
-    assert.ok(sunlight.windowFit(wins, new Date(2026, 6, 6, 12, 0)) < 0.5);
+    assert.ok(sunlight.windowFit(wins, new Date('2026-07-06T04:00:00.000Z')) < 0.5);
 });
 
 test('accessible planner rejects graph fallback routes', () => {

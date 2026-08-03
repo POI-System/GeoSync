@@ -5,8 +5,9 @@ const crypto = require('crypto');
 const SAFE_EDGE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const MUTABLE_STATES = new Set(['pending', 'approaching']);
 const DEFAULT_PROPOSAL_TTL_MS = 10 * 60000;
-const DEFAULT_EVENT_DEDUPE_LIMIT = 2048;
 const DEFAULT_ITINERARY_CONCURRENCY = 6;
+const DEFAULT_EVENT_LEASE_MS = 60 * 1000;
+const DEFAULT_EVENT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 function barrierError(code, message, details = null) {
     const error = new Error(message);
@@ -342,6 +343,26 @@ function normalizeGraphEvent(value) {
     };
 }
 
+function graphEventPayloadHash(event) {
+    const canonical = [
+        event.eventId,
+        event.scenicId,
+        event.edgeId,
+        event.operation,
+        event.cacheInvalidated === true
+    ];
+    return `sha256:${crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex')}`;
+}
+
+function duplicateKeyError(error) {
+    return Number(error?.code) === 11000 || error?.codeName === 'DuplicateKey';
+}
+
+function persistedErrorCode(error) {
+    const value = String(error?.code || error?.name || 'UNEXPECTED_ERROR');
+    return /^[A-Z0-9_:-]{1,64}$/.test(value) ? value : 'UNEXPECTED_ERROR';
+}
+
 function errorRecord(scope, error, itineraryId = null) {
     return {
         scope,
@@ -442,10 +463,31 @@ function proposalMetadata(value) {
     };
 }
 
+function priorBarrierEvent(itinerary, eventId) {
+    if (itinerary?.pendingProposal) {
+        const pending = proposalMetadata(itinerary.pendingProposal);
+        if (pending.eventId === eventId) return pending;
+    }
+    const logs = Array.isArray(itinerary?.rerouteLog) ? itinerary.rerouteLog : [];
+    for (let index = logs.length - 1; index >= 0; index--) {
+        const entry = toPlain(logs[index]);
+        if (String(entry?.eventId || '').trim() !== eventId) continue;
+        return {
+            proposalId: String(entry?.proposalId || '').trim() || null,
+            eventId,
+            edgeId: String(entry?.edgeId || '').trim() || null,
+            barrierFingerprint: String(entry?.barrierFingerprint || '').trim() || null
+        };
+    }
+    return null;
+}
+
 function createBarrierRerouteCoordinator(deps = {}) {
     const { models, gateway, walkGraph, rebuildTimeline, routeBetween } = deps;
-    if (!models?.WalkEdge || !models?.Itinerary) {
-        throw new TypeError('createBarrierRerouteCoordinator requires WalkEdge and Itinerary models');
+    if (!models?.WalkEdge || !models?.Itinerary || !models?.BarrierEventRecord) {
+        throw new TypeError(
+            'createBarrierRerouteCoordinator requires WalkEdge, Itinerary, and BarrierEventRecord models'
+        );
     }
     if (!gateway || typeof gateway.invalidateRouteCache !== 'function') {
         throw new TypeError('createBarrierRerouteCoordinator requires gateway.invalidateRouteCache');
@@ -468,6 +510,12 @@ function createBarrierRerouteCoordinator(deps = {}) {
     }
     if (typeof models.Itinerary.find !== 'function' || typeof models.Itinerary.findOneAndUpdate !== 'function') {
         throw new TypeError('Itinerary model must provide find and findOneAndUpdate');
+    }
+    if (
+        typeof models.BarrierEventRecord.findOne !== 'function'
+        || typeof models.BarrierEventRecord.findOneAndUpdate !== 'function'
+    ) {
+        throw new TypeError('BarrierEventRecord model must provide findOne and findOneAndUpdate');
     }
 
     const emitOpsImpact = resolveImpactEmitter(deps);
@@ -494,28 +542,207 @@ function createBarrierRerouteCoordinator(deps = {}) {
     if (!Number.isFinite(proposalTtlMs) || proposalTtlMs <= 0) {
         throw new TypeError('proposalTtlMs must be a positive number');
     }
-    const eventDedupeLimit = deps.eventDedupeLimit === undefined
-        ? DEFAULT_EVENT_DEDUPE_LIMIT
-        : Number(deps.eventDedupeLimit);
-    if (!Number.isInteger(eventDedupeLimit) || eventDedupeLimit <= 0) {
-        throw new TypeError('eventDedupeLimit must be a positive integer');
-    }
     const itineraryConcurrency = deps.itineraryConcurrency === undefined
         ? DEFAULT_ITINERARY_CONCURRENCY
         : Number(deps.itineraryConcurrency);
     if (!Number.isInteger(itineraryConcurrency) || itineraryConcurrency <= 0) {
         throw new TypeError('itineraryConcurrency must be a positive integer');
     }
+    const eventLeaseMs = deps.eventLeaseMs === undefined
+        ? DEFAULT_EVENT_LEASE_MS
+        : Number(deps.eventLeaseMs);
+    if (!Number.isInteger(eventLeaseMs) || eventLeaseMs < 3000) {
+        throw new TypeError('eventLeaseMs must be an integer of at least 3000');
+    }
+    const eventRetentionMs = deps.eventRetentionMs === undefined
+        ? DEFAULT_EVENT_RETENTION_MS
+        : Number(deps.eventRetentionMs);
+    if (!Number.isInteger(eventRetentionMs) || eventRetentionMs < eventLeaseMs) {
+        throw new TypeError('eventRetentionMs must be an integer greater than or equal to eventLeaseMs');
+    }
+    const eventHeartbeatMs = deps.eventHeartbeatMs === undefined
+        ? Math.max(1000, Math.floor(eventLeaseMs / 3))
+        : Number(deps.eventHeartbeatMs);
+    if (
+        !Number.isInteger(eventHeartbeatMs)
+        || eventHeartbeatMs <= 0
+        || eventHeartbeatMs >= eventLeaseMs
+    ) {
+        throw new TypeError('eventHeartbeatMs must be a positive integer smaller than eventLeaseMs');
+    }
+    const eventOwnerId = String(deps.eventOwnerId
+        || `barrier:${process.pid}:${crypto.randomBytes(8).toString('hex')}`).trim();
+    if (!eventOwnerId) throw new TypeError('eventOwnerId must not be empty');
 
     const eventRecords = new Map();
     const scenicQueues = new Map();
 
-    function pruneEventRecords() {
-        if (eventRecords.size <= eventDedupeLimit) return;
-        for (const [eventId, record] of eventRecords) {
-            if (eventRecords.size <= eventDedupeLimit) break;
-            if (record.settled) eventRecords.delete(eventId);
+    async function loadEventRecord(eventId) {
+        return toPlain(await resolveLeanQuery(models.BarrierEventRecord.findOne({ eventId })));
+    }
+
+    async function claimEventLease(event) {
+        const payloadHash = graphEventPayloadHash(event);
+        for (let attempt = 0; attempt < 3; attempt++) {
+            const now = validDate(clock(), 'clock');
+            const leaseUntil = new Date(now.getTime() + eventLeaseMs);
+            const expireAt = new Date(now.getTime() + eventRetentionMs);
+            try {
+                const claimed = toPlain(await models.BarrierEventRecord.findOneAndUpdate(
+                    {
+                        eventId: event.eventId,
+                        payloadHash,
+                        $or: [
+                            { state: 'failed' },
+                            { state: 'processing', leaseUntil: { $lte: now } }
+                        ]
+                    },
+                    {
+                        $setOnInsert: {
+                            eventId: event.eventId,
+                            payloadHash,
+                            scenicId: event.scenicId,
+                            edgeId: event.edgeId,
+                            operation: event.operation,
+                            createdAt: now
+                        },
+                        $set: {
+                            state: 'processing',
+                            ownerId: eventOwnerId,
+                            leaseUntil,
+                            updatedAt: now,
+                            completedAt: null,
+                            outcome: null,
+                            lastErrorCode: null,
+                            expireAt
+                        },
+                        $inc: { attempts: 1 }
+                    },
+                    { new: true, upsert: true, setDefaultsOnInsert: true }
+                ));
+                if (claimed?.state === 'processing' && claimed.ownerId === eventOwnerId) {
+                    return { acquired: true, ownerId: eventOwnerId, payloadHash };
+                }
+            } catch (error) {
+                if (!duplicateKeyError(error)) throw error;
+            }
+
+            const existing = await loadEventRecord(event.eventId);
+            if (!existing) continue;
+            if (existing.payloadHash !== payloadHash) {
+                throw barrierError(
+                    'BARRIER_EVENT_ID_CONFLICT',
+                    'barrier eventId was reused with a different payload'
+                );
+            }
+            if (existing.state === 'completed') {
+                return { acquired: false, state: 'completed' };
+            }
+            const existingLease = new Date(existing.leaseUntil || 0);
+            if (existing.state === 'processing' && existingLease.getTime() > now.getTime()) {
+                return { acquired: false, state: 'processing' };
+            }
         }
+        return { acquired: false, state: 'processing' };
+    }
+
+    function startEventHeartbeat(event) {
+        let stopped = false;
+        let renewal = null;
+        let ownershipError = null;
+
+        async function renew() {
+            const now = validDate(clock(), 'clock');
+            const updated = await models.BarrierEventRecord.findOneAndUpdate(
+                {
+                    eventId: event.eventId,
+                    ownerId: eventOwnerId,
+                    state: 'processing'
+                },
+                {
+                    $set: {
+                        leaseUntil: new Date(now.getTime() + eventLeaseMs),
+                        updatedAt: now,
+                        expireAt: new Date(now.getTime() + eventRetentionMs)
+                    }
+                },
+                { new: true }
+            );
+            if (!updated) {
+                throw barrierError('BARRIER_EVENT_LEASE_LOST', 'barrier event lease ownership was lost');
+            }
+        }
+
+        function tick() {
+            if (stopped || renewal) return;
+            renewal = renew()
+                .catch(error => {
+                    ownershipError = error?.code
+                        ? error
+                        : barrierError(
+                            'BARRIER_EVENT_LEASE_RENEW_FAILED',
+                            'barrier event lease could not be renewed'
+                        );
+                })
+                .finally(() => { renewal = null; });
+        }
+
+        const timer = setInterval(tick, eventHeartbeatMs);
+        timer.unref?.();
+        return {
+            assertOwned() {
+                if (ownershipError) throw ownershipError;
+            },
+            async stop() {
+                if (stopped) return;
+                stopped = true;
+                clearInterval(timer);
+                if (renewal) await renewal;
+            }
+        };
+    }
+
+    async function completeEventLease(event, impact) {
+        const now = validDate(clock(), 'clock');
+        const updated = await models.BarrierEventRecord.findOneAndUpdate(
+            { eventId: event.eventId, ownerId: eventOwnerId, state: 'processing' },
+            {
+                $set: {
+                    state: 'completed',
+                    ownerId: null,
+                    leaseUntil: null,
+                    completedAt: now,
+                    updatedAt: now,
+                    outcome: impact.outcome,
+                    lastErrorCode: null,
+                    expireAt: new Date(now.getTime() + eventRetentionMs)
+                }
+            },
+            { new: true }
+        );
+        if (!updated) {
+            throw barrierError('BARRIER_EVENT_LEASE_LOST', 'barrier event completion lost its lease');
+        }
+    }
+
+    async function failEventLease(event, error) {
+        const now = validDate(clock(), 'clock');
+        await models.BarrierEventRecord.findOneAndUpdate(
+            { eventId: event.eventId, ownerId: eventOwnerId, state: 'processing' },
+            {
+                $set: {
+                    state: 'failed',
+                    ownerId: null,
+                    leaseUntil: now,
+                    completedAt: null,
+                    updatedAt: now,
+                    outcome: null,
+                    lastErrorCode: persistedErrorCode(error),
+                    expireAt: new Date(now.getTime() + eventRetentionMs)
+                }
+            },
+            { new: true }
+        );
     }
 
     async function emitFinalImpact(impact) {
@@ -551,10 +778,11 @@ function createBarrierRerouteCoordinator(deps = {}) {
         return fallbackRoute || stopRoute;
     }
 
-    async function processItinerary({ itinerary, event, snapshot, now }) {
+    async function processItinerary({ itinerary, event, snapshot, now, assertEventOwnership }) {
         let affected = false;
         let attempted = false;
         try {
+            assertEventOwnership();
             const itineraryId = itineraryIdOf(itinerary);
             if (!itineraryId) {
                 throw barrierError('INVALID_ITINERARY', 'active itinerary is missing _id');
@@ -584,6 +812,18 @@ function createBarrierRerouteCoordinator(deps = {}) {
             const existingProposal = hasPendingProposal(itinerary)
                 ? proposalMetadata(itinerary.pendingProposal)
                 : null;
+            const priorEvent = priorBarrierEvent(itinerary, event.eventId);
+            if (priorEvent) {
+                return {
+                    itineraryId,
+                    status: 'proposed',
+                    code: 'EVENT_ALREADY_APPLIED',
+                    proposalId: priorEvent.proposalId,
+                    replayed: true,
+                    affected,
+                    attempted
+                };
+            }
             if (existingProposal && event.operation !== 'close') {
                 return {
                     itineraryId,
@@ -602,6 +842,7 @@ function createBarrierRerouteCoordinator(deps = {}) {
             }
 
             attempted = true;
+            assertEventOwnership();
             const routeContext = {
                 barriers: snapshot.barriers.map(barrier => ({
                     edgeId: barrier.edgeId,
@@ -692,6 +933,7 @@ function createBarrierRerouteCoordinator(deps = {}) {
                 expireAt: new Date(now.getTime() + proposalTtlMs)
             };
 
+            assertEventOwnership();
             const updated = await models.Itinerary.findOneAndUpdate(
                 {
                     _id: itinerary._id,
@@ -732,6 +974,7 @@ function createBarrierRerouteCoordinator(deps = {}) {
             }
 
             const operationalErrors = [];
+            assertEventOwnership();
             if (existingProposal) {
                 try {
                     await releaseProposalTokens(
@@ -778,7 +1021,8 @@ function createBarrierRerouteCoordinator(deps = {}) {
         }
     }
 
-    async function runAcceptedEvent(event) {
+    async function runAcceptedEvent(event, assertEventOwnership) {
+        assertEventOwnership();
         const now = validDate(clock(), 'clock');
         const impact = {
             eventId: event.eventId,
@@ -807,6 +1051,7 @@ function createBarrierRerouteCoordinator(deps = {}) {
             failures: []
         };
 
+        assertEventOwnership();
         if (!event.cacheInvalidated) {
             try {
                 await gateway.invalidateRouteCache(
@@ -817,6 +1062,7 @@ function createBarrierRerouteCoordinator(deps = {}) {
                 impact.failures.push(errorRecord('route-cache-invalidation', error));
             }
         }
+        assertEventOwnership();
         try {
             await reloadWalkGraph();
         } catch (error) {
@@ -824,6 +1070,7 @@ function createBarrierRerouteCoordinator(deps = {}) {
             impact.failures.push(errorRecord('walk-graph-reload', error));
         }
 
+        assertEventOwnership();
         let snapshot;
         try {
             snapshot = await loadClosedBarrierSnapshot({
@@ -839,6 +1086,7 @@ function createBarrierRerouteCoordinator(deps = {}) {
             return emitFinalImpact(impact);
         }
 
+        assertEventOwnership();
         let itineraries;
         try {
             itineraries = await resolveLeanQuery(models.Itinerary.find({
@@ -858,7 +1106,13 @@ function createBarrierRerouteCoordinator(deps = {}) {
         const settled = await settleWithConcurrency(
             itineraries,
             itineraryConcurrency,
-            itinerary => processItinerary({ itinerary, event, snapshot, now })
+            itinerary => processItinerary({
+                itinerary,
+                event,
+                snapshot,
+                now,
+                assertEventOwnership
+            })
         );
         settled.forEach((result, index) => {
             const itineraryId = itineraryIdOf(itineraries[index]);
@@ -895,13 +1149,70 @@ function createBarrierRerouteCoordinator(deps = {}) {
             }
         });
 
+        assertEventOwnership();
         return emitFinalImpact(impact);
+    }
+
+    async function runPersistedEvent(event) {
+        const claim = await claimEventLease(event);
+        if (!claim.acquired) {
+            return {
+                eventId: event.eventId,
+                requestId: event.eventId,
+                scenicId: event.scenicId,
+                edgeId: event.edgeId,
+                operation: event.operation,
+                accepted: false,
+                duplicate: true,
+                persisted: true,
+                ...(claim.state === 'processing' ? { inProgress: true } : { completed: true })
+            };
+        }
+
+        const heartbeat = startEventHeartbeat(event);
+        try {
+            heartbeat.assertOwned();
+            const impact = await runAcceptedEvent(event, () => heartbeat.assertOwned());
+            await heartbeat.stop();
+            heartbeat.assertOwned();
+            await completeEventLease(event, impact);
+            return impact;
+        } catch (error) {
+            let failure = error;
+            try {
+                await heartbeat.stop();
+                heartbeat.assertOwned();
+            } catch (heartbeatError) {
+                if (heartbeatError !== failure) {
+                    failure = new AggregateError(
+                        [failure, heartbeatError],
+                        'Barrier event processing and lease renewal both failed'
+                    );
+                }
+            }
+            try {
+                await failEventLease(event, failure);
+            } catch (persistenceError) {
+                throw new AggregateError(
+                    [failure, persistenceError],
+                    'Barrier event failed and its persistent lease could not be updated'
+                );
+            }
+            throw failure;
+        }
     }
 
     async function processGraphEvent(rawEvent) {
         const event = normalizeGraphEvent(rawEvent);
+        const payloadHash = graphEventPayloadHash(event);
         const existing = eventRecords.get(event.eventId);
         if (existing) {
+            if (existing.payloadHash !== payloadHash) {
+                throw barrierError(
+                    'BARRIER_EVENT_ID_CONFLICT',
+                    'barrier eventId was reused with a different payload'
+                );
+            }
             await existing.promise;
             return {
                 eventId: event.eventId,
@@ -914,14 +1225,15 @@ function createBarrierRerouteCoordinator(deps = {}) {
             };
         }
 
-        const record = { promise: null, settled: false };
-        record.promise = runAcceptedEvent(event).finally(() => {
-            record.settled = true;
-            pruneEventRecords();
-        });
-        eventRecords.set(event.eventId, record);
-        pruneEventRecords();
-        return record.promise;
+        const promise = runPersistedEvent(event);
+        eventRecords.set(event.eventId, { promise, payloadHash });
+        try {
+            return await promise;
+        } finally {
+            if (eventRecords.get(event.eventId)?.promise === promise) {
+                eventRecords.delete(event.eventId);
+            }
+        }
     }
 
     function enqueueGraphEvent(rawEvent) {

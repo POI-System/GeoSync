@@ -214,6 +214,12 @@ test('reviewer middleware rejects collectors and accepts verified reviewers or a
     assert.equal(reviewerNext, true);
     assert.equal(reviewerReq.openId, 'reviewer-a');
 
+    let substringCookieNext = false;
+    await auth.requireReviewerOrAdmin({
+        headers: { cookie: `${reviewerCookie}; not_${DEFAULT_COOKIE_NAMES.admin}=invalid` }
+    }, response(), () => { substringCookieNext = true; });
+    assert.equal(substringCookieNext, true, 'cookie-name substrings must not force admin auth');
+
     const collectorRes = response();
     auth.issueUserSession(collectorRes, { openId: 'user-a', role: 'collector' });
     const denied = response();

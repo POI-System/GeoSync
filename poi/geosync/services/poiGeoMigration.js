@@ -13,6 +13,16 @@ const NUMERIC_VISIT_FIELDS = new Set([
 const BOOLEAN_VISIT_FIELDS = new Set([
     'accessible', 'ticketRequired', 'sheltered'
 ]);
+const DEFAULT_BATCH_SIZE = 250;
+const POI_PROJECTION = Object.freeze({
+    _id: 1,
+    category: 1,
+    location: 1,
+    geo: 1,
+    visitMeta: 1,
+    gateNodeId: 1,
+    superMapRef: 1
+});
 
 function toPlain(value) {
     return value?.toObject ? value.toObject() : value;
@@ -37,14 +47,19 @@ function migrationError(index, poiId, code, message) {
     };
 }
 
+function isNonNegativeSafeInteger(value) {
+    if (typeof value === 'number') return Number.isSafeInteger(value) && value >= 0;
+    if (typeof value !== 'string' || !/^(0|[1-9]\d*)$/.test(value)) return false;
+    return Number.isSafeInteger(Number(value));
+}
+
 function validSuperMapRef(value) {
     return Boolean(value
         && typeof value === 'object'
         && !Array.isArray(value)
         && typeof value.datasetName === 'string'
         && value.datasetName.trim()
-        && Number.isSafeInteger(Number(value.smId))
-        && Number(value.smId) >= 0
+        && isNonNegativeSafeInteger(value.smId)
         && typeof value.dataVersion === 'string'
         && value.dataVersion.trim());
 }
@@ -253,49 +268,88 @@ async function leanResult(query) {
 
 async function findOneLean(POI, documentId) {
     if (typeof POI.findOne !== 'function') return null;
-    return leanResult(POI.findOne(
-        { _id: documentId },
-        {
-            _id: 1,
-            category: 1,
-            location: 1,
-            geo: 1,
-            visitMeta: 1,
-            gateNodeId: 1,
-            superMapRef: 1
+    return leanResult(POI.findOne({ _id: documentId }, POI_PROJECTION));
+}
+
+function migrationBatchSize(value) {
+    const batchSize = value === undefined ? DEFAULT_BATCH_SIZE : Number(value);
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 5000) {
+        throw new TypeError('batchSize must be an integer between 1 and 5000');
+    }
+    return batchSize;
+}
+
+async function* iteratePoiDocuments(POI, batchSize) {
+    const query = POI.find({}, POI_PROJECTION);
+    const leanQuery = query && typeof query.lean === 'function' ? query.lean() : query;
+    if (leanQuery && typeof leanQuery.cursor === 'function') {
+        const cursor = leanQuery.cursor({ batchSize });
+        if (!cursor || typeof cursor[Symbol.asyncIterator] !== 'function') {
+            throw new TypeError('POI cursor must be async iterable');
         }
-    ));
+        try {
+            for await (const poi of cursor) yield poi;
+        } finally {
+            if (typeof cursor.close === 'function') await cursor.close();
+        }
+        return;
+    }
+
+    const pois = await leanQuery;
+    if (!Array.isArray(pois)) throw new TypeError('POI find result must be an array or cursor');
+    for (const poi of pois) yield poi;
 }
 
 async function runPoiGeoMigration({
     POI,
     apply = false,
-    scenicId = DEFAULT_SCENIC_ID
+    scenicId = DEFAULT_SCENIC_ID,
+    batchSize
 }) {
     if (!POI || typeof POI.find !== 'function' || typeof POI.updateOne !== 'function') {
         throw new TypeError('POI model with find and updateOne is required');
     }
-    const pois = await leanResult(POI.find(
-        {},
-        {
-            _id: 1,
-            category: 1,
-            location: 1,
-            geo: 1,
-            visitMeta: 1,
-            gateNodeId: 1,
-            superMapRef: 1
-        }
-    ));
-    const plan = planPoiGeoMigration({ pois, scenicId });
-    if (!apply) return { mode: 'dry-run', ...plan };
-
-    const errors = [...plan.errors];
-    const items = plan.items.filter(item => item.status !== 'planned');
+    const normalizedScenicId = String(scenicId || DEFAULT_SCENIC_ID).trim() || DEFAULT_SCENIC_ID;
+    const normalizedBatchSize = migrationBatchSize(batchSize);
+    const operations = [];
+    const items = [];
+    const errors = [];
+    let total = 0;
     let success = 0;
-    let skipped = plan.summary.skipped;
+    let skipped = 0;
+    let gateNodeIdDeferred = 0;
+    let superMapRefDeferred = 0;
 
-    for (const operation of plan.operations) {
+    for await (const poi of iteratePoiDocuments(POI, normalizedBatchSize)) {
+        const planned = planPoi(poi, total, normalizedScenicId);
+        total++;
+        if (planned.deferred?.includes('gateNodeId')) gateNodeIdDeferred++;
+        if (planned.deferred?.includes('superMapRef')) superMapRefDeferred++;
+
+        if (planned.status === 'failed') {
+            errors.push(planned.error);
+            items.push({
+                poiId: planned.error.poiId,
+                status: 'failed',
+                deferred: planned.deferred,
+                error: planned.error
+            });
+            continue;
+        }
+        if (planned.status === 'skipped') {
+            skipped++;
+            items.push({ poiId: planned.poiId, status: 'skipped', deferred: planned.deferred });
+            continue;
+        }
+
+        const operation = planned.operation;
+        operations.push(operation);
+        if (!apply) {
+            success++;
+            items.push({ poiId: planned.poiId, status: 'planned', deferred: planned.deferred });
+            continue;
+        }
+
         try {
             const result = await POI.updateOne(
                 conditionalFilter(operation),
@@ -309,7 +363,7 @@ async function runPoiGeoMigration({
 
             const current = await findOneLean(POI, operation.documentId);
             if (current) {
-                const currentPlan = planPoi(current, 0, scenicId);
+                const currentPlan = planPoi(current, total - 1, normalizedScenicId);
                 if (currentPlan.status === 'skipped') {
                     skipped++;
                     items.push({ poiId: operation.poiId, status: 'skipped' });
@@ -339,17 +393,17 @@ async function runPoiGeoMigration({
     }
 
     return {
-        mode: 'apply',
-        operations: plan.operations,
+        mode: apply ? 'apply' : 'dry-run',
+        operations,
         items,
         errors,
         summary: {
-            total: plan.summary.total,
+            total,
             success,
             skipped,
             failed: errors.length,
-            gateNodeIdDeferred: plan.summary.gateNodeIdDeferred,
-            superMapRefDeferred: plan.summary.superMapRefDeferred
+            gateNodeIdDeferred,
+            superMapRefDeferred
         }
     };
 }

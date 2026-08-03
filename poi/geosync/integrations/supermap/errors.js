@@ -184,6 +184,15 @@ function toSuperMapError(error, context = {}) {
     const transportCode = transportCodeOf(error);
     const upstreamCode = upstreamCodeOf(error);
 
+    // Transport rate limiting is authoritative even when the upstream body
+    // contains a domain code such as 8201.
+    if (status === 429) {
+        return new IServerUnavailableError(undefined, mappedOptions(error, context, {
+            category: 'rate-limit',
+            retryable: false
+        }));
+    }
+
     if (upstreamCode) {
         const nonRetryableStatus = status && [400, 401, 403, 404, 409, 422].includes(status);
         return createSuperMapError(upstreamCode, undefined, mappedOptions(error, context, {
@@ -235,13 +244,6 @@ function toSuperMapError(error, context = {}) {
     if (status === 422) {
         return new RouteSnapError(undefined, mappedOptions(error, context, {
             category: 'parameter',
-            retryable: false
-        }));
-    }
-
-    if (status === 429) {
-        return new IServerUnavailableError(undefined, mappedOptions(error, context, {
-            category: 'rate-limit',
             retryable: false
         }));
     }

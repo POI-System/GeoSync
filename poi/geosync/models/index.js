@@ -4,6 +4,13 @@
 
 const { Schema } = require('mongoose');
 const { getAdminSessionRevocationModel } = require('../services/adminSessionRevocation');
+const {
+    WALK_EDGE_LIMITS,
+    normalizeDistanceM,
+    normalizeSlopePct,
+    normalizeUnitRatio,
+    normalizeWalkSec
+} = require('../lib/walkEdgeContract');
 
 let M = null; // 注册结果缓存
 
@@ -287,6 +294,35 @@ function registerModels(mongoose, injectedModels = {}) {
     );
     capacityTokenSchema.index({ expireAt: 1 }, { expireAfterSeconds: 0 });
 
+    // ---- barrier_event_records（跨实例事件租约 + 完成去重）----
+    const barrierEventRecordSchema = new Schema({
+        eventId: { type: String, required: true },
+        payloadHash: { type: String, required: true },
+        scenicId: { type: String, required: true },
+        edgeId: { type: String, required: true },
+        operation: { type: String, enum: ['close', 'open'], required: true },
+        state: {
+            type: String,
+            enum: ['processing', 'completed', 'failed'],
+            required: true
+        },
+        ownerId: { type: String, default: null },
+        leaseUntil: { type: Date, default: null },
+        attempts: { type: Number, min: 0, default: 0 },
+        outcome: { type: String, enum: ['completed', 'partial', 'failed', null], default: null },
+        lastErrorCode: { type: String, default: null },
+        createdAt: { type: Date, required: true },
+        updatedAt: { type: Date, required: true },
+        completedAt: { type: Date, default: null },
+        expireAt: { type: Date, required: true }
+    }, { collection: 'barrier_event_records' });
+    barrierEventRecordSchema.index(
+        { eventId: 1 },
+        { unique: true, name: 'barrier_event_id_unique' }
+    );
+    barrierEventRecordSchema.index({ state: 1, leaseUntil: 1 });
+    barrierEventRecordSchema.index({ expireAt: 1 }, { expireAfterSeconds: 0 });
+
     // ---- pairings + pairing_profiles ----
     const pairingSchema = new Schema({
         scenicId: String,
@@ -342,12 +378,39 @@ function registerModels(mongoose, injectedModels = {}) {
         from: { type: String, required: true },
         to: { type: String, required: true },
         geometry: { type: [[Number]], default: [] },
-        distanceM: Number,
-        walkSec: { type: Number, required: true },
-        slope: { type: Number, default: 0 },
+        distanceM: {
+            type: Number,
+            min: 0,
+            validate: value => normalizeDistanceM(value) !== null
+        },
+        walkSec: {
+            type: Number,
+            required: true,
+            min: 0,
+            validate: value => normalizeWalkSec(value) !== null
+        },
+        slope: {
+            type: Number,
+            default: 0,
+            min: WALK_EDGE_LIMITS.MIN_SLOPE_PCT,
+            max: WALK_EDGE_LIMITS.MAX_SLOPE_PCT,
+            validate: value => normalizeSlopePct(value) !== null
+        },
         stairs: { type: Boolean, default: false },
-        shade: { type: Number, default: 0.5, min: 0, max: 1 },
-        covered: { type: Number, default: 0, min: 0, max: 1 },
+        shade: {
+            type: Number,
+            default: 0.5,
+            min: 0,
+            max: 1,
+            validate: value => normalizeUnitRatio(value) !== null
+        },
+        covered: {
+            type: Number,
+            default: 0,
+            min: 0,
+            max: 1,
+            validate: value => normalizeUnitRatio(value) !== null
+        },
         accessible: { type: Boolean, default: false },
         accessibleEvidence: { type: Number, default: 0 },
         accessibleVerified: { type: Boolean, default: false },
@@ -442,6 +505,7 @@ function registerModels(mongoose, injectedModels = {}) {
         Itinerary: mongoose.model('Itinerary', itinerarySchema),
         Checkin: mongoose.model('Checkin', checkinSchema),
         CapacityToken: mongoose.model('CapacityToken', capacityTokenSchema),
+        BarrierEventRecord: mongoose.model('BarrierEventRecord', barrierEventRecordSchema),
         Pairing: mongoose.model('Pairing', pairingSchema),
         PairingProfile: mongoose.model('PairingProfile', pairingProfileSchema),
         WalkNode: mongoose.model('WalkNode', walkNodeSchema),

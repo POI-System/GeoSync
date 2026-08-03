@@ -435,7 +435,10 @@ function applyProposal(itinerary, proposal) {
 
 function proposalDiff(itinerary, proposal = itinerary?.pendingProposal) {
     if (!itinerary || !proposal) return null;
-    const newStops = applyProposal(itinerary, proposal);
+    const source = proposal?.toObject ? proposal.toObject() : proposal;
+    const newStops = source?.type === 'barrierReroute' && Array.isArray(source.payload?.stops)
+        ? source.payload.stops
+        : applyProposal(itinerary, source);
     return newStops ? {
         before: (itinerary.stops || []).map(stop => String(stop.poiId)),
         after: newStops
