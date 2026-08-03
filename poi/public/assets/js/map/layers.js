@@ -1,4 +1,11 @@
-export const SOURCE_IDS = Object.freeze({
+import {
+    CROWD_COLORS,
+    MAP_COLORS,
+    MAP_LAYER_STYLES,
+    ROUTE_COLORS
+} from './styles.js';
+
+const SOURCE_IDS = Object.freeze({
     boundary: 'geosync-boundary',
     pois: 'geosync-pois',
     route: 'geosync-route',
@@ -8,7 +15,7 @@ export const SOURCE_IDS = Object.freeze({
     closedEdges: 'geosync-closed-edges'
 });
 
-export const LAYER_IDS = Object.freeze({
+const LAYER_IDS = Object.freeze({
     boundaryFill: 'geosync-boundary-fill',
     boundaryLine: 'geosync-boundary-line',
     routeOld: 'geosync-route-old-line',
@@ -25,7 +32,10 @@ export const LAYER_IDS = Object.freeze({
 export const emptyFeatureCollection = () => ({ type: 'FeatureCollection', features: [] });
 
 export function installSourcesAndLayers(map) {
-    for (const sourceId of Object.values(SOURCE_IDS)) {
+    const sources = SOURCE_IDS;
+    const layers = LAYER_IDS;
+    const style = MAP_LAYER_STYLES;
+    for (const sourceId of Object.values(sources)) {
         if (!map.getSource(sourceId)) {
             map.addSource(sourceId, { type: 'geojson', data: emptyFeatureCollection() });
         }
@@ -36,71 +46,84 @@ export function installSourcesAndLayers(map) {
     };
 
     addLayer({
-        id: LAYER_IDS.boundaryFill,
+        id: layers.boundaryFill,
         type: 'fill',
-        source: SOURCE_IDS.boundary,
-        paint: { 'fill-color': '#087f73', 'fill-opacity': 0.06 }
+        source: sources.boundary,
+        paint: { 'fill-color': MAP_COLORS.boundary, 'fill-opacity': style.boundary.fillOpacity }
     });
     addLayer({
-        id: LAYER_IDS.boundaryLine,
+        id: layers.boundaryLine,
         type: 'line',
-        source: SOURCE_IDS.boundary,
-        paint: { 'line-color': '#087f73', 'line-width': 2, 'line-dasharray': [3, 2] }
-    });
-    addLayer({
-        id: LAYER_IDS.routeOld,
-        type: 'line',
-        source: SOURCE_IDS.routeOld,
-        layout: { 'line-cap': 'round', 'line-join': 'round' },
-        paint: { 'line-color': '#707a80', 'line-width': 6, 'line-opacity': 0.65, 'line-dasharray': [2, 2] }
-    });
-    addLayer({
-        id: LAYER_IDS.route,
-        type: 'line',
-        source: SOURCE_IDS.route,
-        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        source: sources.boundary,
         paint: {
-            'line-color': ['coalesce', ['get', 'color'], '#087f73'],
-            'line-width': 6,
-            'line-opacity': 0.92,
-            'line-dasharray': [1, 0]
+            'line-color': MAP_COLORS.boundary,
+            'line-width': style.boundary.lineWidth,
+            'line-dasharray': style.boundary.dash
         }
     });
     addLayer({
-        id: LAYER_IDS.routeNew,
+        id: layers.routeOld,
         type: 'line',
-        source: SOURCE_IDS.routeNew,
+        source: sources.routeOld,
         layout: { 'line-cap': 'round', 'line-join': 'round' },
-        paint: { 'line-color': '#087f73', 'line-width': 5, 'line-opacity': 0.9 }
+        paint: {
+            'line-color': ROUTE_COLORS.old,
+            'line-width': style.routeOld.width,
+            'line-opacity': style.routeOld.opacity,
+            'line-dasharray': style.routeOld.dash
+        }
     });
     addLayer({
-        id: LAYER_IDS.closedEdges,
+        id: layers.route,
         type: 'line',
-        source: SOURCE_IDS.closedEdges,
+        source: sources.route,
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: {
+            'line-color': ['coalesce', ['get', 'color'], ROUTE_COLORS.normal],
+            'line-width': style.route.width,
+            'line-opacity': style.route.opacity,
+            'line-dasharray': style.route.solidDash
+        }
+    });
+    addLayer({
+        id: layers.routeNew,
+        type: 'line',
+        source: sources.routeNew,
+        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        paint: {
+            'line-color': ['coalesce', ['get', 'color'], ROUTE_COLORS.normal],
+            'line-width': style.routeNew.width,
+            'line-opacity': style.routeNew.opacity
+        }
+    });
+    addLayer({
+        id: layers.closedEdges,
+        type: 'line',
+        source: sources.closedEdges,
         layout: { 'line-cap': 'round' },
         paint: {
-            'line-color': '#b42318',
-            'line-width': ['case', ['boolean', ['get', 'selected'], false], 8, 5],
-            'line-dasharray': [1, 1]
+            'line-color': ROUTE_COLORS.closed,
+            'line-width': ['case', ['boolean', ['get', 'selected'], false], style.closedEdge.selectedWidth, style.closedEdge.width],
+            'line-dasharray': style.closedEdge.dash
         }
     });
     addLayer({
-        id: LAYER_IDS.poiCrowd,
+        id: layers.poiCrowd,
         type: 'circle',
-        source: SOURCE_IDS.pois,
+        source: sources.pois,
         filter: ['!=', ['get', 'status'], 'closed'],
         paint: {
-            'circle-radius': ['interpolate', ['linear'], ['zoom'], 13, 10, 18, 17],
-            'circle-color': ['coalesce', ['get', 'crowdColor'], '#8e8e93'],
-            'circle-opacity': ['case', ['==', ['get', 'status'], 'limited'], 0.5, 0.92],
-            'circle-stroke-width': 3,
-            'circle-stroke-color': '#ffffff'
+            'circle-radius': ['interpolate', ['linear'], ['zoom'], 13, style.poi.minRadius, 18, style.poi.maxRadius],
+            'circle-color': ['coalesce', ['get', 'crowdColor'], CROWD_COLORS.unknown],
+            'circle-opacity': ['case', ['==', ['get', 'status'], 'limited'], style.poi.limitedOpacity, style.poi.opacity],
+            'circle-stroke-width': style.poi.strokeWidth,
+            'circle-stroke-color': MAP_COLORS.white
         }
     });
     addLayer({
-        id: LAYER_IDS.poiIcon,
+        id: layers.poiIcon,
         type: 'symbol',
-        source: SOURCE_IDS.pois,
+        source: sources.pois,
         filter: ['!=', ['get', 'status'], 'closed'],
         layout: {
             'icon-image': ['coalesce', ['get', 'iconId'], 'geosync-poi-default'],
@@ -110,10 +133,11 @@ export function installSourcesAndLayers(map) {
     });
     if (map.getStyle()?.glyphs) {
         addLayer({
-            id: LAYER_IDS.poiLabel,
+            id: layers.poiLabel,
             type: 'symbol',
-            source: SOURCE_IDS.pois,
+            source: sources.pois,
             minzoom: 15,
+            filter: ['!=', ['get', 'status'], 'closed'],
             layout: {
                 'text-field': ['concat', ['coalesce', ['get', 'name'], ''], '\n', ['coalesce', ['get', 'crowdLabel'], '准备中']],
                 'text-size': 12,
@@ -121,19 +145,51 @@ export function installSourcesAndLayers(map) {
                 'text-anchor': 'top',
                 'text-allow-overlap': false
             },
-            paint: { 'text-color': '#17222a', 'text-halo-color': '#ffffff', 'text-halo-width': 2 }
+            paint: { 'text-color': MAP_COLORS.text, 'text-halo-color': MAP_COLORS.white, 'text-halo-width': 2 }
         });
     }
     addLayer({
-        id: LAYER_IDS.userAccuracy,
+        id: layers.userAccuracy,
         type: 'circle',
-        source: SOURCE_IDS.user,
-        paint: { 'circle-radius': 18, 'circle-color': '#2774ae', 'circle-opacity': 0.14 }
+        source: sources.user,
+        paint: {
+            'circle-radius': style.user.accuracyRadius,
+            'circle-color': MAP_COLORS.user,
+            'circle-opacity': style.user.accuracyOpacity
+        }
     });
     addLayer({
-        id: LAYER_IDS.userPoint,
+        id: layers.userPoint,
         type: 'circle',
-        source: SOURCE_IDS.user,
-        paint: { 'circle-radius': 7, 'circle-color': '#2774ae', 'circle-stroke-color': '#ffffff', 'circle-stroke-width': 3 }
+        source: sources.user,
+        paint: {
+            'circle-radius': style.user.pointRadius,
+            'circle-color': MAP_COLORS.user,
+            'circle-stroke-color': MAP_COLORS.white,
+            'circle-stroke-width': style.user.strokeWidth
+        }
+    });
+
+    return Object.freeze({
+        getSource(key) {
+            const id = sources[key];
+            return id ? map.getSource(id) : null;
+        },
+        getLayer(key) {
+            const id = layers[key];
+            return id ? map.getLayer(id) : null;
+        },
+        setPaintProperty(key, property, value) {
+            const id = layers[key];
+            if (id) map.setPaintProperty(id, property, value);
+        },
+        onLayer(event, key, handler) {
+            const id = layers[key];
+            if (id) map.on(event, id, handler);
+        },
+        offLayer(event, key, handler) {
+            const id = layers[key];
+            if (id) map.off?.(event, id, handler);
+        }
     });
 }

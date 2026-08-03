@@ -1,0 +1,11 @@
+{
+  "slot": "2026-08-03T10:00:00.000Z",
+  "lowConfidence": false,
+  "items": [
+    { "poiId": "poi_gate", "ci": 0.26, "level": "low", "queueEstMin": 2 },
+    { "poiId": "poi_photo", "ci": 0.56, "level": "medium", "queueEstMin": 9 },
+    { "poiId": "poi_history", "ci": 0.83, "level": "high", "queueEstMin": 24 },
+    { "poiId": "poi_lake", "ci": 0.38, "level": "low", "queueEstMin": 4 },
+    { "poiId": "poi_family", "ci": 0.45, "level": "medium", "queueEstMin": 6 }
+  ]
+}

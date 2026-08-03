@@ -1,203 +1,403 @@
-const CENTER = [114.3592, 30.541];
-const EXTENT = [114.3468, 30.5332, 114.3722, 30.5486];
+import { ApiError, apiErrorCategory, safeApiMessage } from '../shared/errors.js';
+import { DEMO_CLOSED_EDGE, DEMO_PROPOSAL_TEMPLATE, DEMO_ROUTES } from '../../mock/runtime.js';
 
-const POIS = [
-    { id: 'poi_gate', poiName: '珞珈门游客中心', category: '旅游景点', description: '行程起点与服务中心', lng: 114.3518, lat: 30.5374, status: 'approved' },
-    { id: 'poi_photo', poiName: '樱顶摄影点', category: '摄影', description: '适合远眺与建筑摄影', lng: 114.3558, lat: 30.5404, status: 'approved' },
-    { id: 'poi_history', poiName: '老图书馆', category: '人文', description: '校园历史建筑', lng: 114.3596, lat: 30.5421, status: 'approved' },
-    { id: 'poi_lake', poiName: '珞珈湖步道', category: '自然', description: '林荫步道与湖景', lng: 114.3648, lat: 30.5441, status: 'approved' },
-    { id: 'poi_family', poiName: '自然观察园', category: '亲子', description: '适合亲子自然观察', lng: 114.3692, lat: 30.5405, status: 'approved' }
-];
+const FIXTURE_BASE = '/assets/mock';
+const clone = value => value == null ? value : JSON.parse(JSON.stringify(value));
 
-const HEATMAP = {
-    slot: new Date().toISOString(),
-    lowConfidence: false,
-    items: [
-        { poiId: 'poi_gate', ci: 0.26, level: 'low', queueEstMin: 2, lowConfidence: false },
-        { poiId: 'poi_photo', ci: 0.56, level: 'medium', queueEstMin: 9, lowConfidence: false },
-        { poiId: 'poi_history', ci: 0.83, level: 'high', queueEstMin: 24, lowConfidence: false },
-        { poiId: 'poi_lake', ci: 0.38, level: 'low', queueEstMin: 4, lowConfidence: false },
-        { poiId: 'poi_family', ci: 0.45, level: 'medium', queueEstMin: 6, lowConfidence: false }
-    ]
-};
-
-const route = (coordinates, mode = 'shade', source = 'iserver') => ({
-    geometry: { type: 'LineString', coordinates },
-    distanceM: Math.round(coordinates.length * 238),
-    durationSec: Math.round(coordinates.length * 196),
-    gis: { source, mode, degraded: source !== 'iserver', durationMs: 148, dataVersion: 'demo-v1' },
-    verifiedAccessible: mode === 'accessible' ? source === 'iserver' : null
+const SCENARIO_STATUS = Object.freeze({
+    1203: 409,
+    1204: 400,
+    1205: 400,
+    8201: 503,
+    8202: 503,
+    8204: 400
 });
 
-const OLD_ROUTE = route([
-    [114.3518, 30.5374], [114.3558, 30.5404], [114.3596, 30.5421], [114.3648, 30.5441]
-]);
-
-const NEW_ROUTE = route([
-    [114.3518, 30.5374], [114.3558, 30.5404], [114.3615, 30.5394], [114.3648, 30.5441]
-]);
-
-function stops() {
-    const now = Date.now();
-    return [
-        ['stop_photo', 'poi_photo', '樱顶摄影点'],
-        ['stop_history', 'poi_history', '老图书馆'],
-        ['stop_lake', 'poi_lake', '珞珈湖步道']
-    ].map(([stopId, poiId, poiName], index) => ({
-        stopId, poiId, poiName,
-        state: index === 0 ? 'approaching' : 'pending',
-        plannedArrive: new Date(now + (index * 55 + 20) * 60000).toISOString(),
-        plannedLeave: new Date(now + (index * 55 + 45) * 60000).toISOString(),
-        ci: { predictedAtArrive: [0.56, 0.83, 0.38][index] }
-    }));
+function scenarioOperation(code) {
+    if ([8201, 8202, 8204].includes(Number(code))) return 'plan';
+    if ([1204, 1205].includes(Number(code))) return 'proposal';
+    if (Number(code) === 1203) return 'write';
+    if ([2102, 2103].includes(Number(code))) return 'position';
+    return 'all';
 }
 
-function clone(value) {
-    return value == null ? value : JSON.parse(JSON.stringify(value));
+function cancelledError(cause = null) {
+    return new ApiError('请求已取消', {
+        category: 'cancelled',
+        retryable: false,
+        cause
+    });
 }
 
-function photoSpots() {
-    return {
-        items: [
-            {
-                spotId: 'spot_roof', poiId: 'poi_photo', name: '樱顶西望',
-                lnglat: [114.3558, 30.5404], heading: 285, score: 0.91,
-                coverPhoto: null, todayWindows: [{ start: '17:12', end: '17:48', light: 'golden' }],
-                ciNow: 0.56, distanceM: 420
-            },
-            {
-                spotId: 'spot_lake', poiId: 'poi_lake', name: '湖畔倒影',
-                lnglat: [114.3648, 30.5441], heading: 110, score: 0.84,
-                coverPhoto: null, todayWindows: [{ start: '08:10', end: '08:42', light: 'side' }],
-                ciNow: 0.38, distanceM: 780
-            }
-        ]
-    };
+function nowOf(clock) {
+    return typeof clock.now === 'function' ? Number(clock.now()) : Date.now();
 }
 
 export class DemoApiClient {
-    constructor() {
+    constructor({
+        scenario = '',
+        fetchImpl = globalThis.fetch?.bind(globalThis),
+        clock = globalThis,
+        storage = globalThis.sessionStorage
+    } = {}) {
+        this.fetchImpl = fetchImpl;
+        this.clock = clock;
+        this.storage = storage;
+        this.controllers = new Map();
+        this.fixtureCache = new Map();
+        this.scenarios = new Map();
+        this.itinerary = this.readStoredItinerary();
+        if (scenario && typeof scenario === 'object') {
+            for (const [operation, code] of Object.entries(scenario)) this.setScenario(operation, code);
+        } else if (scenario) {
+            this.setScenario(Number(scenario));
+        }
+    }
+
+    readStoredItinerary() {
         try {
-            this.itinerary = JSON.parse(sessionStorage.getItem('geosync:demo-itinerary')) || null;
+            return JSON.parse(this.storage?.getItem('geosync:demo-itinerary')) || null;
         } catch {
-            this.itinerary = null;
+            return null;
         }
     }
 
     persist() {
-        if (this.itinerary) sessionStorage.setItem('geosync:demo-itinerary', JSON.stringify(this.itinerary));
-        else sessionStorage.removeItem('geosync:demo-itinerary');
+        if (!this.storage) return;
+        if (this.itinerary) this.storage.setItem('geosync:demo-itinerary', JSON.stringify(this.itinerary));
+        else this.storage.removeItem('geosync:demo-itinerary');
+    }
+
+    setScenario(operation, code) {
+        if (code === undefined) {
+            code = Number(operation);
+            operation = scenarioOperation(code);
+        }
+        const numericCode = Number(code);
+        if (numericCode) this.scenarios.set(String(operation), numericCode);
+        return this;
+    }
+
+    clearScenario(operation) {
+        if (operation) this.scenarios.delete(String(operation));
+        else this.scenarios.clear();
+        return this;
+    }
+
+    scenarioCode(operation) {
+        return this.scenarios.get(operation)
+            || (operation === 'proposal' ? this.scenarios.get('write') : 0)
+            || this.scenarios.get('all')
+            || 0;
+    }
+
+    throwScenario(operation) {
+        const code = this.scenarioCode(operation);
+        if (!code || [2102, 2103].includes(code)) return;
+        const status = SCENARIO_STATUS[code] || 400;
+        const category = apiErrorCategory({ status, code });
+        throw new ApiError(safeApiMessage({ status, code, category }), {
+            category,
+            httpStatus: status,
+            code,
+            retryable: status >= 500
+        });
+    }
+
+    register(key, controller) {
+        if (!this.controllers.has(key)) this.controllers.set(key, new Set());
+        this.controllers.get(key).add(controller);
+    }
+
+    unregister(key, controller) {
+        const controllers = this.controllers.get(key);
+        controllers?.delete(controller);
+        if (!controllers?.size) this.controllers.delete(key);
+    }
+
+    cancel(key) {
+        for (const controller of this.controllers.get(key) || []) controller.abort();
+        this.controllers.delete(key);
+    }
+
+    cancelAll() {
+        for (const key of [...this.controllers.keys()]) this.cancel(key);
+    }
+
+    destroy() {
+        this.cancelAll();
+    }
+
+    wait(ms, signal) {
+        return new Promise((resolve, reject) => {
+            if (signal.aborted) return reject(cancelledError(signal.reason));
+            const timer = this.clock.setTimeout(() => {
+                cleanup();
+                resolve();
+            }, ms);
+            const onAbort = () => {
+                cleanup();
+                reject(cancelledError(signal.reason));
+            };
+            const cleanup = () => {
+                this.clock.clearTimeout(timer);
+                signal.removeEventListener('abort', onAbort);
+            };
+            signal.addEventListener('abort', onAbort, { once: true });
+        });
+    }
+
+    async run(key, operation, { delayMs = 90, cancelPrevious = true } = {}) {
+        if (cancelPrevious) this.cancel(key);
+        const controller = new AbortController();
+        this.register(key, controller);
+        try {
+            await this.wait(delayMs, controller.signal);
+            if (controller.signal.aborted) throw cancelledError(controller.signal.reason);
+            return clone(await operation(controller.signal));
+        } catch (error) {
+            if (error instanceof ApiError) throw error;
+            if (controller.signal.aborted || error?.name === 'AbortError') throw cancelledError(error);
+            throw new ApiError('演示数据暂时不可用', {
+                category: 'response',
+                retryable: true,
+                cause: error
+            });
+        } finally {
+            this.unregister(key, controller);
+        }
     }
 
     delay(value, ms = 90) {
-        return new Promise(resolve => setTimeout(() => resolve(clone(value)), ms));
+        return this.run(`delay:${Math.random()}`, () => value, { delayMs: ms, cancelPrevious: false });
+    }
+
+    async fixture(name, signal) {
+        if (this.fixtureCache.has(name)) return clone(this.fixtureCache.get(name));
+        if (typeof this.fetchImpl !== 'function') throw new TypeError('fetch unavailable');
+        const response = await this.fetchImpl(`${FIXTURE_BASE}/${name}`, {
+            credentials: 'same-origin',
+            signal
+        });
+        if (!response.ok) throw new Error(`fixture ${name} unavailable`);
+        const value = await response.json();
+        this.fixtureCache.set(name, value);
+        return clone(value);
     }
 
     getClientConfig() {
-        return this.delay({
-            scenicId: 'whu_demo', scenicCenter: CENTER,
-            features: { supermap: true, threeD: true, rain: true },
-            gis: {
-                enabled: true, state: 'online', center: CENTER, extent: EXTENT, crs: 'EPSG:4326',
-                features: { supermap: true, threeD: true },
-                publicServices: { map: 'demo://map', scene: '/tour?demo=1#spot/spot_roof' }
-            }
+        return this.run('config', signal => this.fixture('client-config.json', signal));
+    }
+
+    getBoundary() {
+        return this.run('boundary', signal => this.fixture('boundary.geojson', signal));
+    }
+
+    getPois() {
+        return this.run('pois', async signal => {
+            const collection = await this.fixture('pois.geojson', signal);
+            return collection.features.map(feature => ({
+                id: feature.properties.poiId,
+                poiName: feature.properties.name,
+                category: feature.properties.category,
+                description: feature.properties.description,
+                status: feature.properties.status,
+                lng: feature.geometry.coordinates[0],
+                lat: feature.geometry.coordinates[1]
+            }));
         });
     }
 
-    getPois() { return this.delay(POIS); }
-    getHeatmap() { return this.delay(HEATMAP); }
-    getCurrentItinerary() { return this.delay(this.itinerary); }
-    getPhotoSpots() { return this.delay(photoSpots()); }
-    getGoldenWindow() {
-        return this.delay({
-            date: new Date().toISOString().slice(0, 10), weatherAdjusted: false, cloudy: false,
-            windows: [{ start: '17:12', end: '17:48', light: 'golden', trueSunset: '18:52', geometricSunset: '19:08', ciPredicted: 0.47 }]
+    getHeatmap() {
+        return this.run('heatmap', signal => this.fixture('heatmap.json', signal));
+    }
+
+    getCurrentItinerary() {
+        return this.run('current', () => this.itinerary);
+    }
+
+    getClosedEdges() {
+        return this.run('closed-edges', signal => this.fixture('closed-edges.json', signal));
+    }
+
+    getPhotoSpots() {
+        return this.run('photospots', signal => this.fixture('photospots.json', signal));
+    }
+
+    getGoldenWindow(id) {
+        return this.run(`golden:${id}`, async signal => {
+            const fixture = await this.fixture('photospots.json', signal);
+            return fixture.items.find(item => String(item.spotId) === String(id))?.golden || null;
         });
     }
-    getArData() {
-        return this.delay({ heading: 285, tolerance: 10, focalHint: '26mm 等效', ciNow: 0.56, fallbackCard: { text: '面朝西北，主楼置于画面右三分之一', photos: [] } });
+
+    getArData(id) {
+        return this.run(`ar:${id}`, async signal => {
+            const fixture = await this.fixture('photospots.json', signal);
+            return fixture.items.find(item => String(item.spotId) === String(id))?.ar || null;
+        });
     }
 
     async plan(payload) {
-        const mode = payload.accessible ? 'accessible' : payload.shadeFirst ? 'shade' : 'normal';
-        this.itinerary = {
-            itineraryId: 'demo_itinerary', version: 0, state: 'draft',
-            date: new Date().toISOString().slice(0, 10),
-            preferences: { ...payload }, stops: stops(), route: { ...clone(OLD_ROUTE), gis: { ...OLD_ROUTE.gis, mode } },
-            currentStopId: 'stop_photo', pendingProposal: null, savedMinutesTotal: 0, rerouteCount: 0,
-            totalWalkMin: 34, planNote: '已优先安排摄影和林荫路段'
-        };
-        this.persist();
-        return this.delay(this.itinerary, 320);
+        return this.run('plan', async signal => {
+            this.throwScenario('plan');
+            const [template, routes] = await Promise.all([
+                this.fixture('itinerary.json', signal),
+                this.fixture('routes.json', signal)
+            ]);
+            const mode = payload.accessible ? 'accessible' : payload.shadeFirst ? 'shade' : 'normal';
+            const now = nowOf(this.clock);
+            template.date = new Date(now).toISOString().slice(0, 10);
+            template.preferences = { ...payload };
+            template.stops = template.stops.map((stop, index) => ({
+                ...stop,
+                plannedArrive: new Date(now + (index * 55 + 20) * 60000).toISOString(),
+                plannedLeave: new Date(now + (index * 55 + 45) * 60000).toISOString()
+            }));
+            template.route = {
+                ...routes.before,
+                gis: { ...routes.before.gis, mode },
+                verifiedAccessible: mode === 'accessible' ? true : null
+            };
+            this.itinerary = template;
+            this.persist();
+            return this.itinerary;
+        }, { delayMs: 320 });
     }
 
-    mutate(state) {
-        this.itinerary = { ...this.itinerary, state, version: this.itinerary.version + 1 };
-        this.persist();
-        return this.delay(this.itinerary);
+    planItinerary(payload) { return this.plan(payload); }
+
+    requireItinerary(id, version) {
+        if (!this.itinerary
+            || String(this.itinerary.itineraryId) !== String(id)
+            || Number(this.itinerary.version) !== Number(version)) {
+            const status = 409;
+            throw new ApiError(safeApiMessage({ status, code: 1203 }), {
+                category: 'conflict', httpStatus: status, code: 1203
+            });
+        }
     }
 
-    start() { return this.mutate('active'); }
-    pause() { return this.mutate('paused'); }
-    resume() { return this.mutate('active'); }
-    finish() { return this.mutate('completed'); }
-    reportPosition() { return this.delay({ accepted: true }, 20); }
+    transition(id, version, state, key) {
+        return this.run('itinerary-write', () => {
+            this.throwScenario('write');
+            this.requireItinerary(id, version);
+            this.itinerary = { ...this.itinerary, state, version: this.itinerary.version + 1 };
+            this.persist();
+            return this.itinerary;
+        }, { delayMs: 90, cancelPrevious: true, key });
+    }
 
-    skip(_id, stopId) {
-        this.itinerary = {
-            ...this.itinerary,
-            version: this.itinerary.version + 1,
-            stops: this.itinerary.stops.map(stop => stop.stopId === stopId ? { ...stop, state: 'skipped' } : stop)
-        };
-        this.persist();
-        return this.delay(this.itinerary);
+    start(id, version) { return this.transition(id, version, 'active'); }
+    startItinerary(id, version) { return this.start(id, version); }
+    pause(id, version) { return this.transition(id, version, 'paused'); }
+    pauseItinerary(id, version) { return this.pause(id, version); }
+    resume(id, version) { return this.transition(id, version, 'active'); }
+    resumeItinerary(id, version) { return this.resume(id, version); }
+    finish(id, version) { return this.transition(id, version, 'completed'); }
+    endItinerary(id, version) { return this.finish(id, version); }
+
+    skip(id, stopId, version) {
+        return this.run('itinerary-write', () => {
+            this.throwScenario('write');
+            this.requireItinerary(id, version);
+            if (!this.itinerary.stops.some(stop => String(stop.stopId) === String(stopId))) {
+                throw new ApiError(safeApiMessage({ status: 409, code: 1203 }), {
+                    category: 'conflict', httpStatus: 409, code: 1203
+                });
+            }
+            this.itinerary = {
+                ...this.itinerary,
+                version: this.itinerary.version + 1,
+                stops: this.itinerary.stops.map(stop =>
+                    String(stop.stopId) === String(stopId) ? { ...stop, state: 'skipped' } : stop)
+            };
+            this.persist();
+            return this.itinerary;
+        });
+    }
+
+    skipStop(id, stopId, version) { return this.skip(id, stopId, version); }
+
+    reportPosition() {
+        return this.run('position', () => {
+            const code = this.scenarioCode('position');
+            if (code === 2102) return { accepted: false, outOfFence: true, code, message: safeApiMessage({ code }) };
+            if (code === 2103) return { accepted: false, code, message: safeApiMessage({ code }) };
+            return { accepted: true, code: 0, message: '' };
+        }, { delayMs: 20, cancelPrevious: false });
     }
 
     setProposal(proposal) {
+        if (!this.itinerary) return;
         this.itinerary = { ...this.itinerary, pendingProposal: clone(proposal) };
         this.persist();
     }
 
-    decideProposal(_id, _proposalId, decision) {
-        if (decision === 'accept') {
+    decideProposal(id, proposalId, decision, version) {
+        return this.run('itinerary-write', async signal => {
+            this.throwScenario('proposal');
+            this.requireItinerary(id, version);
+            const proposal = this.itinerary.pendingProposal;
+            if (!proposal || String(proposal.proposalId) !== String(proposalId)
+                || new Date(proposal.expireAt).getTime() <= nowOf(this.clock)) {
+                throw new ApiError(safeApiMessage({ status: 400, code: 1204 }), {
+                    category: 'business', httpStatus: 400, code: 1204
+                });
+            }
+            if (!['accept', 'reject'].includes(String(decision))) {
+                throw new ApiError('路线建议操作无效', { category: 'business' });
+            }
+            let route = this.itinerary.route;
+            let stops = this.itinerary.stops;
+            let currentStopId = this.itinerary.currentStopId;
+            let planNote = this.itinerary.planNote;
+            let rerouteCount = this.itinerary.rerouteCount;
+            let savedMinutesTotal = this.itinerary.savedMinutesTotal;
+            if (decision === 'accept') {
+                const acceptedSnapshot = await this.fixture('itinerary-rerouted.json', signal);
+                route = acceptedSnapshot.route;
+                stops = acceptedSnapshot.stops;
+                currentStopId = acceptedSnapshot.currentStopId;
+                planNote = acceptedSnapshot.planNote;
+                rerouteCount = Number(rerouteCount || 0) + 1;
+                savedMinutesTotal = Number(savedMinutesTotal || 0) + Number(proposal.gainMin || 0);
+            }
             this.itinerary = {
                 ...this.itinerary,
                 version: this.itinerary.version + 1,
-                route: clone(NEW_ROUTE), pendingProposal: null, rerouteCount: 1, savedMinutesTotal: 11
+                route,
+                stops,
+                currentStopId,
+                planNote,
+                pendingProposal: null,
+                rerouteCount,
+                savedMinutesTotal
             };
-        } else {
-            this.itinerary = { ...this.itinerary, version: this.itinerary.version + 1, pendingProposal: null };
-        }
-        this.persist();
-        return this.delay(this.itinerary);
+            this.persist();
+            return this.itinerary;
+        });
     }
 
-    cancelAll() {}
+    acceptProposal(id, proposalId, version) {
+        return this.decideProposal(id, proposalId, 'accept', version);
+    }
+
+    rejectProposal(id, proposalId, version) {
+        return this.decideProposal(id, proposalId, 'reject', version);
+    }
 }
 
 export function demoProposal(version = 1) {
     return {
-        itineraryId: 'demo_itinerary', version,
-        proposalId: 'demo_proposal', type: 'barrierReroute',
-        reason: '老图书馆东侧道路临时关闭，建议绕行林荫路', gainMin: 11,
-        distanceDeltaM: 126,
+        ...clone(DEMO_PROPOSAL_TEMPLATE),
+        version,
         expireAt: new Date(Date.now() + 8 * 60000).toISOString(),
-        diff: { before: ['poi_photo', 'poi_history', 'poi_lake'], after: ['poi_photo', 'poi_lake'] },
-        beforeRoute: clone(OLD_ROUTE), afterRoute: { ...clone(NEW_ROUTE), reason: '临时封路绕行' }
+        beforeRoute: clone(DEMO_ROUTES.before),
+        afterRoute: clone(DEMO_ROUTES.after)
     };
 }
 
 export function demoClosedEdge() {
-    return {
-        eventId: 'demo_barrier',
-        edgeId: 'edge_library_east',
-        status: 'closed',
-        reason: '道路临时关闭',
-        at: new Date().toISOString(),
-        geometry: {
-            type: 'LineString',
-            coordinates: [[114.3582, 30.5414], [114.3608, 30.5427]]
-        }
-    };
+    return { ...clone(DEMO_CLOSED_EDGE), at: new Date().toISOString() };
 }

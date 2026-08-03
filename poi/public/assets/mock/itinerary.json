@@ -1,0 +1,19 @@
+{
+  "itineraryId": "demo_itinerary",
+  "version": 0,
+  "state": "draft",
+  "date": "2026-08-03",
+  "preferences": { "hours": 4, "interests": ["摄影"], "pace": "normal", "accessible": false, "shadeFirst": true },
+  "stops": [
+    { "stopId": "stop_photo", "poiId": "poi_photo", "poiName": "樱顶摄影点", "state": "approaching", "plannedArrive": "2026-08-03T10:20:00.000Z", "plannedLeave": "2026-08-03T10:45:00.000Z", "ci": { "predictedAtArrive": 0.56 } },
+    { "stopId": "stop_history", "poiId": "poi_history", "poiName": "老图书馆", "state": "pending", "plannedArrive": "2026-08-03T11:15:00.000Z", "plannedLeave": "2026-08-03T11:40:00.000Z", "ci": { "predictedAtArrive": 0.83 } },
+    { "stopId": "stop_lake", "poiId": "poi_lake", "poiName": "珞珈湖步道", "state": "pending", "plannedArrive": "2026-08-03T12:10:00.000Z", "plannedLeave": "2026-08-03T12:35:00.000Z", "ci": { "predictedAtArrive": 0.38 } }
+  ],
+  "route": null,
+  "currentStopId": "stop_photo",
+  "pendingProposal": null,
+  "savedMinutesTotal": 0,
+  "rerouteCount": 0,
+  "totalWalkMin": 34,
+  "planNote": "已优先安排摄影和林荫路段"
+}
