@@ -492,6 +492,463 @@ test('GeoSync Phase 5 cross-module workflows', { concurrency: false }, async t =
         assert.strictEqual(proposals[0].proposal, proposal);
     });
 
+    await t.test('closed barrier proposal completes the public current and accept workflow', async () => {
+        const modelModule = require('../geosync/models');
+        const antiHerding = require('../geosync/services/antiHerding');
+        const forecast = require('../geosync/services/forecastService');
+        const bus = require('../geosync/lib/eventBus');
+        const timelinePath = require.resolve('../geosync/services/itineraryTimeline');
+        const routePath = require.resolve('../geosync/routes/itinerary');
+        const originals = {
+            getModels: modelModule.getModels,
+            claimTokens: antiHerding.claimTokens,
+            claimedTokensActive: antiHerding.claimedTokensActive,
+            rollbackClaimedTokens: antiHerding.rollbackClaimedTokens,
+            finalizeClaimedTokens: antiHerding.finalizeClaimedTokens,
+            releaseTokens: antiHerding.releaseTokens,
+            rebuildArrivalIndex: forecast.rebuildArrivalIndex,
+            busEmit: bus.emit
+        };
+
+        const workflowNow = new Date();
+        const privatePayloadSentinel = 'private-barrier-payload-must-not-leak';
+        const privateBeforeRouteSentinel = 'private-before-route-must-not-leak';
+        const privateAfterRouteSentinel = 'private-after-route-must-not-leak';
+        const poiRows = [{
+            _id: 'poi-closed-loop-one',
+            poiName: 'Closed loop one',
+            geo: { type: 'Point', coordinates: [120.005, 30.005] },
+            visitMeta: { suggestedStayMin: 10 }
+        }, {
+            _id: 'poi-closed-loop-two',
+            poiName: 'Closed loop two',
+            geo: { type: 'Point', coordinates: [120.01, 30.01] },
+            visitMeta: { suggestedStayMin: 15 }
+        }];
+        const closedBarriers = [{
+            scenicId: SCENIC_ID,
+            status: 'closed',
+            edgeId: 'EDGE_CLOSED',
+            sourceRef: { datasetName: WALK_EDGE_DATASET, smId: 7 }
+        }];
+        const oldRoute = {
+            geometry: {
+                type: 'LineString',
+                coordinates: [
+                    [120, 30],
+                    [120.005, 30.005],
+                    [120.01, 30.01]
+                ]
+            },
+            distanceM: 900,
+            durationSec: 600,
+            gis: {
+                source: 'iserver',
+                mode: 'normal',
+                degraded: false,
+                requestId: 'old-route',
+                durationMs: 12,
+                dataVersion: DATA_VERSION
+            },
+            segments: [{
+                edgeId: 'EDGE_CLOSED',
+                distanceM: 450,
+                durationSec: 300,
+                sourceRef: { datasetName: WALK_EDGE_DATASET, smId: 7 }
+            }, {
+                edgeId: 'EDGE_OLD_OPEN',
+                distanceM: 450,
+                durationSec: 300,
+                sourceRef: { datasetName: WALK_EDGE_DATASET, smId: 8 }
+            }],
+            snap: { startDistanceM: 1, endDistanceM: 2 },
+            verifiedAccessible: false,
+            pathGeometry: 'old-route-polyline',
+            internalTrace: privateBeforeRouteSentinel
+        };
+        let currentItinerary = {
+            _id: 'itinerary-closed-loop',
+            openId: 'owner-closed-loop',
+            scenicId: SCENIC_ID,
+            version: 3,
+            state: 'active',
+            rerouteCount: 0,
+            savedMinutesTotal: 0,
+            preferences: { pace: 'normal' },
+            lastPosition: { lng: 120, lat: 30, at: workflowNow },
+            route: oldRoute,
+            pendingProposal: null,
+            rerouteLog: [],
+            stops: [{
+                _id: 'stop-closed-loop-one',
+                poiId: 'poi-closed-loop-one',
+                state: 'approaching',
+                plannedArrive: new Date(workflowNow.getTime() + 5 * 60000),
+                plannedLeave: new Date(workflowNow.getTime() + 15 * 60000),
+                geometry: {
+                    type: 'LineString',
+                    coordinates: [[120, 30], [120.005, 30.005]]
+                },
+                distanceM: 450,
+                durationSec: 300,
+                segments: [oldRoute.segments[0]],
+                pathGeometry: 'old-first-leg'
+            }, {
+                _id: 'stop-closed-loop-two',
+                poiId: 'poi-closed-loop-two',
+                state: 'pending',
+                plannedArrive: new Date(workflowNow.getTime() + 20 * 60000),
+                plannedLeave: new Date(workflowNow.getTime() + 35 * 60000),
+                geometry: {
+                    type: 'LineString',
+                    coordinates: [[120.005, 30.005], [120.01, 30.01]]
+                },
+                distanceM: 450,
+                durationSec: 300,
+                segments: [oldRoute.segments[1]],
+                pathGeometry: 'old-second-leg'
+            }]
+        };
+        let coordinatorWrite;
+        let acceptWrite;
+        const events = [];
+        const barrierRequests = [];
+        const fakeModels = {
+            Itinerary: {
+                find(filter) {
+                    assert.deepEqual(filter, { scenicId: SCENIC_ID, state: 'active' });
+                    return leanQuery([currentItinerary]);
+                },
+                findOne(filter) {
+                    if (filter.openId === 'owner-closed-loop' && filter.state?.$in) {
+                        assert.deepEqual(filter.state.$in, ['draft', 'active', 'paused']);
+                        return {
+                            async sort(sort) {
+                                assert.deepEqual(sort, { createTime: -1 });
+                                return currentItinerary;
+                            }
+                        };
+                    }
+                    assert.deepEqual(filter, {
+                        _id: 'itinerary-closed-loop',
+                        openId: 'owner-closed-loop'
+                    });
+                    return Promise.resolve(currentItinerary);
+                },
+                async findOneAndUpdate(filter, update, options) {
+                    assert.deepEqual(options, { new: true });
+                    if (!Object.hasOwn(filter, 'openId')) {
+                        assert.deepEqual(filter, {
+                            _id: 'itinerary-closed-loop',
+                            version: 3,
+                            state: 'active',
+                            pendingProposal: null
+                        });
+                        coordinatorWrite = { filter, update };
+                        const pendingProposal = structuredClone(update.$set.pendingProposal);
+                        pendingProposal.payload.privatePayloadSentinel = privatePayloadSentinel;
+                        pendingProposal.payload.route.internalTrace = privateAfterRouteSentinel;
+                        currentItinerary = {
+                            ...currentItinerary,
+                            pendingProposal,
+                            version: currentItinerary.version + update.$inc.version
+                        };
+                        return currentItinerary;
+                    }
+
+                    assert.equal(filter._id, 'itinerary-closed-loop');
+                    assert.equal(filter.openId, 'owner-closed-loop');
+                    assert.equal(filter.version, 4);
+                    assert.equal(filter.state, 'active');
+                    assert.equal(
+                        filter['pendingProposal.proposalId'],
+                        'proposal-local-closed-loop'
+                    );
+                    assert.ok(filter['pendingProposal.expireAt'].$gt instanceof Date);
+                    assert.ok(
+                        new Date(currentItinerary.pendingProposal.expireAt)
+                            > filter['pendingProposal.expireAt'].$gt
+                    );
+                    acceptWrite = { filter, update };
+                    currentItinerary = {
+                        ...currentItinerary,
+                        ...structuredClone(update.$set),
+                        version: currentItinerary.version + update.$inc.version,
+                        rerouteCount: currentItinerary.rerouteCount + update.$inc.rerouteCount,
+                        savedMinutesTotal: currentItinerary.savedMinutesTotal
+                            + update.$inc.savedMinutesTotal,
+                        rerouteLog: [
+                            ...currentItinerary.rerouteLog,
+                            structuredClone(update.$push.rerouteLog)
+                        ]
+                    };
+                    return currentItinerary;
+                }
+            },
+            WalkEdge: {
+                find(filter) {
+                    assert.deepEqual(filter, { scenicId: SCENIC_ID, status: 'closed' });
+                    return leanQuery(closedBarriers);
+                }
+            },
+            ExternalPoi: {
+                find(filter) {
+                    assert.ok(Array.isArray(filter?._id?.$in));
+                    return leanQuery(poiRows);
+                }
+            },
+            BarrierEventRecord: barrierEventRecordModel(),
+            PhotoSpot: {}
+        };
+        const { gateway } = createGateway({
+            fixtures: {
+                findPathWithBarriers: request => {
+                    barrierRequests.push(request);
+                    const firstLeg = request.data.end[0] === poiRows[0].geo.coordinates[0];
+                    return routeResponse(request, {
+                        edgeId: firstLeg ? 'EDGE_ALT_ONE' : 'EDGE_ALT_TWO',
+                        smId: firstLeg ? 101 : 102,
+                        distanceM: 240,
+                        durationSec: 180
+                    });
+                }
+            },
+            clock: () => workflowNow
+        });
+        const routeBetween = createRouteBetween(gateway, {
+            scenicId: SCENIC_ID,
+            closedBarrierProvider: async () => ({ barriers: closedBarriers })
+        });
+        const coordinator = createBarrierRerouteCoordinator({
+            models: fakeModels,
+            gateway,
+            walkGraph: { async loadIntoMemory() {} },
+            rebuildTimeline: input => timelineModule.rebuildTimeline({
+                ...input,
+                loadPois: async poiIds => poiRows.filter(poi =>
+                    poiIds.includes(String(poi._id)))
+            }),
+            routeBetween,
+            aggregateRouteFromStops,
+            emitRerouteProposed: async () => {},
+            emitRerouteDecided: async () => {},
+            releaseProposalTokens: async () => {},
+            emitOpsImpact: async () => {},
+            clock: () => workflowNow,
+            idFactory: () => 'proposal-local-closed-loop'
+        });
+
+        const result = await coordinator.processGraphEvent({
+            eventId: 'event-local-closed-loop',
+            scenicId: SCENIC_ID,
+            edgeId: 'EDGE_CLOSED',
+            operation: 'close'
+        });
+        assert.equal(result.proposedCount, 1);
+        assert.ok(coordinatorWrite);
+        assert.equal(currentItinerary.version, 4);
+        assert.equal(
+            currentItinerary.pendingProposal.proposalId,
+            'proposal-local-closed-loop'
+        );
+        assert.equal(currentItinerary.pendingProposal.type, 'barrierReroute');
+        assert.equal(currentItinerary.pendingProposal.payload.route.distanceM, 480);
+        assert.equal(currentItinerary.pendingProposal.payload.route.durationSec, 360);
+        assert.ok(barrierRequests.length >= 2);
+        assert.ok(barrierRequests.every(request =>
+            request.data.barriers.some(barrier => barrier.edgeId === 'EDGE_CLOSED')));
+
+        try {
+            modelModule.getModels = () => fakeModels;
+            antiHerding.claimTokens = async tokenIds => {
+                assert.deepEqual(tokenIds, []);
+                return true;
+            };
+            antiHerding.claimedTokensActive = async tokenIds => {
+                assert.deepEqual(tokenIds, []);
+                return true;
+            };
+            antiHerding.rollbackClaimedTokens = async () => {
+                throw new Error('rollback must not run on the successful closed-loop workflow');
+            };
+            antiHerding.finalizeClaimedTokens = async tokenIds => {
+                assert.deepEqual(tokenIds, []);
+            };
+            antiHerding.releaseTokens = async () => {};
+            forecast.rebuildArrivalIndex = async () => {};
+            bus.emit = (event, payload) => events.push({ event, payload });
+
+            delete require.cache[timelinePath];
+            delete require.cache[routePath];
+            const router = require(routePath);
+            const currentLayer = router.stack.find(layer => layer.route?.path === '/current');
+            const decisionLayer = router.stack.find(layer =>
+                layer.route?.path === '/:id/proposal/:proposalId/:decision(accept|reject)');
+            assert.ok(currentLayer);
+            assert.ok(decisionLayer);
+            const currentHandler = currentLayer.route.stack[0].handle;
+            const decisionHandler = decisionLayer.route.stack[0].handle;
+
+            const currentRes = responseHarness();
+            await currentHandler({
+                method: 'GET',
+                originalUrl: '/api/itinerary/current',
+                openId: 'owner-closed-loop'
+            }, currentRes, () => {});
+
+            assert.equal(currentRes.statusCode, 200);
+            assert.equal(currentRes.body.success, true);
+            assert.equal(currentRes.body.data.version, 4);
+            const publicProposal = currentRes.body.data.pendingProposal;
+            assert.equal(publicProposal.proposalId, 'proposal-local-closed-loop');
+            assert.deepEqual(publicProposal.beforeRoute.geometry, oldRoute.geometry);
+            assert.deepEqual(
+                publicProposal.afterRoute.geometry,
+                currentItinerary.pendingProposal.payload.route.geometry
+            );
+            assert.equal(publicProposal.beforeRoute.distanceM, 900);
+            assert.equal(publicProposal.beforeRoute.durationSec, 600);
+            assert.equal(publicProposal.afterRoute.distanceM, 480);
+            assert.equal(publicProposal.afterRoute.durationSec, 360);
+            assert.equal(publicProposal.distanceDeltaM, -420);
+            assert.equal(publicProposal.durationDeltaSec, -240);
+            const publicRouteKeys = [
+                'distanceM',
+                'durationSec',
+                'geometry',
+                'gis',
+                'pathGeometry',
+                'segments',
+                'snap',
+                'verifiedAccessible'
+            ];
+            assert.deepEqual(Object.keys(publicProposal.beforeRoute).sort(), publicRouteKeys);
+            assert.deepEqual(Object.keys(publicProposal.afterRoute).sort(), publicRouteKeys);
+            assert.equal(Object.hasOwn(publicProposal, 'payload'), false);
+            assert.equal(Object.hasOwn(publicProposal, 'tokenIds'), false);
+            const publicProposalJson = JSON.stringify(publicProposal);
+            assert.equal(publicProposalJson.includes('"payload"'), false);
+            assert.equal(publicProposalJson.includes('"tokenIds"'), false);
+            assert.equal(publicProposalJson.includes(privatePayloadSentinel), false);
+            assert.equal(publicProposalJson.includes(privateBeforeRouteSentinel), false);
+            assert.equal(publicProposalJson.includes(privateAfterRouteSentinel), false);
+
+            const returnedProposalId = publicProposal.proposalId;
+            const returnedVersion = currentRes.body.data.version;
+            const acceptRes = responseHarness();
+            await decisionHandler({
+                method: 'POST',
+                originalUrl: `/api/itinerary/itinerary-closed-loop/proposal/${returnedProposalId}/accept`,
+                openId: 'owner-closed-loop',
+                params: {
+                    id: 'itinerary-closed-loop',
+                    proposalId: returnedProposalId,
+                    decision: 'accept'
+                },
+                body: { version: returnedVersion },
+                app: { locals: { geosync: { routeBetween } } }
+            }, acceptRes, () => {});
+
+            assert.equal(acceptRes.statusCode, 200);
+            assert.equal(acceptRes.body.success, true);
+            assert.ok(acceptWrite);
+            assert.equal(acceptWrite.filter.version, returnedVersion);
+            assert.equal(
+                acceptWrite.filter['pendingProposal.proposalId'],
+                returnedProposalId
+            );
+            assert.equal(acceptRes.body.data.version, 5);
+            assert.equal(currentItinerary.version, 5);
+            assert.equal(currentItinerary.pendingProposal, null);
+            assert.equal(currentItinerary.rerouteCount, 1);
+            assert.equal(currentItinerary.savedMinutesTotal, 0);
+            assert.equal(currentItinerary.stops.length, 2);
+            assert.equal(currentItinerary.stops[0].state, 'approaching');
+            assert.equal(currentItinerary.stops[1].state, 'pending');
+            assert.ok(currentItinerary.stops.every(stop => stop.distanceM === 240));
+            assert.ok(currentItinerary.stops.every(stop => stop.durationSec === 180));
+            assert.equal(
+                new Date(currentItinerary.stops[0].plannedLeave)
+                    - new Date(currentItinerary.stops[0].plannedArrive),
+                10 * 60000
+            );
+            assert.equal(
+                new Date(currentItinerary.stops[1].plannedArrive)
+                    - new Date(currentItinerary.stops[0].plannedLeave),
+                180 * 1000
+            );
+            assert.equal(
+                new Date(currentItinerary.stops[1].plannedLeave)
+                    - new Date(currentItinerary.stops[1].plannedArrive),
+                15 * 60000
+            );
+            assert.equal(
+                currentItinerary.route.distanceM,
+                currentItinerary.stops.reduce((sum, stop) => sum + stop.distanceM, 0)
+            );
+            assert.equal(
+                currentItinerary.route.durationSec,
+                currentItinerary.stops.reduce((sum, stop) => sum + stop.durationSec, 0)
+            );
+            assert.deepEqual(acceptRes.body.data.route, currentItinerary.route);
+            assert.deepEqual(
+                acceptRes.body.data.route.geometry,
+                publicProposal.afterRoute.geometry
+            );
+            assert.equal(
+                acceptRes.body.data.route.distanceM,
+                publicProposal.afterRoute.distanceM
+            );
+            assert.equal(
+                acceptRes.body.data.route.durationSec,
+                publicProposal.afterRoute.durationSec
+            );
+            assert.ok(acceptRes.body.data.route.segments.every(segment =>
+                segment.edgeId !== 'EDGE_CLOSED'));
+            for (let index = 0; index < currentItinerary.stops.length; index++) {
+                const storedStop = currentItinerary.stops[index];
+                const publicStop = acceptRes.body.data.stops[index];
+                assert.equal(publicStop.stopId, storedStop._id);
+                assert.equal(publicStop.poiId, storedStop.poiId);
+                assert.equal(publicStop.state, storedStop.state);
+                assert.equal(publicStop.plannedArrive, storedStop.plannedArrive);
+                assert.equal(publicStop.plannedLeave, storedStop.plannedLeave);
+                assert.equal(publicStop.distanceM, storedStop.distanceM);
+                assert.equal(publicStop.durationSec, storedStop.durationSec);
+                assert.deepEqual(publicStop.geometry, storedStop.geometry);
+                assert.deepEqual(publicStop.segments, storedStop.segments);
+            }
+            assert.deepEqual(acceptWrite.update.$set.route, currentItinerary.route);
+            assert.deepEqual(acceptWrite.update.$set.stops, currentItinerary.stops);
+            const progress = events.find(item =>
+                item.event === bus.EVENTS.ITINERARY_PROGRESS)?.payload;
+            assert.equal(progress.version, currentItinerary.version);
+            assert.deepEqual(
+                progress.stops.map(stop => ({
+                    stopId: stop.stopId,
+                    poiId: stop.poiId,
+                    state: stop.state
+                })),
+                currentItinerary.stops.map(stop => ({
+                    stopId: stop._id,
+                    poiId: stop.poiId,
+                    state: stop.state
+                }))
+            );
+        } finally {
+            modelModule.getModels = originals.getModels;
+            antiHerding.claimTokens = originals.claimTokens;
+            antiHerding.claimedTokensActive = originals.claimedTokensActive;
+            antiHerding.rollbackClaimedTokens = originals.rollbackClaimedTokens;
+            antiHerding.finalizeClaimedTokens = originals.finalizeClaimedTokens;
+            antiHerding.releaseTokens = originals.releaseTokens;
+            forecast.rebuildArrivalIndex = originals.rebuildArrivalIndex;
+            bus.emit = originals.busEmit;
+            delete require.cache[routePath];
+            delete require.cache[timelinePath];
+        }
+    });
+
     await t.test('accepting a proposal commits one consistent route, ETA, timetable, and version', async () => {
         const modelModule = require('../geosync/models');
         const antiHerding = require('../geosync/services/antiHerding');

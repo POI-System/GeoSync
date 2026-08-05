@@ -12,6 +12,11 @@ test('public POI projection exposes only approved display fields', () => {
         description: 'Public description',
         imageUrl: '/uploads/gate.jpg',
         location: { lng: '120.25', lat: 30.5 },
+        visitMeta: {
+            suggestedStayMin: '25',
+            dwellMin: 40,
+            internalNote: 'visit-meta-private-sentinel'
+        },
         status: 'approved',
         createTime: new Date('2026-08-02T00:00:00.000Z'),
         userOpenId: 'collector-private-sentinel',
@@ -24,14 +29,18 @@ test('public POI projection exposes only approved display fields', () => {
     assert.equal(projected.id, 'poi-1');
     assert.equal(projected.lng, 120.25);
     assert.equal(projected.lat, 30.5);
+    assert.equal(projected.suggestedStayMin, 25);
     assert.equal(projected.status, 'approved');
     for (const privateField of [
-        'userOpenId', 'reviewerId', 'rejectReason', 'superMapRef', '__v'
+        'visitMeta', 'userOpenId', 'reviewerId', 'rejectReason', 'superMapRef', '__v'
     ]) {
         assert.equal(Object.hasOwn(projected, privateField), false);
     }
     const serialized = JSON.stringify(projected);
-    assert.doesNotMatch(serialized, /private-sentinel|private-dataset|internal-only/);
+    assert.doesNotMatch(
+        serialized,
+        /visit-meta-private-sentinel|private-sentinel|private-dataset|internal-only/
+    );
 });
 
 test('public POI projection normalizes invalid coordinates without leaking source fields', () => {
@@ -45,4 +54,40 @@ test('public POI projection normalizes invalid coordinates without leaking sourc
     assert.equal(projected.lat, null);
     assert.deepEqual(projected.location, { lng: null, lat: null });
     assert.equal(Object.hasOwn(projected, 'userOpenId'), false);
+});
+
+test('public POI projection keeps a zero suggested stay value', () => {
+    const projected = serializePublicPoi({
+        _id: 'poi-zero',
+        visitMeta: { suggestedStayMin: 0, dwellMin: 35 }
+    });
+
+    assert.equal(projected.suggestedStayMin, 0);
+});
+
+test('public POI projection falls back to a valid dwell value', () => {
+    for (const suggestedStayMin of [undefined, null, '', '   ', -1, '-2', Infinity, 'invalid']) {
+        const projected = serializePublicPoi({
+            _id: 'poi-fallback',
+            visitMeta: { suggestedStayMin, dwellMin: '18' }
+        });
+
+        assert.equal(projected.suggestedStayMin, 18);
+    }
+});
+
+test('public POI projection uses the schema default when no valid stay value exists', () => {
+    const cases = [
+        {},
+        { visitMeta: null },
+        { visitMeta: { suggestedStayMin: -1, dwellMin: -2 } },
+        { visitMeta: { suggestedStayMin: NaN, dwellMin: Infinity } },
+        { visitMeta: { suggestedStayMin: {}, dwellMin: false } }
+    ];
+
+    for (const item of cases) {
+        const projected = serializePublicPoi({ _id: 'poi-null', ...item });
+        assert.equal(projected.suggestedStayMin, 20);
+        assert.equal(Object.hasOwn(projected, 'visitMeta'), false);
+    }
 });
