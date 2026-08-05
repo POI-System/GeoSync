@@ -15,6 +15,7 @@ export const ENDPOINTS = Object.freeze({
     clientConfig: '/api/geosync/client-config',
     pois: '/api/poi/all',
     currentItinerary: '/api/itinerary/current',
+    itineraryDetail: id => `/api/itinerary/${encode(id)}`,
     heatmap: '/api/crowd/heatmap',
     planItinerary: '/api/itinerary/plan',
     position: '/api/position',
@@ -228,7 +229,27 @@ export class ApiClient {
 
     getClientConfig() { return this.request(ENDPOINTS.clientConfig, { key: 'config' }); }
     getPois() { return this.request(ENDPOINTS.pois, { key: 'pois' }); }
-    getCurrentItinerary() { return this.request(ENDPOINTS.currentItinerary, { key: 'current' }); }
+    getCurrentItinerary() {
+        return this.request(ENDPOINTS.currentItinerary, { key: 'current', cancelPrevious: false });
+    }
+    async getItinerary(id) {
+        try {
+            return await this.request(ENDPOINTS.itineraryDetail(id), { key: 'itinerary-detail' });
+        } catch (error) {
+            if (error instanceof ApiError && error.httpStatus === 404 && error.code === 1204) {
+                throw new ApiError('行程不存在或已失效', {
+                    category: error.category,
+                    httpStatus: error.httpStatus,
+                    code: error.code,
+                    data: error.data,
+                    retryable: error.retryable,
+                    requestId: error.requestId,
+                    cause: error
+                });
+            }
+            throw error;
+        }
+    }
     getHeatmap() { return this.request(ENDPOINTS.heatmap, { key: 'heatmap' }); }
     getPhotoSpots(params = {}) {
         const query = new URLSearchParams();

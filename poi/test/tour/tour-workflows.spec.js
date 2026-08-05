@@ -163,6 +163,8 @@ test('runs the full plan, pause, resume, skip, reject, finish, and refresh workf
     expect(Object.keys(started).sort()).toEqual(itineraryKeys);
 
     await expect(page.getByRole('heading', { name: '路线调整建议' })).toBeVisible({ timeout: 6000 });
+    await expect(page.locator('#proposal-before-stops li')).toHaveText(['樱顶摄影点', '老图书馆', '珞珈湖步道']);
+    await expect(page.locator('#proposal-after-stops li')).toHaveText(['樱顶摄影点', '珞珈湖步道']);
     const beforeReject = await readDemoItinerary(page);
     expectCompleteItinerary(beforeReject, { version: 1, state: 'active' });
     expect(beforeReject.pendingProposal).not.toBeNull();

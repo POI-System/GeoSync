@@ -77,6 +77,44 @@ function featureCollection(value) {
     throw new MapFacadeError('MAP_GEOMETRY_INVALID', 'GeoJSON 数据格式无效');
 }
 
+function poiFeatureCollection(value) {
+    if (!Array.isArray(value)) return featureCollection(value);
+    return {
+        type: 'FeatureCollection',
+        features: value.map(item => {
+            if (item?.type === 'Feature') return item;
+            const poiId = item?.poiId ?? item?.id ?? item?._id;
+            const lng = Number(item?.lng ?? item?.longitude ?? item?.location?.lng ?? item?.location?.longitude);
+            const lat = Number(item?.lat ?? item?.latitude ?? item?.location?.lat ?? item?.location?.latitude);
+            if (poiId === null || poiId === undefined || String(poiId) === '' || !validPosition([lng, lat])) {
+                return null;
+            }
+            return geometryFeature({ type: 'Point', coordinates: [lng, lat] }, {
+                poiId: String(poiId),
+                name: item?.poiName || item?.name || '',
+                category: item?.category || 'default',
+                status: item?.status || 'approved'
+            });
+        }).filter(Boolean)
+    };
+}
+
+function routeMetricDelta(beforeValue, afterValue) {
+    if (beforeValue === null || beforeValue === undefined
+        || afterValue === null || afterValue === undefined) {
+        return undefined;
+    }
+    if ((typeof beforeValue === 'string' && !beforeValue.trim())
+        || (typeof afterValue === 'string' && !afterValue.trim())) {
+        return undefined;
+    }
+    const before = Number(beforeValue);
+    const after = Number(afterValue);
+    return Number.isFinite(before) && before >= 0 && Number.isFinite(after) && after >= 0
+        ? after - before
+        : undefined;
+}
+
 function decodePolyline(encoded) {
     if (typeof encoded !== 'string' || !encoded) {
         throw new MapFacadeError('MAP_GEOMETRY_INVALID', '路线几何为空');
@@ -215,11 +253,11 @@ export class MapFacade extends EventTarget {
     }
 
     isReady() {
-        return Boolean(this._map);
+        return Boolean(this._map && this._layerAccess);
     }
 
     requireReady(method) {
-        if (!this._map) {
+        if (!this.isReady()) {
             throw new MapFacadeError('MAP_NOT_INITIALIZED', `${method} 必须在地图初始化完成后调用`);
         }
         return this._map;
@@ -478,7 +516,7 @@ export class MapFacade extends EventTarget {
 
     setPois(collection) {
         this.requireReady('setPois');
-        const incoming = featureCollection(collection);
+        const incoming = poiFeatureCollection(collection);
         this._rawPois = {
             type: 'FeatureCollection',
             features: incoming.features.filter(feature =>
@@ -544,6 +582,16 @@ export class MapFacade extends EventTarget {
         return presentation;
     }
 
+    _setMainRouteVisible(visible) {
+        if (this._layerAccess?.getLayer('route')) {
+            this._layerAccess.setPaintProperty(
+                'route',
+                'line-opacity',
+                visible ? MAP_LAYER_STYLES.route.opacity : 0
+            );
+        }
+    }
+
     compareRoutes(beforeRoute, afterRoute) {
         this.requireReady('compareRoutes');
         let beforeGeometry;
@@ -552,6 +600,7 @@ export class MapFacade extends EventTarget {
             beforeGeometry = routeGeometry(beforeRoute);
             afterGeometry = routeGeometry(afterRoute);
         } catch (error) {
+            this._setMainRouteVisible(true);
             this.setData('routeOld', emptyFeatureCollection(), 'compareRoutes');
             this.setData('routeNew', emptyFeatureCollection(), 'compareRoutes');
             const mapError = error instanceof MapFacadeError
@@ -562,26 +611,41 @@ export class MapFacade extends EventTarget {
         }
         const beforePresentation = routePresentation(beforeRoute);
         const afterPresentation = routePresentation(afterRoute);
-        this.setData(
-            'routeOld',
-            featureCollection(geometryFeature(beforeGeometry, { source: beforePresentation.source })),
-            'compareRoutes'
-        );
-        this.setData(
-            'routeNew',
-            featureCollection(geometryFeature(afterGeometry, {
-                source: afterPresentation.source,
-                color: afterPresentation.color
-            })),
-            'compareRoutes'
-        );
-        this.fitToGeometry({
-            type: 'FeatureCollection',
-            features: [geometryFeature(beforeGeometry), geometryFeature(afterGeometry)]
-        }, { padding: 54 });
+        try {
+            this.setData(
+                'routeOld',
+                featureCollection(geometryFeature(beforeGeometry, { source: beforePresentation.source })),
+                'compareRoutes'
+            );
+            this.setData(
+                'routeNew',
+                featureCollection(geometryFeature(afterGeometry, {
+                    source: afterPresentation.source,
+                    color: afterPresentation.color
+                })),
+                'compareRoutes'
+            );
+            this.fitToGeometry({
+                type: 'FeatureCollection',
+                features: [geometryFeature(beforeGeometry), geometryFeature(afterGeometry)]
+            }, { padding: 54 });
+            this._setMainRouteVisible(false);
+        } catch (error) {
+            try { this._setMainRouteVisible(true); } catch { /* preserve the comparison error */ }
+            for (const sourceKey of ['routeOld', 'routeNew']) {
+                try { this.setData(sourceKey, emptyFeatureCollection(), 'compareRoutes'); } catch { /* best effort */ }
+            }
+            const mapError = error instanceof MapFacadeError
+                ? error
+                : new MapFacadeError('MAP_SERVICE_UNAVAILABLE', '路线比较无法显示', error);
+            this.emitMapError(mapError);
+            throw mapError;
+        }
+        const distanceDeltaM = routeMetricDelta(beforeRoute?.distanceM, afterRoute?.distanceM);
+        const durationDeltaSec = routeMetricDelta(beforeRoute?.durationSec, afterRoute?.durationSec);
         const detail = {
-            distanceDeltaM: Number(afterRoute?.distanceM || 0) - Number(beforeRoute?.distanceM || 0),
-            durationDeltaSec: Number(afterRoute?.durationSec || 0) - Number(beforeRoute?.durationSec || 0),
+            distanceDeltaM: distanceDeltaM ?? null,
+            durationDeltaSec: durationDeltaSec ?? null,
             reason: afterRoute?.reason || afterRoute?.diff?.reason || '',
             degraded: Boolean(beforePresentation.degraded || afterPresentation.degraded),
             beforeSource: beforePresentation.source,
@@ -592,6 +656,8 @@ export class MapFacade extends EventTarget {
     }
 
     clearRouteComparison() {
+        this.requireReady('clearRouteComparison');
+        this._setMainRouteVisible(true);
         this.setData('routeOld', emptyFeatureCollection(), 'clearRouteComparison');
         this.setData('routeNew', emptyFeatureCollection(), 'clearRouteComparison');
     }

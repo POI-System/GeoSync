@@ -29,6 +29,7 @@ export class SocketClient extends EventTarget {
         this.demoTimers = [];
         this.pollTimer = null;
         this.pollRunning = false;
+        this.pollGeneration = 0;
         this.socketListeners = [];
         this.managerListeners = [];
         this.joinedForConnection = false;
@@ -152,20 +153,29 @@ export class SocketClient extends EventTarget {
     async runPoll(reason) {
         if (!this.poll || this.pollRunning) return;
         const generation = this.generation;
+        const pollGeneration = this.pollGeneration;
         this.pollRunning = true;
         try {
             await this.poll({ reason });
-            if (generation === this.generation) this.emit('polled', { reason });
+            if (generation === this.generation && pollGeneration === this.pollGeneration) {
+                this.emit('polled', { reason });
+            }
         } catch (error) {
-            if (generation === this.generation) this.emit('poll:error', { reason, error });
+            if (generation === this.generation && pollGeneration === this.pollGeneration) {
+                this.emit('poll:error', { reason, error });
+            }
         } finally {
-            if (generation === this.generation) this.pollRunning = false;
+            if (generation === this.generation && pollGeneration === this.pollGeneration) {
+                this.pollRunning = false;
+            }
         }
     }
 
     stopPolling() {
         if (this.pollTimer !== null) clearInterval(this.pollTimer);
         this.pollTimer = null;
+        this.pollGeneration += 1;
+        this.pollRunning = false;
     }
 
     demoProposal(payload, delayMs = 400) {

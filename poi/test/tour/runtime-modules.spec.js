@@ -235,6 +235,79 @@ test('SocketClient polls while offline, joins once per connection, and removes m
     expect(result.finalPolls).toBe(result.pollsAfterJoinSuccessWait);
 });
 
+test('SocketClient ignores in-flight poll results after polling stops on reconnect', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+        const { SocketClient } = await import('/assets/js/realtime/socketClient.js');
+        const makeEmitter = () => {
+            const handlers = new Map();
+            return {
+                on(name, handler) {
+                    if (!handlers.has(name)) handlers.set(name, new Set());
+                    handlers.get(name).add(handler);
+                    return this;
+                },
+                off(name, handler) {
+                    handlers.get(name)?.delete(handler);
+                    return this;
+                },
+                emit() { return this; },
+                trigger(name, payload) {
+                    for (const handler of [...(handlers.get(name) || [])]) handler(payload);
+                },
+                disconnect() {}
+            };
+        };
+        const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+        const manager = makeEmitter();
+        const socket = makeEmitter();
+        socket.io = manager;
+        const pending = [];
+        const events = [];
+        const client = new SocketClient({
+            ioFactory: () => socket,
+            poll: ({ reason }) => new Promise((resolve, reject) => {
+                pending.push({ reason, resolve, reject });
+            }),
+            pollIntervalMs: 1000
+        });
+        client.addEventListener('polled', event => events.push({ type: 'polled', reason: event.detail.reason }));
+        client.addEventListener('poll:error', event => events.push({ type: 'poll:error', reason: event.detail.reason }));
+
+        client.connect();
+        socket.trigger('connect');
+
+        socket.trigger('disconnect');
+        manager.trigger('reconnect');
+        pending[0].resolve();
+        await settle();
+        const afterStaleSuccess = [...events];
+
+        socket.trigger('disconnect');
+        manager.trigger('reconnect');
+        pending[1].reject(new Error('stale poll failure'));
+        await settle();
+        const afterStaleFailure = [...events];
+
+        socket.trigger('disconnect');
+        pending[2].resolve();
+        await settle();
+        const afterCurrentSuccess = [...events];
+
+        client.destroy();
+        return {
+            pendingReasons: pending.map(item => item.reason),
+            afterStaleSuccess,
+            afterStaleFailure,
+            afterCurrentSuccess
+        };
+    });
+
+    expect(result.pendingReasons).toEqual(['disconnect', 'disconnect', 'disconnect']);
+    expect(result.afterStaleSuccess).toEqual([]);
+    expect(result.afterStaleFailure).toEqual([]);
+    expect(result.afterCurrentSuccess).toEqual([{ type: 'polled', reason: 'disconnect' }]);
+});
+
 test('LocationClient uploads immediately after a stopped watch is started for a new tour', async ({ page }) => {
     const result = await page.evaluate(async () => {
         const { LocationClient } = await import('/assets/js/location/locationClient.js');

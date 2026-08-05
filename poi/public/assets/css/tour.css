@@ -430,6 +430,31 @@ input[type="range"] {
     border-left-color: var(--color-accent);
 }
 
+.proposal-route-diff {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+    margin: 14px 0;
+}
+
+.proposal-route-diff h3 {
+    margin: 0 0 7px;
+    font-size: 14px;
+    line-height: 1.35;
+}
+
+.proposal-stop-list {
+    margin: 0;
+    padding-left: 22px;
+    color: var(--color-muted);
+    font-size: 13px;
+    line-height: 1.45;
+}
+
+.proposal-stop-list li + li {
+    margin-top: 5px;
+}
+
 .spot-cover {
     width: 100%;
     max-height: 210px;

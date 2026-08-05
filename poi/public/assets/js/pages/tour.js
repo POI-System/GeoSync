@@ -18,6 +18,8 @@ const demo = params.get('demo') === '1';
 const demoScenario = params.get('scenario') || '';
 const localHost = ['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname);
 const legacyOpenId = localHost && params.get('legacyAuth') === '1' ? params.get('openid') || '' : '';
+const CURRENT_RECOVERY_DELAYS_MS = Object.freeze([2000, 5000, 15000, 30000]);
+const TERMINAL_ITINERARY_STORAGE_KEY = 'geosync:tour:terminal-itinerary-id:v1';
 const api = demo
     ? new DemoApiClient({ scenario: demoScenario })
     : new ApiClient({ openId: legacyOpenId, allowLegacyOpenId: Boolean(legacyOpenId) });
@@ -43,6 +45,12 @@ let pageDestroyed = false;
 let bootStarted = false;
 let lowAccuracyNoticeShown = false;
 let poiDialogReturnFocus = null;
+let currentRecoveryPending = false;
+let currentRecoveryTimer = null;
+let currentRecoveryAttempt = 0;
+let currentRecoveryInFlight = null;
+let currentReadGeneration = 0;
+let itineraryMutationRevision = 0;
 
 const byId = id => document.getElementById(id);
 const elements = {
@@ -96,6 +104,9 @@ const elements = {
     proposalReason: byId('proposal-reason'),
     proposalCountdown: byId('proposal-countdown'),
     proposalMetrics: byId('proposal-metrics'),
+    proposalRouteDiff: byId('proposal-route-diff'),
+    proposalBeforeStops: byId('proposal-before-stops'),
+    proposalAfterStops: byId('proposal-after-stops'),
     acceptProposal: byId('accept-proposal'),
     rejectProposal: byId('reject-proposal'),
     completedMetrics: byId('completed-metrics'),
@@ -361,7 +372,9 @@ function renderProposal(state) {
         clearInterval(proposalTimer);
         proposalTimer = null;
         proposalTimerId = null;
-        lastComparedProposalKey = '';
+        elements.proposalRouteDiff.classList.add('hidden');
+        elements.proposalBeforeStops.replaceChildren();
+        elements.proposalAfterStops.replaceChildren();
         return;
     }
     setText(elements.proposalReason, proposal.reason || '路线条件发生变化');
@@ -371,21 +384,37 @@ function renderProposal(state) {
     const durationDelta = Number(rawDurationDelta);
     const hasDistanceDelta = rawDistanceDelta !== null && rawDistanceDelta !== undefined && Number.isFinite(distanceDelta);
     const hasDurationDelta = rawDurationDelta !== null && rawDurationDelta !== undefined && Number.isFinite(durationDelta);
-    const gainMin = Number(proposal.gainMin);
+    const rawGainMin = proposal.gainMin;
+    const gainMin = Number(rawGainMin);
+    const hasGainMin = rawGainMin !== null
+        && rawGainMin !== undefined
+        && !(typeof rawGainMin === 'string' && rawGainMin.trim() === '')
+        && Number.isFinite(gainMin);
     const timeValue = hasDurationDelta
         ? `${durationDelta > 0 ? '+' : durationDelta < 0 ? '-' : ''}${formatDuration(Math.abs(durationDelta))}`
-        : Number.isFinite(gainMin)
+        : hasGainMin
             ? `${Math.abs(gainMin)} 分钟`
             : '服务端暂未提供';
     const timeLabel = hasDurationDelta
-        ? '路线时间变化'
-        : Number.isFinite(gainMin) && gainMin >= 0 ? '预计节省' : '预计时间变化';
+        ? durationDelta > 0 ? '预计增加' : durationDelta < 0 ? '预计节省' : '路线时间变化'
+        : hasGainMin ? gainMin >= 0 ? '预计节省' : '预计增加' : '预计时间变化';
     renderMetrics(elements.proposalMetrics, [
         [timeValue, timeLabel],
         [hasDistanceDelta ? `${distanceDelta > 0 ? '+' : distanceDelta < 0 ? '-' : ''}${formatDistance(Math.abs(distanceDelta))}` : '服务端暂未提供', hasDistanceDelta && distanceDelta < 0 ? '减少步行' : '额外步行'],
         [formatTime(proposal.expireAt), '建议到期'],
         [proposal.diff?.after?.length ?? '服务端暂未提供', '调整后站点']
     ]);
+    const beforeStopIds = Array.isArray(proposal.diff?.before) ? proposal.diff.before : null;
+    const afterStopIds = Array.isArray(proposal.diff?.after) ? proposal.diff.after : null;
+    const hasStopDiff = Boolean(beforeStopIds && afterStopIds);
+    elements.proposalRouteDiff.classList.toggle('hidden', !hasStopDiff);
+    if (hasStopDiff) {
+        renderProposalStops(elements.proposalBeforeStops, beforeStopIds, state);
+        renderProposalStops(elements.proposalAfterStops, afterStopIds, state);
+    } else {
+        elements.proposalBeforeStops.replaceChildren();
+        elements.proposalAfterStops.replaceChildren();
+    }
     const beforeRoute = proposal.beforeRoute || state.itinerary?.route;
     const afterRoute = proposal.afterRoute || proposal.route || proposal.proposedRoute;
     const comparisonKey = `${proposal.proposalId || ''}:${state.itinerary?.version ?? ''}`;
@@ -405,6 +434,28 @@ function renderProposal(state) {
     startProposalTimer(proposal);
 }
 
+function renderProposalStops(container, poiIds, state) {
+    const stopNames = new Map((state.itinerary?.stops || []).map(stop => [
+        String(stop.poiId),
+        stop.poiName || ''
+    ]));
+    const poiNames = new Map(state.pois.map(poi => [
+        String(poi.poiId ?? poi.id ?? poi._id),
+        poi.poiName || poi.name || ''
+    ]));
+    const rows = poiIds.map((poiId, index) => {
+        const row = document.createElement('li');
+        setText(row, stopNames.get(String(poiId)) || poiNames.get(String(poiId)) || `景点 ${index + 1}`);
+        return row;
+    });
+    if (!rows.length) {
+        const row = document.createElement('li');
+        setText(row, '无保留站点');
+        rows.push(row);
+    }
+    container.replaceChildren(...rows);
+}
+
 function startProposalTimer(proposal) {
     const timerKey = `${proposal.proposalId}:${proposal.expireAt}`;
     if (proposalTimerId === timerKey) return;
@@ -412,7 +463,11 @@ function startProposalTimer(proposal) {
     proposalTimerId = timerKey;
     const update = () => {
         const remaining = proposalRemainingMs(proposal.expireAt);
-        const hasComparison = Boolean((proposal.afterRoute || proposal.route || proposal.proposedRoute)?.geometry);
+        const hasComparison = Boolean(
+            (proposal.afterRoute || proposal.route || proposal.proposedRoute)?.geometry
+            && mapFacade.isReady()
+            && lastComparedProposalKey
+        );
         setText(elements.proposalCountdown, remaining
             ? `${hasComparison ? '新旧路线已标注' : '服务端暂未提供新路线几何'} · 剩余 ${formatProposalCountdown(proposal.expireAt)}`
             : '建议已到期，正在同步最新行程');
@@ -516,6 +571,7 @@ function render(state) {
         }
     }
     elements.app.setAttribute('aria-busy', String(state.boot === 'loading' || busy));
+    elements.app.dataset.apiState = state.apiState;
     elements.app.dataset.itineraryVersion = state.itinerary?.version ?? '';
     elements.app.dataset.itineraryState = state.itinerary?.state || '';
     syncHash(state.activePanel, state.selectedSpotId);
@@ -642,7 +698,12 @@ async function initMap() {
             void error;
             announce('景区边界数据不可用，已显示配置范围');
         }
-        updateMap(store.getState(), 'map:init', null, { force: true });
+        const state = store.getState();
+        updateMap(state, 'map:init', null, { force: true });
+        if (state.activePanel === 'proposal' && state.pendingProposal) {
+            lastComparedProposalKey = '';
+            renderProposal(state);
+        }
         if (lastLocation) mapFacade.setUserLocation(lastLocation);
         elements.mapLoading.classList.add('hidden');
         store.set({ mapState: 'online' }, 'map:online');
@@ -699,18 +760,179 @@ function updateMap(state, reason = 'state', previous = null, { force = false } =
     }
 }
 
-async function refreshCurrent({ announceChange = false, navigate = true } = {}) {
+function beginCurrentRead() {
+    return {
+        generation: ++currentReadGeneration,
+        mutationRevision: itineraryMutationRevision
+    };
+}
+
+function currentReadIsFresh(token) {
+    return token?.generation === currentReadGeneration
+        && token?.mutationRevision === itineraryMutationRevision;
+}
+
+function clearCurrentRecoveryRetry() {
+    clearTimeout(currentRecoveryTimer);
+    currentRecoveryTimer = null;
+}
+
+function finishCurrentRecovery() {
+    currentRecoveryPending = false;
+    currentRecoveryAttempt = 0;
+    clearCurrentRecoveryRetry();
+}
+
+function storedTerminalItineraryId() {
+    if (demo) return '';
     try {
-        const itinerary = await api.getCurrentItinerary();
-        const local = store.getState().itinerary;
-        const preserveTerminal = itinerary === null && ['completed', 'abandoned'].includes(local?.state);
-        if (!preserveTerminal) store.replaceItinerary(itinerary, { navigate });
-        if (announceChange) announce('行程已与服务端同步');
-        return preserveTerminal ? local : itinerary;
+        return String(sessionStorage.getItem(TERMINAL_ITINERARY_STORAGE_KEY) || '').trim();
+    } catch {
+        return '';
+    }
+}
+
+function clearStoredTerminalItineraryId() {
+    if (demo) return;
+    try { sessionStorage.removeItem(TERMINAL_ITINERARY_STORAGE_KEY); } catch { /* storage is optional */ }
+}
+
+function syncTerminalItineraryReference(itinerary, { clearOnNull = false } = {}) {
+    if (demo) return;
+    if (['completed', 'abandoned'].includes(itinerary?.state) && itinerary?.itineraryId) {
+        try {
+            sessionStorage.setItem(TERMINAL_ITINERARY_STORAGE_KEY, String(itinerary.itineraryId));
+        } catch { /* storage is optional */ }
+        return;
+    }
+    if (itinerary || clearOnNull) clearStoredTerminalItineraryId();
+}
+
+async function getRecoverableCurrentItinerary() {
+    const current = await api.getCurrentItinerary();
+    if (demo || current !== null) return current;
+    const terminalId = storedTerminalItineraryId();
+    if (!terminalId || typeof api.getItinerary !== 'function') return null;
+    try {
+        const terminal = await api.getItinerary(terminalId);
+        if (!terminal || typeof terminal !== 'object') {
+            throw new ApiError('行程数据不完整，请稍后重试', {
+                category: 'response',
+                retryable: true
+            });
+        }
+        if (!['completed', 'abandoned'].includes(terminal?.state)) {
+            clearStoredTerminalItineraryId();
+            return null;
+        }
+        return terminal;
     } catch (error) {
-        store.fail(error, { apiState: error.httpStatus >= 500 || error.category === 'network' ? 'offline' : 'online' });
-        if (error.httpStatus !== 401) showToast(error.message);
-        return null;
+        if (Number(error?.httpStatus) === 404) {
+            clearStoredTerminalItineraryId();
+            return null;
+        }
+        throw error;
+    }
+}
+
+function replaceItineraryAfterMutation(itinerary, options) {
+    const next = store.replaceItinerary(itinerary, options);
+    syncTerminalItineraryReference(itinerary, { clearOnNull: true });
+    itineraryMutationRevision += 1;
+    currentReadGeneration += 1;
+    finishCurrentRecovery();
+    return next;
+}
+
+function currentSnapshotError(error) {
+    if (error?.code !== 'ITINERARY_PARTIAL') return error;
+    return new ApiError('行程数据不完整，请稍后重试', {
+        category: 'response',
+        retryable: true,
+        cause: error
+    });
+}
+
+function recoverableCurrentFailure(error) {
+    const status = Number(error?.httpStatus ?? error?.status);
+    if ([401, 403].includes(status) || error?.category === 'cancelled') return false;
+    return error?.retryable === true
+        || status >= 500
+        || ['network', 'timeout', 'response'].includes(error?.category);
+}
+
+function applyCurrentSnapshot(token, itinerary, { navigate = true } = {}) {
+    if (!currentReadIsFresh(token)) return { applied: false, stale: true };
+    const local = store.getState().itinerary;
+    const preserveTerminal = itinerary === null && ['completed', 'abandoned'].includes(local?.state);
+    if (!preserveTerminal) store.replaceItinerary(itinerary, { navigate });
+    syncTerminalItineraryReference(preserveTerminal ? local : itinerary);
+    finishCurrentRecovery();
+    return { applied: true, itinerary: preserveTerminal ? local : itinerary };
+}
+
+async function refreshCurrent({
+    announceChange = false,
+    navigate = true,
+    showFailureToast = true
+} = {}) {
+    const token = beginCurrentRead();
+    try {
+        const itinerary = await getRecoverableCurrentItinerary();
+        const outcome = applyCurrentSnapshot(token, itinerary, { navigate });
+        if (!outcome.applied) return undefined;
+        if (announceChange) announce('行程已与服务端同步');
+        return outcome.itinerary;
+    } catch (rawError) {
+        if (pageDestroyed || !currentReadIsFresh(token)) return undefined;
+        const error = currentSnapshotError(rawError);
+        const authRequired = [401, 403].includes(Number(error.httpStatus));
+        const cancelled = error.category === 'cancelled';
+        if (authRequired || cancelled) {
+            if (currentRecoveryPending) finishCurrentRecovery();
+            if (cancelled) return undefined;
+        }
+        const shouldRecover = recoverableCurrentFailure(error);
+        if (shouldRecover) {
+            currentRecoveryPending = true;
+            scheduleCurrentRecovery();
+        } else if (currentRecoveryPending) {
+            finishCurrentRecovery();
+        }
+        store.fail(error, { apiState: shouldRecover ? 'offline' : 'online' });
+        if (showFailureToast && error.httpStatus !== 401 && error.category !== 'cancelled') {
+            showToast(error.message);
+        }
+        return undefined;
+    }
+}
+
+function scheduleCurrentRecovery() {
+    if (!currentRecoveryPending || currentRecoveryTimer !== null || pageDestroyed) return;
+    const delay = CURRENT_RECOVERY_DELAYS_MS[
+        Math.min(currentRecoveryAttempt, CURRENT_RECOVERY_DELAYS_MS.length - 1)
+    ];
+    currentRecoveryAttempt += 1;
+    currentRecoveryTimer = setTimeout(() => {
+        currentRecoveryTimer = null;
+        void recoverCurrentSnapshot();
+    }, delay);
+}
+
+async function recoverCurrentSnapshot() {
+    if (!currentRecoveryPending) return;
+    if (currentRecoveryInFlight) return currentRecoveryInFlight;
+    const task = (async () => {
+        const current = await refreshCurrent({ announceChange: false, showFailureToast: false });
+        if (current === undefined) return;
+        store.set({ apiState: 'online' }, 'current:recovered');
+        announce(current ? '当前行程已恢复' : '当前行程状态已同步');
+    })();
+    currentRecoveryInFlight = task;
+    try {
+        return await task;
+    } finally {
+        if (currentRecoveryInFlight === task) currentRecoveryInFlight = null;
     }
 }
 
@@ -719,25 +941,47 @@ function mapConfigSignature(value) {
 }
 
 async function synchronizeSnapshot({ setConnected = false, announceChange = false } = {}) {
-    const results = await Promise.allSettled([api.getClientConfig(), api.getCurrentItinerary(), api.getHeatmap()]);
+    const currentToken = beginCurrentRead();
+    const results = await Promise.allSettled([api.getClientConfig(), getRecoverableCurrentItinerary(), api.getHeatmap()]);
     const oldMapSignature = mapConfigSignature(mapConfig);
     const oldScenicId = socketScenicId;
-    const patch = { apiState: results.some(result => result.status === 'fulfilled') ? 'online' : 'offline' };
+    const patch = {};
     if (setConnected) patch.socketState = 'connected';
     if (results[0].status === 'fulfilled') {
         patch.config = results[0].value;
         mapConfig = resolveMapConfig(results[0].value);
     }
     if (results[2].status === 'fulfilled') store.applyHeatmap(results[2].value);
-    store.set(patch, setConnected ? 'socket:recovered' : 'socket:poll');
     if (results[1].status === 'fulfilled') {
+        const shouldRecoverPanel = currentRecoveryPending;
         const incoming = results[1].value;
-        const shouldNavigate = Boolean(incoming?.pendingProposal);
-        const local = store.getState().itinerary;
-        if (!(incoming === null && ['completed', 'abandoned'].includes(local?.state))) {
-            store.replaceItinerary(incoming, { navigate: shouldNavigate });
+        const shouldNavigate = shouldRecoverPanel || Boolean(incoming?.pendingProposal);
+        try {
+            applyCurrentSnapshot(currentToken, incoming, { navigate: shouldNavigate });
+        } catch (rawError) {
+            const error = currentSnapshotError(rawError);
+            results[1] = { status: 'rejected', reason: error };
+            if (currentReadIsFresh(currentToken)) {
+                currentRecoveryPending = true;
+                store.fail(error, { apiState: 'offline' });
+                scheduleCurrentRecovery();
+            }
+        }
+    } else if (currentReadIsFresh(currentToken)) {
+        const error = results[1].reason;
+        if ([401, 403].includes(Number(error?.httpStatus ?? error?.status))) {
+            finishCurrentRecovery();
+        } else {
+            currentRecoveryPending = true;
+            scheduleCurrentRecovery();
         }
     }
+    const currentAuthReachable = results[1].status === 'rejected'
+        && [401, 403].includes(Number(results[1].reason?.httpStatus ?? results[1].reason?.status));
+    const anyApiReachable = currentAuthReachable
+        || results.some(result => result.status === 'fulfilled');
+    patch.apiState = currentRecoveryPending ? 'offline' : anyApiReachable ? 'online' : 'offline';
+    store.set(patch, setConnected ? 'socket:recovered' : 'socket:poll');
     const refreshedConfig = results[0].status === 'fulfilled' ? results[0].value : null;
     if (refreshedConfig && (!socketClient || oldScenicId !== String(refreshedConfig.scenicId || 'default'))) {
         initSocket(refreshedConfig);
@@ -746,7 +990,11 @@ async function synchronizeSnapshot({ setConnected = false, announceChange = fals
     if (mapConfig && (oldMapSignature !== newMapSignature || store.getState().mapState === 'fallback')) {
         await initMap();
     }
-    if (announceChange) announce('实时连接已恢复，配置、行程和客流已同步');
+    if (announceChange) {
+        announce(results.every(result => result.status === 'fulfilled')
+            ? '实时连接已恢复，配置、行程和客流已同步'
+            : '实时连接已恢复，部分数据仍在重试');
+    }
     return results;
 }
 
@@ -762,15 +1010,25 @@ function initSocket(config) {
         scenicId: socketScenicId,
         openId: legacyOpenId,
         demo,
-        poll: demo ? null : () => synchronizeSnapshot({ setConnected: false, announceChange: false }),
+        poll: demo ? null : async () => {
+            const results = await synchronizeSnapshot({ setConnected: false, announceChange: false });
+            if (currentRecoveryPending || !results.some(result => result.status === 'fulfilled')) {
+                throw new ApiError('实时同步暂时不可用', { category: 'network', retryable: true });
+            }
+            return results;
+        },
         pollIntervalMs: 30000
     });
     listen(socketClient, 'state', event => store.set({ socketState: event.detail.state }, 'socket:state'), undefined, socketListenerCleanup);
     listen(socketClient, 'joined', event => {
-        store.set({ socketState: event.detail?.ok === false ? 'offline' : 'connected' }, 'socket:joined');
+        const joined = event.detail?.ok !== false;
+        store.set({ socketState: joined ? 'connected' : 'offline' }, 'socket:joined');
+        if (joined && currentRecoveryPending) void recoverCurrentSnapshot();
     }, undefined, socketListenerCleanup);
     listen(socketClient, 'reconnected', () => void refreshAfterReconnect(), undefined, socketListenerCleanup);
-    listen(socketClient, 'polled', () => store.set({ apiState: 'online' }, 'socket:poll:ok'), undefined, socketListenerCleanup);
+    listen(socketClient, 'polled', () => {
+        if (!currentRecoveryPending) store.set({ apiState: 'online' }, 'socket:poll:ok');
+    }, undefined, socketListenerCleanup);
     listen(socketClient, 'poll:error', () => store.set({ apiState: 'offline' }, 'socket:poll:error'), undefined, socketListenerCleanup);
     listen(socketClient, 'crowd', event => store.applyCrowdUpdate(event.detail), undefined, socketListenerCleanup);
     listen(socketClient, 'progress', event => {
@@ -792,12 +1050,11 @@ function initSocket(config) {
 async function receiveProposal(payload) {
     const notifiedProposalId = String(payload?.proposalId || payload?.proposal?.proposalId || '');
     if (notifiedProposalId && store.getState().handledProposalIds.includes(notifiedProposalId)) return;
-    const current = await api.getCurrentItinerary().catch(() => null);
+    const current = await refreshCurrent({ announceChange: false, showFailureToast: false });
     if (!current) {
         showToast('收到路线调整通知，服务端状态暂未同步');
         return;
     }
-    store.replaceItinerary(current);
     if (current.pendingProposal && proposalRemainingMs(current.pendingProposal.expireAt)) {
         announce('收到新的路线调整建议');
     } else if (payload?.proposalId || payload?.proposal?.proposalId) {
@@ -858,7 +1115,7 @@ async function submitPlan(event) {
     try {
         const itinerary = await api.planItinerary(payload);
         if (requestGeneration !== planRequestGeneration || store.getState().activePanel !== 'plan') return;
-        store.replaceItinerary(itinerary);
+        replaceItineraryAfterMutation(itinerary);
         announce('路线规划完成');
     } catch (error) {
         if (requestGeneration !== planRequestGeneration || error.category === 'cancelled') return;
@@ -886,7 +1143,7 @@ async function startTour() {
     store.set({ busyAction: 'start' }, 'tour:start');
     try {
         const updated = await api.startItinerary(itinerary.itineraryId, itinerary.version);
-        store.replaceItinerary(updated);
+        replaceItineraryAfterMutation(updated);
         locationClient.start('tour');
         if (demo) {
             const proposal = demoProposal(updated.version);
@@ -913,7 +1170,7 @@ async function itineraryAction(action) {
         })[action];
         if (!method || typeof api[method] !== 'function') throw new ApiError('不支持的行程操作');
         const updated = await api[method](itinerary.itineraryId, itinerary.version);
-        store.replaceItinerary(updated);
+        replaceItineraryAfterMutation(updated);
         if (action === 'finish') {
             locationClient.stop();
             clearInterval(proposalTimer);
@@ -934,7 +1191,7 @@ async function skipCurrentStop() {
     if (!itinerary || !stop || store.getState().busyAction) return;
     store.set({ busyAction: 'skip' }, 'itinerary:skip:start');
     try {
-        store.replaceItinerary(await api.skipStop(itinerary.itineraryId, stop.stopId, itinerary.version));
+        replaceItineraryAfterMutation(await api.skipStop(itinerary.itineraryId, stop.stopId, itinerary.version));
     } catch (error) {
         await handleWriteError(error);
     } finally {
@@ -956,7 +1213,7 @@ async function decideProposal(decision) {
         proposalTimerId = null;
         if (mapFacade.isReady()) mapFacade.clearRouteComparison();
         store.markProposalHandled(proposal.proposalId, decision === 'accept' ? 'accepted' : 'rejected');
-        store.replaceItinerary(updated);
+        replaceItineraryAfterMutation(updated);
         announce(decision === 'accept' ? '已接受新路线' : '已保留原路线');
     } catch (error) {
         await handleWriteError(error, {
@@ -971,7 +1228,8 @@ async function decideProposal(decision) {
 async function handleWriteError(error, { closeProposal = false, proposalId = null } = {}) {
     if ([1203, 1204, 1205].includes(Number(error.code))) {
         if (closeProposal) store.markProposalHandled(proposalId, Number(error.code) === 1203 ? 'conflict' : 'expired');
-        await refreshCurrent({ announceChange: true });
+        const refreshed = await refreshCurrent({ announceChange: true });
+        if (refreshed === undefined) return;
         showToast(Number(error.code) === 1203 ? '行程已在其他位置更新，已同步最新版本' : '路线建议已失效，已刷新行程');
     } else {
         store.fail(error);
@@ -1102,14 +1360,24 @@ async function retryMapOrConfig() {
     }
 }
 
+function returnHomeFromCompleted() {
+    replaceItineraryAfterMutation(null, { navigate: false });
+    navigate('home');
+}
+
 function bindUi() {
     listen(mapFacade, 'poi:selected', event => {
         const poi = store.getState().pois.find(item => String(item.poiId ?? item.id ?? item._id) === String(event.detail.poiId));
         if (poi) selectPoi(poi);
     });
     listen(mapFacade, 'route:compared', event => {
-        const distance = Number(event.detail.distanceDeltaM);
-        announce(Number.isFinite(distance)
+        const rawDistance = event.detail.distanceDeltaM;
+        const distance = Number(rawDistance);
+        const hasDistance = rawDistance !== null
+            && rawDistance !== undefined
+            && !(typeof rawDistance === 'string' && rawDistance.trim() === '')
+            && Number.isFinite(distance);
+        announce(hasDistance
             ? `路线差异：距离变化 ${Math.round(distance)} 米`
             : '新旧路线已显示');
     });
@@ -1131,10 +1399,7 @@ function bindUi() {
     listen(elements.skipStop, 'click', () => void skipCurrentStop());
     listen(elements.acceptProposal, 'click', () => void decideProposal('accept'));
     listen(elements.rejectProposal, 'click', () => void decideProposal('reject'));
-    listen(elements.returnHome, 'click', () => {
-        store.replaceItinerary(null, { navigate: false });
-        navigate('home');
-    });
+    listen(elements.returnHome, 'click', returnHomeFromCompleted);
     listen(elements.retryMap, 'click', () => void retryMapOrConfig());
     listen(elements.openScene, 'click', () => {
         const raw = elements.openScene.dataset.sceneUrl;
@@ -1181,7 +1446,12 @@ function bindUi() {
             return;
         }
         const panel = store.getState().activePanel;
-        const back = ({ plan: 'home', preview: 'plan', spot: 'home', completed: 'home' })[panel];
+        if (panel === 'completed') {
+            event.preventDefault();
+            returnHomeFromCompleted();
+            return;
+        }
+        const back = ({ plan: 'home', preview: 'plan', spot: 'home' })[panel];
         if (!back) return;
         event.preventDefault();
         navigate(back);
@@ -1204,23 +1474,61 @@ async function boot() {
         if (wasRunning && !isRunning) locationClient?.stop();
     }, { emitCurrent: true });
 
+    const bootCurrentToken = beginCurrentRead();
     const results = await Promise.allSettled([
-        api.getClientConfig(), api.getPois(), api.getHeatmap(), api.getCurrentItinerary(),
+        api.getClientConfig(), api.getPois(), api.getHeatmap(), getRecoverableCurrentItinerary(),
         typeof api.getBoundary === 'function' ? api.getBoundary() : Promise.resolve(null)
     ]);
     if (pageDestroyed) return;
     const config = results[0].status === 'fulfilled' ? results[0].value : null;
     const pois = results[1].status === 'fulfilled' ? normalizePois(results[1].value) : [];
     const heatmap = results[2].status === 'fulfilled' ? results[2].value : { items: [] };
-    const itinerary = results[3].status === 'fulfilled' ? results[3].value : null;
+    const currentResult = results[3];
+    const currentStatus = currentResult.status === 'rejected'
+        ? Number(currentResult.reason?.httpStatus ?? currentResult.reason?.status)
+        : 0;
+    const currentAuthRequired = [401, 403].includes(currentStatus);
+    const itinerary = currentResult.status === 'fulfilled'
+        ? currentResult.value
+        : currentAuthRequired ? null : undefined;
+    const currentFresh = currentReadIsFresh(bootCurrentToken);
+    const currentUnavailable = currentFresh
+        && currentResult.status === 'rejected'
+        && !currentAuthRequired;
+    if (currentFresh) currentRecoveryPending = currentUnavailable;
     boundaryData = results[4].status === 'fulfilled' ? results[4].value : null;
-    const anyApiAvailable = results.slice(0, 4).some(result => result.status === 'fulfilled');
-    store.set({ config, pois, boot: 'ready', apiState: anyApiAvailable ? 'online' : 'offline' }, 'boot');
+    const apiReachable = currentAuthRequired
+        || results.slice(0, 4).some(result => result.status === 'fulfilled');
+    store.set({
+        config,
+        pois,
+        boot: 'ready',
+        apiState: currentUnavailable ? 'offline' : apiReachable ? 'online' : 'offline'
+    }, 'boot');
     store.applyHeatmap(heatmap);
-    try {
-        store.replaceItinerary(itinerary, { navigate: false });
-    } catch (error) {
-        store.fail(error);
+    let currentNotice = null;
+    if (currentResult.status === 'fulfilled' || currentAuthRequired) {
+        try {
+            const outcome = applyCurrentSnapshot(bootCurrentToken, itinerary, { navigate: false });
+            if (outcome.applied && currentAuthRequired) {
+                currentNotice = currentStatus === 401
+                    ? '当前未登录，可浏览景点；规划行程前请完成微信授权'
+                    : '当前账号无法读取行程，可继续浏览景点';
+            }
+        } catch (rawError) {
+            if (currentReadIsFresh(bootCurrentToken)) {
+                const error = currentSnapshotError(rawError);
+                currentRecoveryPending = true;
+                store.fail(error, { boot: 'ready', apiState: 'offline' });
+                currentNotice = '当前行程数据暂未恢复，正在自动重试';
+            }
+        }
+    } else if (currentFresh) {
+        store.fail(currentResult.reason || new ApiError('当前行程暂时不可用'), {
+            boot: 'ready',
+            apiState: 'offline'
+        });
+        currentNotice = '当前行程暂未恢复，正在自动重试';
     }
     const initialRoute = panelFromHash();
     const restoredItinerary = store.getState().itinerary;
@@ -1232,6 +1540,7 @@ async function boot() {
                 : initialRoute.panel;
     store.navigate(initialPanel, { selectedSpotId: initialRoute.spotId || null });
     initSocket(config);
+    if (currentRecoveryPending) scheduleCurrentRecovery();
     if (config) {
         mapConfig = resolveMapConfig(config);
         await initMap();
@@ -1240,25 +1549,30 @@ async function boot() {
             ? results[0].reason
             : new ApiError('启动配置不可用');
         enterMapFallback(new MapFacadeError('MAP_CONFIG_INVALID', '启动配置不可用'));
-        store.fail(configError, { boot: 'ready', apiState: anyApiAvailable ? 'online' : 'offline' });
+        store.fail(configError, {
+            boot: 'ready',
+            apiState: currentRecoveryPending ? 'offline' : apiReachable ? 'online' : 'offline'
+        });
         showToast(`${configError.message}；景点列表和行程操作仍可使用`);
     }
     if (['active', 'paused'].includes(restoredItinerary?.state)) locationClient.start('tour');
     if (initialRoute.panel === 'spot') await openPhotoSpots(initialRoute.spotId);
-    if (results[3].status === 'rejected' && Number(results[3].reason?.httpStatus ?? results[3].reason?.status) === 401) {
-        showToast('当前未登录，可浏览景点；规划行程前请完成微信授权');
-    }
+    if (currentNotice && currentReadIsFresh(bootCurrentToken)) showToast(currentNotice);
 }
 
 function destroyPage() {
     if (pageDestroyed) return;
     pageDestroyed = true;
     planRequestGeneration += 1;
+    currentReadGeneration += 1;
+    currentRecoveryPending = false;
     clearInterval(proposalTimer);
     proposalTimer = null;
     proposalTimerId = null;
     clearTimeout(toastTimer);
     toastTimer = null;
+    clearCurrentRecoveryRetry();
+    currentRecoveryInFlight = null;
     clearListeners(uiListenerCleanup);
     clearListeners(socketListenerCleanup);
     clearListeners(locationListenerCleanup);

@@ -39,6 +39,11 @@ test('ApiClient preserves null data, safe errors, success codes, timeout, cancel
         contentType: 'application/json',
         body: JSON.stringify({ success: true, code: 0, data: fullItinerary, message: '' })
     }));
+    await page.route('**/api/itinerary/missing', route => route.fulfill({
+        status: 404,
+        contentType: 'application/json',
+        body: JSON.stringify({ success: false, code: 1204, data: null, message: 'private detail' })
+    }));
 
     await page.goto('/tour?demo=1');
     const result = await page.evaluate(async () => {
@@ -83,8 +88,33 @@ test('ApiClient preserves null data, safe errors, success codes, timeout, cancel
         client.cancel('module-cancel');
         const cancelled = await cancelledPromise;
         const rejected = await client.rejectProposal('it-1', 'p-1', 7);
+        let detailError;
+        try {
+            await client.getItinerary('missing');
+        } catch (error) {
+            detailError = {
+                category: error.category,
+                httpStatus: error.httpStatus,
+                code: error.code,
+                message: error.message
+            };
+        }
         client.destroy();
-        return { nullData, code2102, code2103, errors, malformed, timeout, cancelled, rejected, endpoints: ENDPOINTS };
+        return {
+            nullData,
+            code2102,
+            code2103,
+            errors,
+            malformed,
+            timeout,
+            cancelled,
+            rejected,
+            detailError,
+            endpoints: {
+                currentItinerary: ENDPOINTS.currentItinerary,
+                itineraryDetail: ENDPOINTS.itineraryDetail('it 1')
+            }
+        };
     });
 
     expect(result.nullData).toBeNull();
@@ -102,7 +132,65 @@ test('ApiClient preserves null data, safe errors, success codes, timeout, cancel
     expect(result.timeout).toEqual({ category: 'timeout', retryable: true, message: '请求超时，请稍后重试' });
     expect(result.cancelled).toEqual({ category: 'cancelled', retryable: false, message: '请求已取消' });
     expect(result.rejected).toEqual(fullItinerary);
+    expect(result.detailError).toEqual({
+        category: 'business',
+        httpStatus: 404,
+        code: 1204,
+        message: '行程不存在或已失效'
+    });
     expect(result.endpoints.currentItinerary).toBe('/api/itinerary/current');
+    expect(result.endpoints.itineraryDetail).toBe('/api/itinerary/it%201');
+});
+
+test('ApiClient keeps concurrent current reads alive for coordinated recovery', async ({ page }) => {
+    await page.goto('/tour?demo=1');
+    const result = await page.evaluate(async () => {
+        const { ApiClient } = await import('/assets/js/api/client.js');
+        const pending = [];
+        const fetchImpl = (_url, { signal }) => new Promise((resolve, reject) => {
+            const request = {
+                aborted: false,
+                resolve(version) {
+                    resolve({
+                        ok: true,
+                        status: 200,
+                        headers: new Headers(),
+                        text: async () => JSON.stringify({
+                            success: true,
+                            code: 0,
+                            data: {
+                                itineraryId: `it-${version}`,
+                                version,
+                                state: 'active',
+                                stops: [],
+                                route: null,
+                                pendingProposal: null
+                            },
+                            message: ''
+                        })
+                    });
+                }
+            };
+            signal.addEventListener('abort', () => {
+                request.aborted = true;
+                reject(new DOMException('cancelled', 'AbortError'));
+            }, { once: true });
+            pending.push(request);
+        });
+        const client = new ApiClient({ fetchImpl });
+        const first = client.getCurrentItinerary().then(value => value.version, error => error.category);
+        const second = client.getCurrentItinerary().then(value => value.version, error => error.category);
+        await Promise.resolve();
+        pending[1].resolve(2);
+        pending[0].resolve(1);
+        const values = await Promise.all([first, second]);
+        const aborted = pending.map(request => request.aborted);
+        client.destroy();
+        return { values, aborted };
+    });
+
+    expect(result.values).toEqual([1, 2]);
+    expect(result.aborted).toEqual([false, false]);
 });
 
 test('DemoApiClient uses external fixtures, validates versions, supports scenarios, and cancels', async ({ page }) => {
@@ -150,6 +238,7 @@ test('DemoApiClient uses external fixtures, validates versions, supports scenari
         demo.destroy();
         return {
             config, boundaryType: boundary.type, poiCount: pois.length,
+            firstSuggestedStayMin: pois[0]?.suggestedStayMin,
             heatmapCount: heatmap.items.length, closedCount: closedEdges.items.length,
             planned, versionError, proposalError, rejected, position, planErrors, cancelled
         };
@@ -158,6 +247,7 @@ test('DemoApiClient uses external fixtures, validates versions, supports scenari
     expect(result.config.scenicId).toBe('whu_demo');
     expect(result.boundaryType).toBe('FeatureCollection');
     expect(result.poiCount).toBe(5);
+    expect(result.firstSuggestedStayMin).toBe(10);
     expect(result.heatmapCount).toBe(5);
     expect(result.closedCount).toBe(1);
     expect(result.planned.route.gis.mode).toBe('shade');
@@ -191,6 +281,7 @@ test('MapFacade adapter covers strict lifecycle, route compatibility, styles, ev
                 this.paintUpdates = [];
                 this.removed = false;
                 this.fitCalls = [];
+                this.failNextFit = false;
                 this.easeCalls = [];
                 this.canvas = { style: {} };
             }
@@ -227,7 +318,13 @@ test('MapFacade adapter covers strict lifecycle, route compatibility, styles, ev
             }
             getCanvas() { return this.canvas; }
             setPaintProperty(layer, property, value) { this.paintUpdates.push({ layer, property, value }); }
-            fitBounds(bounds, options) { this.fitCalls.push({ bounds, options }); }
+            fitBounds(bounds, options) {
+                if (this.failNextFit) {
+                    this.failNextFit = false;
+                    throw new Error('fit failed');
+                }
+                this.fitCalls.push({ bounds, options });
+            }
             easeTo(options) { this.easeCalls.push(options); }
             getZoom() { return 15; }
             resize() {}
@@ -260,8 +357,31 @@ test('MapFacade adapter covers strict lifecycle, route compatibility, styles, ev
             mapUrl: '/fake-map', center: [114.3592, 30.541], extent: [114.3468, 30.5332, 114.3722, 30.5486],
             zoom: 15, minZoom: 13, maxZoom: 20, crs: 'EPSG:4326'
         };
+
+        const pendingMap = new FakeMap('pending-map');
+        pendingMap.loaded = () => false;
+        const pendingFacade = new MapFacade({
+            adapter: { init: () => ({ map: pendingMap }) },
+            ResizeObserver: FakeResizeObserver,
+            timeoutMs: 100
+        });
+        const pendingInit = pendingFacade.init(host, config);
+        await new Promise(resolve => setTimeout(resolve, 0));
+        const readyDuringLoad = pendingFacade.isReady();
+        let updateDuringLoadCode;
+        try {
+            pendingFacade.setPois({ type: 'FeatureCollection', features: [] });
+        } catch (error) {
+            updateDuringLoadCode = error.code;
+        }
+        pendingMap.trigger('load', {});
+        await pendingInit;
+        const readyAfterLoad = pendingFacade.isReady();
+        pendingFacade.destroy();
+
         await facade.init(host, config);
         const first = maps[0];
+        const firstObserver = FakeResizeObserver.instances.at(-1);
         const countsBeforeReinstall = { sources: first.sources.size, layers: first.layers.size };
         const layerAccess = installSourcesAndLayers(first);
         const countsAfterReinstall = { sources: first.sources.size, layers: first.layers.size };
@@ -283,6 +403,12 @@ test('MapFacade adapter covers strict lifecycle, route compatibility, styles, ev
         facade.setCrowd({ poiId: 'poi-1', level: 'high', lowConfidence: false });
         const crowdAfterSingle = structuredClone(poiSource.data);
         const layerCountAfterSingleUpdate = first.layers.size;
+        facade.setPois([{
+            id: 'poi-api-1', poiName: '接口景点', category: '摄影', status: 'approved',
+            location: { lng: 114.352, lat: 30.542 }
+        }]);
+        const apiPoiCollection = structuredClone(poiSource.data);
+        facade.setPois({ type: 'FeatureCollection', features: [poi] });
 
         let selected;
         facade.addEventListener('poi:selected', event => { selected = event.detail; }, { once: true });
@@ -305,9 +431,44 @@ test('MapFacade adapter covers strict lifecycle, route compatibility, styles, ev
         let comparisonEvent;
         facade.addEventListener('route:compared', event => { comparisonEvent = event.detail; }, { once: true });
         const comparison = facade.compareRoutes(routeBefore, routeAfter);
+        const routeOpacityDuringComparison = first.paintUpdates
+            .filter(update => update.property === 'line-opacity')
+            .at(-1)?.value;
+        const comparisonFeatureCounts = [
+            layerAccess.getSource('routeOld').data.features.length,
+            layerAccess.getSource('routeNew').data.features.length
+        ];
+        facade.clearRouteComparison();
+        const routeOpacityAfterClear = first.paintUpdates
+            .filter(update => update.property === 'line-opacity')
+            .at(-1)?.value;
+        const clearedComparisonFeatureCounts = [
+            layerAccess.getSource('routeOld').data.features.length,
+            layerAccess.getSource('routeNew').data.features.length
+        ];
+        const mainRouteFeatureCountAfterClear = layerAccess.getSource('route').data.features.length;
+        const missingMetricComparison = facade.compareRoutes(
+            { ...routeBefore, distanceM: null, durationSec: undefined },
+            { ...routeAfter, distanceM: undefined, durationSec: null }
+        );
+        facade.clearRouteComparison();
 
         const mapErrors = [];
         facade.addEventListener('map:error', event => mapErrors.push(event.detail));
+        first.failNextFit = true;
+        let comparisonFailureCode;
+        try {
+            facade.compareRoutes(routeBefore, routeAfter);
+        } catch (error) {
+            comparisonFailureCode = error.code;
+        }
+        const routeOpacityAfterComparisonFailure = first.paintUpdates
+            .filter(update => update.property === 'line-opacity')
+            .at(-1)?.value;
+        const failedComparisonFeatureCounts = [
+            layerAccess.getSource('routeOld').data.features.length,
+            layerAccess.getSource('routeNew').data.features.length
+        ];
         first.trigger('error', { error: new Error('tile failed') });
         let invalidRouteCode;
         try {
@@ -318,8 +479,9 @@ test('MapFacade adapter covers strict lifecycle, route compatibility, styles, ev
 
         await facade.init(host, config);
         const second = maps[1];
+        const secondObserver = FakeResizeObserver.instances.at(-1);
         const firstRemovedOnReinit = first.removed;
-        const firstObserverDisconnected = FakeResizeObserver.instances[0].disconnected;
+        const firstObserverDisconnected = firstObserver.disconnected;
         const readyAfterReinit = facade.isReady();
         facade.destroy();
 
@@ -363,11 +525,16 @@ test('MapFacade adapter covers strict lifecycle, route compatibility, styles, ev
 
         return {
             notReadyCode,
+            readyDuringLoad,
+            updateDuringLoadCode,
+            readyAfterLoad,
+            pendingMapRemoved: pendingMap.removed,
             countsBeforeReinstall,
             countsAfterReinstall,
             closedLabelFilter,
             crowdSnapshot,
             crowdAfterSingle,
+            apiPoiCollection,
             layerCountBeforeSingleUpdate,
             layerCountAfterSingleUpdate,
             selected,
@@ -375,6 +542,15 @@ test('MapFacade adapter covers strict lifecycle, route compatibility, styles, ev
             presentation,
             comparison,
             comparisonEvent,
+            routeOpacityDuringComparison,
+            routeOpacityAfterClear,
+            comparisonFeatureCounts,
+            clearedComparisonFeatureCounts,
+            mainRouteFeatureCountAfterClear,
+            missingMetricComparison,
+            comparisonFailureCode,
+            routeOpacityAfterComparisonFailure,
+            failedComparisonFeatureCounts,
             mapErrors,
             invalidRouteCode,
             firstRemovedOnReinit,
@@ -382,7 +558,7 @@ test('MapFacade adapter covers strict lifecycle, route compatibility, styles, ev
             readyAfterReinit,
             secondRemoved: second.removed,
             secondHandlers: second.handlers.length,
-            secondObserverDisconnected: FakeResizeObserver.instances[1].disconnected,
+            secondObserverDisconnected: secondObserver.disconnected,
             timeoutError,
             timeoutEvent,
             lateErrorCode,
@@ -396,6 +572,10 @@ test('MapFacade adapter covers strict lifecycle, route compatibility, styles, ev
     });
 
     expect(result.notReadyCode).toBe('MAP_NOT_INITIALIZED');
+    expect(result.readyDuringLoad).toBe(false);
+    expect(result.updateDuringLoadCode).toBe('MAP_NOT_INITIALIZED');
+    expect(result.readyAfterLoad).toBe(true);
+    expect(result.pendingMapRemoved).toBe(true);
     expect(result.countsAfterReinstall).toEqual(result.countsBeforeReinstall);
     expect(result.closedLabelFilter).toEqual(['!=', ['get', 'status'], 'closed']);
     expect(result.crowdSnapshot.features[0].properties).toMatchObject({
@@ -404,6 +584,12 @@ test('MapFacade adapter covers strict lifecycle, route compatibility, styles, ev
     expect(result.crowdAfterSingle.features[0].properties).toMatchObject({
         crowdLevel: 'high', lowConfidence: false, crowdLabel: '拥挤'
     });
+    expect(result.apiPoiCollection.features).toEqual([expect.objectContaining({
+        geometry: { type: 'Point', coordinates: [114.352, 30.542] },
+        properties: expect.objectContaining({
+            poiId: 'poi-api-1', name: '接口景点', category: '摄影', status: 'approved'
+        })
+    })]);
     expect(result.layerCountAfterSingleUpdate).toBe(result.layerCountBeforeSingleUpdate);
     expect(result.selected.poiId).toBe('poi-1');
     expect(result.decoded.type).toBe('LineString');
@@ -418,6 +604,18 @@ test('MapFacade adapter covers strict lifecycle, route compatibility, styles, ev
         afterSource: 'local-fallback'
     });
     expect(result.comparisonEvent).toEqual(result.comparison);
+    expect(result.routeOpacityDuringComparison).toBe(0);
+    expect(result.comparisonFeatureCounts).toEqual([1, 1]);
+    expect(result.routeOpacityAfterClear).toBe(result.routeStyle.opacity);
+    expect(result.clearedComparisonFeatureCounts).toEqual([0, 0]);
+    expect(result.mainRouteFeatureCountAfterClear).toBe(1);
+    expect(result.missingMetricComparison).toMatchObject({
+        distanceDeltaM: null,
+        durationDeltaSec: null
+    });
+    expect(result.comparisonFailureCode).toBe('MAP_SERVICE_UNAVAILABLE');
+    expect(result.routeOpacityAfterComparisonFailure).toBe(result.routeStyle.opacity);
+    expect(result.failedComparisonFeatureCounts).toEqual([0, 0]);
     expect(result.mapErrors[0].code).toBe('MAP_SERVICE_UNAVAILABLE');
     expect(result.invalidRouteCode).toBe('MAP_GEOMETRY_INVALID');
     expect(result.mapErrors.some(error => error.code === 'MAP_GEOMETRY_INVALID')).toBe(true);

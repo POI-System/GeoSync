@@ -144,6 +144,16 @@
                 <div class="panel-header"><div><h2>路线调整建议</h2><p id="proposal-reason" class="panel-subtitle"></p></div></div>
                 <div id="proposal-countdown" class="notice" role="timer"></div>
                 <div id="proposal-metrics" class="proposal-grid"></div>
+                <div id="proposal-route-diff" class="proposal-route-diff hidden" aria-label="路线站点调整">
+                    <section>
+                        <h3>原路线站点</h3>
+                        <ol id="proposal-before-stops" class="proposal-stop-list"></ol>
+                    </section>
+                    <section>
+                        <h3>新路线站点</h3>
+                        <ol id="proposal-after-stops" class="proposal-stop-list"></ol>
+                    </section>
+                </div>
                 <div class="panel-actions">
                     <button id="accept-proposal" class="btn btn-primary" type="button">接受新路线</button>
                     <button id="reject-proposal" class="btn btn-secondary" type="button">保留原路线</button>
