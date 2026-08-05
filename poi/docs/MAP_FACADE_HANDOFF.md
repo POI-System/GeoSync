@@ -36,11 +36,11 @@ map.setCrowd(await api.getHeatmap());
 | `init(container, config)` | 校验容器、地图 URL、中心、范围、缩放和 CRS；重复调用会先销毁旧实例。 |
 | `isReady()` | 返回地图是否已经完成初始化。 |
 | `setBoundary(featureCollection)` | 更新景区边界 GeoJSON。 |
-| `setPois(featureCollection)` | 更新 POI；业务键必须是 `properties.poiId`。 |
+| `setPois(featureCollectionOrItems)` | 更新 POI；既可传入 GeoJSON FeatureCollection，也可直接传入 `ApiClient.getPois()` 返回的 POI 数组，数组中的 `poiId/id/_id` 会统一为 `properties.poiId`。 |
 | `setCrowd(snapshotOrItem)` | 接受完整 `{items, lowConfidence}` 快照或一个 `crowd:update` item。 |
 | `setRoute(route, options)` | 绘制 NormalizedRoute；兼容读取集中处理的 `pathGeometry`。 |
-| `compareRoutes(beforeRoute, afterRoute)` | 绘制灰色旧路线和主题色新路线，缩放到联合范围并返回差异摘要。 |
-| `clearRouteComparison()` | 清空比较图层，不影响当前正式路线。 |
+| `compareRoutes(beforeRoute, afterRoute)` | 绘制灰色旧路线和主题色新路线，缩放到联合范围并返回差异摘要；仅在新旧两侧都提供有效指标时返回距离或时长差。 |
+| `clearRouteComparison()` | 清空比较图层并恢复当前正式路线可见性，不删除正式路线数据。 |
 | `setUserLocation(location)` | 更新 `{lng, lat, accuracy}`；无效位置会清空位置图层。 |
 | `setClosedEdges(items)` | 更新包含公开 EPSG:4326 几何的封闭路段。缺少几何时不要伪造线段。 |
 | `selectEdge(edgeId)` | 高亮一个已存在的封闭路段。 |
@@ -73,11 +73,13 @@ map.addEventListener('map:error', ({ detail }) => {
 });
 ```
 
+`distanceDeltaM` 和 `durationDeltaSec` 始终存在。新旧路线任一侧缺少对应指标时值为 `null`，调用方不得把 `null` 当成 `0`。
+
 `init` 的稳定错误分类是 `MAP_SDK_LOAD_FAILED`、`MAP_SERVICE_UNAVAILABLE`、`MAP_CONFIG_INVALID`。运行中还可能发出 `MAP_SOURCE_UNAVAILABLE` 或 `MAP_GEOMETRY_INVALID`；调用方应进入列表或非地图降级状态，不能阻断业务操作。
 
 ## 数据与视觉规范
 
-POI 是 GeoJSON Point FeatureCollection，唯一键为 `properties.poiId`。类别图标由本地样式生成，关闭或受限状态由属性控制；点击只派发事件，不在地图层请求详情。
+POI 的地图内部格式是 GeoJSON Point FeatureCollection，唯一键为 `properties.poiId`。调用方可以直接把 `ApiClient.getPois()` 的数组结果传给 `setPois`，无需复制游客端的数据转换代码。类别图标由本地样式生成，关闭或受限状态由属性控制；点击只派发事件，不在地图层请求详情。
 
 客流固定颜色与文字如下：
 
@@ -110,7 +112,7 @@ POI 是 GeoJSON Point FeatureCollection，唯一键为 `properties.poiId`。类�
 
 可用方法包括：
 
-- `getClientConfig()`、`getPois()`、`getCurrentItinerary()`、`getHeatmap()`
+- `getClientConfig()`、`getPois()`、`getCurrentItinerary()`、`getItinerary(id)`、`getHeatmap()`
 - `getPhotoSpots()`、`getGoldenWindow()`、`getArData()`
 - `planItinerary()`、`startItinerary()`、`pauseItinerary()`、`resumeItinerary()`
 - `skipStop()`、`endItinerary()`、`acceptProposal()`、`rejectProposal()`

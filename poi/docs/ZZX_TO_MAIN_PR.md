@@ -6,14 +6,19 @@
 - 新增可复用 `MapFacade`，统一边界、POI、客流、路线、路线对比、位置和封闭路段图层。
 - 本地化 MapLibreGL、SuperMap iClient 和 Socket.io Client，无 CDN 运行依赖。
 - 新增摄影机位详情、黄金窗口和受配置控制的三维入口。
+- 补齐生产 POI 建议停留字段、封路提案权威新旧路线/差值和文字站点差异。
+- 新增完成态服务端事实恢复：浏览器只保存 terminal 行程 ID，详情接口按用户所有权读取。
+- 补齐 current 失败退避、迟到轮询失效、提案图层清理/重建和缺失指标降级。
 - 新增 Playwright 主闭环、模块契约、定位拒绝和四视口测试及正式截图。
+- 新增非 Demo 生产 REST 提案测试和同实例封路生成、读取、接受后端闭环。
 - 新增 `MAP_FACADE_HANDOFF.md`，提供给邵建鹏直接接入的公共方法、事件、颜色和 API Client 约定。
 
 ## 接口、配置或依赖变化
 
-- 不新增后端 API。
+- 新增受用户认证和所有权校验保护的 `GET /api/itinerary/:id`，用于完成态刷新恢复；不存在、越权或非法 ID 统一返回 `404/1204`。
+- `/api/poi/all` 增加顶层 `suggestedStayMin`；`barrierReroute` 的 `pendingProposal` 增加脱敏后的 `beforeRoute/afterRoute/distanceDeltaM/durationDeltaSec`。
 - `poi/package.json` 增加固定版本前端 SDK、Playwright、`vendor:sync`、`check:tour-offline` 和 `test:tour`。
-- 上游提案暂缺新路线几何，兼容字段与降级表现见 `docs/tourist-client.md`。
+- 非封路提案仍可能缺少接受前路线几何，兼容字段与降级表现见 `docs/tourist-client.md`。
 
 ## 验证方式
 
@@ -29,11 +34,12 @@ npm.cmd test
 
 实际结果：
 
-- 游客端 Playwright：`29/29` 通过。
+- 游客端 Playwright：`44/44` 通过。
 - 游客端纯函数：`17/17` 通过。
-- 后端全量测试：`481/481` 通过。
-- 游客端语法检查：27 个文件通过；后端 Node 语法检查通过。
+- 后端全量测试：`493/493` 通过。
+- 游客端语法检查：29 个文件通过；后端 Node 语法检查通过。
 - 离线资源扫描：通过，固定版本为 SuperMap iClient `12.1.0-r`、MapLibreGL `5.6.0`、Socket.io Client `4.7.4`。
+- 生产依赖审计：`critical 0 / high 5 / moderate 5`；属于现有依赖基线，本次未升级，上线前需单独修复并完成兼容性回归。
 - 演示环境性能断言：首图 `<3s`、封路通知到提案 `<5s`、接受后完整状态替换 `<2s`。
 
 ## 页面截图
@@ -51,7 +57,7 @@ npm.cmd test
 ## 已知问题
 
 - 真实 iServer 首图耗时、封路到提案耗时和三维 scene 跳转需在 SXR 服务与正式 manifest 可用后签字。
-- 接受前的新旧路线比较依赖 LZY 补充公开提案路线几何；当前不会在前端自行推算。
+- 封路提案已支持接受前权威新旧路线比较；其他提案类型仍需后端在创建提案时预计算并公开脱敏路线。
 - 生产 `graph:update` 暂缺封闭路段几何；当前保留状态与提示，收到公开几何后可直接渲染。
 
 ## 提交前确认

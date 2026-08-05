@@ -1,22 +1,25 @@
 # 游客端验收证据
 
-验收日期：2026-08-03。工作区：`D:\spmap\GeoSync`，分支：`ZZX`。本地工具链为 Node.js `v24.14.1`、npm `11.11.0`、Git `2.53.0.windows.3`。
+验收日期：2026-08-05。工作区：`D:\spmap\GeoSync`，分支：`ZZX`。本地工具链为 Node.js `v24.14.1`、npm `11.11.0`、Git `2.53.0.windows.3`。
 
 ## 自动化结果
 
 | 检查 | 结果 | 覆盖重点 |
 |---|---|---|
 | `npm.cmd run test:tour:unit` | `17/17` | 错误分类、格式化、客流/路线样式、提案时钟、Store version 与提案去重。 |
-| `npm.cmd run test:tour` | `29/29` | API/MapFacade/Socket/定位模块、完整游览、改道、错误码、刷新恢复和视口矩阵。 |
-| `npm.cmd test` | `481/481` | 后端全量基线，确认游客端修改没有回归服务端。 |
-| `npm.cmd run check:tour-syntax` | 27 个文件通过 | 游客端一方 ES Modules、脚本和测试语法。 |
+| `npm.cmd run test:tour` | `44/44` | API/MapFacade/Socket/定位模块、完整游览、生产 REST 提案、并发恢复、终态刷新、页面销毁和视口矩阵。 |
+| `npm.cmd test` | `493/493` | 后端全量基线，覆盖本人行程详情、提案公开预览、POI 公共投影、规划停留时间和同实例封路接受闭环。 |
+| `npm.cmd run check:tour-syntax` | 29 个文件通过 | 游客端 ES Modules、脚本和测试语法。 |
 | `npm.cmd run check:syntax` | 通过 | 后端关键模块与测试语法。 |
-| `npm.cmd run check:tour-offline` | 通过 | 无 CDN、无弹窗 API、固定 vendor 版本、无 source map/激活文件。 |
+| `npm.cmd run check:tour-offline` | 通过 | 无 CDN、无弹窗 API、固定 vendor 版本，并校验边界与 5 个 POI 离线夹具。 |
+| `npm.cmd audit --omit=dev --audit-level=high` | `critical 0 / high 5 / moderate 5` | 现有生产依赖基线仍有 10 项告警；本次未升级依赖，上线前需单独修复并回归。 |
 | `git diff --check` | 通过 | 无空白错误。 |
 
 ## P0 浏览器闭环
 
-Playwright 已验证：规划 4 小时摄影路线、预览、开始、暂停、继续、跳过、封路通知、提案查看、接受或拒绝、完整路线/ETA/站点/version 替换、结束和刷新恢复。额外覆盖 8204、1203、1204、1205、2102、2103、空客流、Socket 断线重连、定位拒绝、地图 SDK/配置失败列表降级、API 非 JSON/超时/取消/401/403/409/429/5xx。
+Playwright 已验证：规划 4 小时摄影路线、预览、开始、暂停、继续、跳过、封路通知、提案新旧路线与站点差异、接受或拒绝、完整路线/ETA/站点/version 替换、结束和刷新恢复。生产形态测试使用非 Demo `/tour`、真实 `ApiClient` envelope 和公开 `pendingProposal` 字段，验证地图数据源、差值、站点文本及接受请求 version。终态恢复只在 `sessionStorage` 保存行程 ID，再通过受所有权保护的详情接口读取服务端事实。额外覆盖 Socket proposal/current 首次 503 后退避恢复、1203 后 current 首次失败恢复、延迟 null 竞态、不完整快照、部分轮询失败、重连后迟到轮询失效、页面销毁后迟到请求失效、缺失路线指标不误报零、8204、1204、1205、2102、2103、空客流、定位拒绝、地图 SDK/配置失败列表降级，以及 API 非 JSON/超时/取消/401/403/409/429/5xx。
+
+后端工作流还使用同一个可变行程实例验证 `graph close -> barrierReroute 持久化 -> GET /current 公共投影 -> accept`，确认提案私有 payload 不泄漏，接受后的路线、站点、ETA、时刻表、version 和进度事件保持一致。
 
 本地 Mock 性能断言已通过：首个可交互地图 `<3s`，封路通知到提案 `<5s`，接受提案后完整状态替换 `<2s`。这些结果只证明本地同源 Mock 链路，不等同于真实 iServer 性能签字。
 
@@ -33,6 +36,6 @@ Playwright 已验证：规划 4 小时摄影路线、预览、开始、暂停、
 - 真实 manifest、公开二维地图、边界数据和三维 scene URL。
 - 真实 iServer 首图 3 秒、真实封路事件到提案 5 秒、接受后服务端状态更新 2 秒。
 - 微信 H5 的签名会话 Cookie、Socket Cookie、定位授权和设备安全区实机行为。
-- 上游尚未公开的提案前新路线几何、距离/时长差，以及封闭路段几何。
+- 非 `barrierReroute` 提案仍缺接受前的权威路线预览与距离/时长差；`graph:update` 仍缺封闭路段几何。
 
-当前游客端对缺失字段显示明确降级文案，不推算路线、不伪造几何，也不直接请求 iServer 网络分析。详细契约缺口见 `LZY_FRONTEND_CONTRACT_GAPS.md`。
+封路提案现已从服务端安全公开权威 `beforeRoute/afterRoute` 与距离、时长差；其他提案类型对缺失字段继续显示明确降级文案，不推算路线、不伪造几何，也不直接请求 iServer 网络分析。详细契约缺口见 `LZY_FRONTEND_CONTRACT_GAPS.md`。
