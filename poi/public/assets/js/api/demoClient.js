@@ -202,6 +202,7 @@ export class DemoApiClient {
                 category: feature.properties.category,
                 description: feature.properties.description,
                 status: feature.properties.status,
+                suggestedStayMin: feature.properties.suggestedStayMin,
                 lng: feature.geometry.coordinates[0],
                 lat: feature.geometry.coordinates[1]
             }));

@@ -59,6 +59,8 @@ Thumbs.db
 *.sbx
 *.gpkg
 *.geojson
+!poi/public/assets/mock/boundary.geojson
+!poi/public/assets/mock/pois.geojson
 *.kml
 *.kmz
 *.osm
