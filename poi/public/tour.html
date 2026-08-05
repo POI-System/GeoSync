@@ -112,6 +112,13 @@
                     <label class="switch-row"><span>遮荫优先</span><input name="shadeFirst" type="checkbox" checked></label>
                     <div id="plan-start-source" class="notice">起点：景区入口</div>
                     <div id="plan-message" class="notice hidden" role="status"></div>
+                    <div id="existing-itinerary-choice" class="notice existing-itinerary-choice hidden" role="group" aria-labelledby="existing-itinerary-label">
+                        <p id="existing-itinerary-label">检测到未完成行程，请选择后续操作</p>
+                        <div class="existing-itinerary-actions">
+                            <button id="continue-existing-itinerary" class="btn btn-primary" type="button">继续已有行程</button>
+                            <button id="abandon-existing-itinerary" class="btn btn-danger" type="button">放弃并重新规划</button>
+                        </div>
+                    </div>
                     <button id="submit-plan" class="btn btn-primary" type="submit">生成路线</button>
                 </form>
             </section>

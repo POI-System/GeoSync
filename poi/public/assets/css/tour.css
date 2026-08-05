@@ -30,14 +30,14 @@
 
 .brand-block h1 {
     margin: 0;
-    font-size: 18px;
+    font-size: 1.125rem;
     line-height: 1.2;
 }
 
 .brand-block p {
     margin: 3px 0 0;
     color: var(--color-muted);
-    font-size: 12px;
+    font-size: 0.75rem;
 }
 
 .brand-block .mock-mode {
@@ -75,7 +75,7 @@
 .map-notice-stack {
     position: absolute;
     z-index: 18;
-    top: 120px;
+    top: calc(var(--tour-header-bottom, 108px) + 12px);
     left: 50%;
     display: grid;
     width: min(520px, calc(100% - 32px));
@@ -138,7 +138,7 @@
     border: 1px solid rgba(255, 255, 255, 0.6);
     border-radius: var(--radius-sm);
     background: rgba(255, 255, 255, 0.95);
-    font-size: 12px;
+    font-size: 0.75rem;
 }
 
 .map-stage[data-list-only="true"] .crowd-legend {
@@ -204,7 +204,7 @@
 .panel-header h2,
 .panel h2 {
     margin: 0;
-    font-size: 20px;
+    font-size: 1.25rem;
     line-height: 1.3;
 }
 
@@ -247,13 +247,13 @@
 }
 
 .metric strong {
-    font-size: 18px;
+    font-size: 1.125rem;
 }
 
 .metric span {
     margin-top: 3px;
     color: var(--color-muted);
-    font-size: 12px;
+    font-size: 0.75rem;
 }
 
 .poi-list,
@@ -293,12 +293,27 @@
     display: block;
     margin-top: 3px;
     color: var(--color-muted);
-    font-size: 13px;
+    font-size: 0.8125rem;
 }
 
 .form-grid {
     display: grid;
     gap: 16px;
+}
+
+.existing-itinerary-choice p {
+    margin: 0;
+}
+
+.existing-itinerary-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.existing-itinerary-actions .btn {
+    flex: 1 1 152px;
 }
 
 .field-group {
@@ -396,7 +411,7 @@ input[type="range"] {
     border-radius: var(--radius-sm);
     background: #edf2f0;
     color: var(--color-muted);
-    font-size: 12px;
+    font-size: 0.75rem;
     font-weight: 700;
 }
 
@@ -439,7 +454,7 @@ input[type="range"] {
 
 .proposal-route-diff h3 {
     margin: 0 0 7px;
-    font-size: 14px;
+    font-size: 0.875rem;
     line-height: 1.35;
 }
 
@@ -447,7 +462,7 @@ input[type="range"] {
     margin: 0;
     padding-left: 22px;
     color: var(--color-muted);
-    font-size: 13px;
+    font-size: 0.8125rem;
     line-height: 1.45;
 }
 
@@ -540,6 +555,13 @@ input[type="range"] {
     bottom: calc(38% + 12px);
 }
 
+#tour-map .maplibregl-ctrl-group button {
+    width: var(--touch-size);
+    min-width: var(--touch-size);
+    height: var(--touch-size);
+    min-height: var(--touch-size);
+}
+
 @media (min-width: 1024px) {
     #tour-map {
         inset: 0 420px 0 0;
@@ -603,6 +625,13 @@ input[type="range"] {
 }
 
 @media (max-width: 430px) {
+    .rain-banner,
+    .road-banner,
+    .connection-banner {
+        width: calc(100% - 44vw);
+        justify-self: start;
+    }
+
     .brand-block #scenic-name,
     .status-detail {
         display: none;

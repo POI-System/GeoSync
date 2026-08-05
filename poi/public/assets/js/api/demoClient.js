@@ -8,13 +8,17 @@ const SCENARIO_STATUS = Object.freeze({
     1203: 409,
     1204: 400,
     1205: 400,
+    1206: 400,
     8201: 503,
-    8202: 503,
-    8204: 400
+    8202: 504,
+    8203: 422,
+    8204: 422,
+    8205: 409,
+    8206: 502
 });
 
 function scenarioOperation(code) {
-    if ([8201, 8202, 8204].includes(Number(code))) return 'plan';
+    if ([1206, 8201, 8202, 8203, 8204, 8205, 8206].includes(Number(code))) return 'plan';
     if ([1204, 1205].includes(Number(code))) return 'proposal';
     if (Number(code) === 1203) return 'write';
     if ([2102, 2103].includes(Number(code))) return 'position';
@@ -100,7 +104,7 @@ export class DemoApiClient {
             category,
             httpStatus: status,
             code,
-            retryable: status >= 500
+            retryable: status >= 500 && code !== 8206
         });
     }
 
@@ -297,6 +301,8 @@ export class DemoApiClient {
     resumeItinerary(id, version) { return this.resume(id, version); }
     finish(id, version) { return this.transition(id, version, 'completed'); }
     endItinerary(id, version) { return this.finish(id, version); }
+    abandon(id, version) { return this.transition(id, version, 'abandoned'); }
+    abandonItinerary(id, version) { return this.abandon(id, version); }
 
     skip(id, stopId, version) {
         return this.run('itinerary-write', () => {

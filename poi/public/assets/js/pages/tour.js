@@ -11,7 +11,7 @@ import {
     formatRouteMode
 } from '../shared/formatters.js';
 import { formatProposalCountdown, proposalRemainingMs } from '../state/proposalClock.js';
-import { TourStore } from '../state/tourStore.js';
+import { panelForItinerary, TourStore } from '../state/tourStore.js';
 
 const params = new URLSearchParams(window.location.search);
 const demo = params.get('demo') === '1';
@@ -51,10 +51,14 @@ let currentRecoveryAttempt = 0;
 let currentRecoveryInFlight = null;
 let currentReadGeneration = 0;
 let itineraryMutationRevision = 0;
+let pendingPlanPayload = null;
+let headerResizeObserver = null;
+let headerMeasureTimer = null;
 
 const byId = id => document.getElementById(id);
 const elements = {
     app: byId('tour-app'),
+    appHeader: document.querySelector('.app-header'),
     mockMode: byId('mock-mode'),
     activePanel: byId('active-panel'),
     mapStage: byId('map-stage'),
@@ -81,10 +85,15 @@ const elements = {
     crowdUpdated: byId('crowd-updated'),
     activeState: byId('active-state'),
     poiList: byId('poi-list'),
+    openPlan: byId('open-plan'),
+    openSpots: byId('open-spots'),
     planForm: byId('plan-form'),
     hoursRange: byId('hours-range'),
     hoursOutput: byId('hours-output'),
     planMessage: byId('plan-message'),
+    existingItineraryChoice: byId('existing-itinerary-choice'),
+    continueExistingItinerary: byId('continue-existing-itinerary'),
+    abandonExistingItinerary: byId('abandon-existing-itinerary'),
     planStartSource: byId('plan-start-source'),
     submitPlan: byId('submit-plan'),
     previewNote: byId('preview-note'),
@@ -434,6 +443,23 @@ function renderProposal(state) {
     startProposalTimer(proposal);
 }
 
+function syncHeaderInset() {
+    const appTop = elements.app.getBoundingClientRect().top;
+    const headerBottom = elements.appHeader.getBoundingClientRect().bottom - appTop;
+    elements.app.style.setProperty('--tour-header-bottom', `${Math.max(0, Math.ceil(headerBottom))}px`);
+}
+
+function initHeaderInset() {
+    syncHeaderInset();
+    if (typeof ResizeObserver === 'function') {
+        headerResizeObserver = new ResizeObserver(syncHeaderInset);
+        headerResizeObserver.observe(elements.appHeader);
+    } else {
+        headerMeasureTimer = setInterval(syncHeaderInset, 1000);
+    }
+    listen(window, 'resize', syncHeaderInset);
+}
+
 function renderProposalStops(container, poiIds, state) {
     const stopNames = new Map((state.itinerary?.stops || []).map(stop => [
         String(stop.poiId),
@@ -562,19 +588,20 @@ function render(state) {
         : lastLocation?.lowAccuracy
             ? '起点：景区入口；当前定位精度不足 100 米要求'
             : '起点：景区入口；定位将在开始游览后申请');
-    const busy = Boolean(state.busyAction);
+    const busy = state.boot === 'loading' || Boolean(state.busyAction);
     const proposalExpired = Boolean(state.pendingProposal) && !proposalRemainingMs(state.pendingProposal.expireAt);
-    for (const button of [elements.submitPlan, elements.startTour, elements.pauseTour, elements.resumeTour, elements.skipStop, elements.finishTour, elements.acceptProposal, elements.rejectProposal]) {
+    for (const button of [elements.openPlan, elements.openSpots, elements.submitPlan, elements.continueExistingItinerary, elements.abandonExistingItinerary, elements.startTour, elements.pauseTour, elements.resumeTour, elements.skipStop, elements.finishTour, elements.acceptProposal, elements.rejectProposal]) {
         if (button) {
             const proposalAction = button === elements.acceptProposal || button === elements.rejectProposal;
             button.disabled = busy || (proposalAction && proposalExpired);
         }
     }
-    elements.app.setAttribute('aria-busy', String(state.boot === 'loading' || busy));
+    elements.app.setAttribute('aria-busy', String(state.boot === 'loading'));
     elements.app.dataset.apiState = state.apiState;
     elements.app.dataset.itineraryVersion = state.itinerary?.version ?? '';
     elements.app.dataset.itineraryState = state.itinerary?.state || '';
     syncHash(state.activePanel, state.selectedSpotId);
+    syncHeaderInset();
 }
 
 function syncHash(panel, selectedSpotId) {
@@ -592,10 +619,17 @@ function panelFromHash() {
 
 function navigate(panel, patch = {}) {
     const currentPanel = store.getState().activePanel;
+    if (currentPanel === 'plan' && panel !== 'plan' && store.getState().busyAction === 'plan-replace') {
+        showToast('正在放弃旧行程并重新规划，请稍候');
+        syncHash('plan', store.getState().selectedSpotId);
+        return;
+    }
     if (currentPanel === 'plan' && panel !== 'plan') {
         planRequestGeneration += 1;
         api.cancel?.('plan');
         elements.planMessage.classList.add('hidden');
+        elements.existingItineraryChoice.classList.add('hidden');
+        pendingPlanPayload = null;
         if (store.getState().busyAction === 'plan') store.set({ busyAction: null }, 'plan:cancelled');
     }
     if (currentPanel === 'spot' && panel !== 'spot') {
@@ -722,7 +756,14 @@ function updateMap(state, reason = 'state', previous = null, { force = false } =
         if (force || state.pois !== previous?.pois) {
             mapFacade.setPois(poisToGeoJson(state.pois));
         }
-        if (force || state.heatmap !== previous?.heatmap || state.heatmapMeta !== previous?.heatmapMeta) {
+        if (!force && reason === 'crowd:update' && state.heatmap !== previous?.heatmap) {
+            const changed = state.heatmap.find(item => {
+                const prior = previous?.heatmap?.find(candidate => String(candidate.poiId) === String(item.poiId));
+                return !prior || prior !== item;
+            });
+            if (changed) mapFacade.setCrowd(changed);
+            else mapFacade.setCrowd({ items: state.heatmap, lowConfidence: Boolean(state.heatmapMeta?.lowConfidence) });
+        } else if (force || state.heatmap !== previous?.heatmap || state.heatmapMeta !== previous?.heatmapMeta) {
             mapFacade.setCrowd({
                 items: state.heatmap,
                 lowConfidence: Boolean(state.heatmapMeta?.lowConfidence),
@@ -1106,8 +1147,11 @@ async function submitPlan(event) {
     };
     if (Array.isArray(currentStart)) payload.startLocation = currentStart;
     const requestGeneration = ++planRequestGeneration;
+    pendingPlanPayload = null;
     store.set({ busyAction: 'plan', lastError: null }, 'plan:start');
     elements.planMessage.classList.add('hidden');
+    elements.planMessage.classList.remove('error');
+    elements.existingItineraryChoice.classList.add('hidden');
     const slowTimer = setTimeout(() => {
         setText(elements.planMessage, '仍在规划，请稍候…');
         elements.planMessage.classList.remove('hidden');
@@ -1120,8 +1164,18 @@ async function submitPlan(event) {
     } catch (error) {
         if (requestGeneration !== planRequestGeneration || error.category === 'cancelled') return;
         if (error.code === 1206) {
-            const existing = await refreshCurrent();
-            showToast(existing ? '已恢复未完成行程' : error.message);
+            const existing = await refreshCurrent({ navigate: false });
+            if (requestGeneration !== planRequestGeneration || store.getState().activePanel !== 'plan') return;
+            if (existing) {
+                pendingPlanPayload = payload;
+                setText(elements.planMessage, '已有未完成行程，请继续原行程或放弃后重新规划');
+                elements.planMessage.classList.remove('hidden');
+                elements.existingItineraryChoice.classList.remove('hidden');
+                queueMicrotask(() => elements.continueExistingItinerary.focus({ preventScroll: true }));
+            } else {
+                setText(elements.planMessage, error.message);
+                elements.planMessage.classList.remove('hidden');
+            }
         } else {
             const message = error.code === 8204 ? '没有已验证的无障碍路线，请关闭无障碍模式后主动重试' : error.message;
             setText(elements.planMessage, message);
@@ -1133,6 +1187,55 @@ async function submitPlan(event) {
         clearTimeout(slowTimer);
         if (requestGeneration === planRequestGeneration && store.getState().busyAction === 'plan') {
             store.set({ busyAction: null }, 'plan:end');
+        }
+    }
+}
+
+function continueExistingItinerary() {
+    const existing = store.getState().itinerary;
+    if (!existing || store.getState().busyAction) return;
+    pendingPlanPayload = null;
+    elements.existingItineraryChoice.classList.add('hidden');
+    const resumed = store.replaceItinerary(existing, { navigate: false });
+    navigate(resumed.pendingProposal
+        ? 'proposal'
+        : panelForItinerary(existing, { handledProposalIds: resumed.handledProposalIds }));
+    announce('已继续未完成行程');
+}
+
+async function abandonExistingAndReplan() {
+    const existing = store.getState().itinerary;
+    const payload = pendingPlanPayload;
+    if (!existing || !payload || store.getState().busyAction) return;
+    const requestGeneration = ++planRequestGeneration;
+    store.set({ busyAction: 'plan-replace', lastError: null }, 'plan:replace:start');
+    setText(elements.planMessage, '正在放弃旧行程并重新规划…');
+    elements.planMessage.classList.remove('hidden', 'error');
+    try {
+        const abandoned = await api.abandonItinerary(existing.itineraryId, existing.version);
+        if (requestGeneration !== planRequestGeneration || store.getState().activePanel !== 'plan') return;
+        replaceItineraryAfterMutation(abandoned, { navigate: false });
+        pendingPlanPayload = null;
+        elements.existingItineraryChoice.classList.add('hidden');
+        const planned = await api.planItinerary(payload);
+        if (requestGeneration !== planRequestGeneration || store.getState().activePanel !== 'plan') return;
+        replaceItineraryAfterMutation(planned);
+        announce('旧行程已放弃，新路线规划完成');
+    } catch (error) {
+        if (requestGeneration !== planRequestGeneration || error.category === 'cancelled') return;
+        if (Number(error.code) === 1203) {
+            pendingPlanPayload = null;
+            elements.existingItineraryChoice.classList.add('hidden');
+            await handleWriteError(error);
+        } else {
+            setText(elements.planMessage, error.message);
+            elements.planMessage.classList.remove('hidden');
+            elements.planMessage.classList.add('error');
+            store.fail(error);
+        }
+    } finally {
+        if (requestGeneration === planRequestGeneration && store.getState().busyAction === 'plan-replace') {
+            store.set({ busyAction: null }, 'plan:replace:end');
         }
     }
 }
@@ -1313,6 +1416,7 @@ async function selectPhotoSpot(spotId) {
         ? golden.windows.map(item => `${item.start}–${item.end}（${item.light || '推荐光线'}）`).join('，')
         : golden?.cloudy ? '天气条件不适合固定光位' : '今日无可用光位窗口';
     parts.push(createNotice(`今日窗口：${windowText}`));
+    if (golden && golden.weatherAdjusted === false) parts.push(createNotice('未含天气修正'));
     const heat = store.getState().heatmap.find(item => String(item.poiId) === String(spot.poiId));
     const ciNow = heat?.ci ?? ar?.ciNow ?? spot.ciNow;
     const lowConfidence = Boolean(store.getState().heatmapMeta?.lowConfidence || heat?.lowConfidence);
@@ -1337,8 +1441,17 @@ function createNotice(text) {
 
 function configureSceneButton() {
     const config = store.getState().config;
-    const sceneUrl = String(config?.gis?.publicServices?.scene || '').trim();
-    const enabled = Boolean((config?.features?.threeD || config?.gis?.features?.threeD) && sceneUrl);
+    const rawSceneUrl = String(config?.gis?.publicServices?.scene || '').trim();
+    let sceneUrl = '';
+    try {
+        const parsed = rawSceneUrl ? new URL(rawSceneUrl, window.location.origin) : null;
+        if (parsed && ['http:', 'https:'].includes(parsed.protocol) && !parsed.username && !parsed.password) {
+            sceneUrl = parsed.href;
+        }
+    } catch (error) {
+        void error;
+    }
+    const enabled = Boolean(config?.features?.threeD && sceneUrl);
     elements.openScene.disabled = !enabled;
     elements.openScene.setAttribute('aria-disabled', String(!enabled));
     setText(elements.openScene, enabled ? '打开三维场景' : '三维场景不可用');
@@ -1387,11 +1500,13 @@ function bindUi() {
             enterMapFallback(new MapFacadeError(event.detail.code, event.detail.message));
         }
     });
-    listen(byId('open-plan'), 'click', () => navigate('plan'));
-    listen(byId('open-spots'), 'click', () => void openPhotoSpots());
+    listen(elements.openPlan, 'click', () => navigate('plan'));
+    listen(elements.openSpots, 'click', () => void openPhotoSpots());
     document.querySelectorAll('[data-back]').forEach(button => listen(button, 'click', () => navigate(button.dataset.back)));
     listen(elements.hoursRange, 'input', () => setText(elements.hoursOutput, `${elements.hoursRange.value} 小时`));
     listen(elements.planForm, 'submit', submitPlan);
+    listen(elements.continueExistingItinerary, 'click', continueExistingItinerary);
+    listen(elements.abandonExistingItinerary, 'click', () => void abandonExistingAndReplan());
     listen(elements.startTour, 'click', () => void startTour());
     listen(elements.pauseTour, 'click', () => void itineraryAction('pause'));
     listen(elements.resumeTour, 'click', () => void itineraryAction('resume'));
@@ -1462,6 +1577,7 @@ async function boot() {
     if (bootStarted) return;
     bootStarted = true;
     bindUi();
+    initHeaderInset();
     initLocation();
     unsubscribeStore = store.subscribe((state, detail) => {
         if (pageDestroyed) return;
@@ -1563,6 +1679,10 @@ async function boot() {
 function destroyPage() {
     if (pageDestroyed) return;
     pageDestroyed = true;
+    headerResizeObserver?.disconnect();
+    headerResizeObserver = null;
+    clearInterval(headerMeasureTimer);
+    headerMeasureTimer = null;
     planRequestGeneration += 1;
     currentReadGeneration += 1;
     currentRecoveryPending = false;

@@ -646,10 +646,7 @@ export class MapFacade extends EventTarget {
         const detail = {
             distanceDeltaM: distanceDeltaM ?? null,
             durationDeltaSec: durationDeltaSec ?? null,
-            reason: afterRoute?.reason || afterRoute?.diff?.reason || '',
-            degraded: Boolean(beforePresentation.degraded || afterPresentation.degraded),
-            beforeSource: beforePresentation.source,
-            afterSource: afterPresentation.source
+            reason: afterRoute?.reason || afterRoute?.diff?.reason || ''
         };
         dispatchDetail(this, MAP_EVENT_NAMES.ROUTE_COMPARED, detail);
         return detail;

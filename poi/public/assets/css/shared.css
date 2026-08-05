@@ -134,7 +134,7 @@ button:disabled {
     border-radius: 999px;
     background: rgba(255, 255, 255, 0.94);
     color: var(--color-ink);
-    font-size: 12px;
+    font-size: 0.75rem;
     font-weight: 700;
     white-space: nowrap;
 }

@@ -43,8 +43,9 @@ function requestBody(body) {
 }
 
 function retryableFailure(status, code) {
+    if ([8203, 8204, 8205, 8206].includes(Number(code))) return false;
     return status === 408 || status === 425 || status === 429 || status >= 500
-        || [8201, 8202, 8205].includes(Number(code));
+        || [8201, 8202].includes(Number(code));
 }
 
 function requestIdOf(response, payload) {
@@ -275,6 +276,8 @@ export class ApiClient {
     resumeItinerary(id, version) { return this.resume(id, version); }
     finish(id, version) { return this.writeItinerary(id, 'finish', { version }); }
     endItinerary(id, version) { return this.finish(id, version); }
+    abandon(id, version) { return this.writeItinerary(id, 'abandon', { version }); }
+    abandonItinerary(id, version) { return this.abandon(id, version); }
     skip(id, stopId, version) {
         return this.request(ENDPOINTS.skipStop(id, stopId), {
             method: 'POST', body: { version }, key: 'itinerary-write'
