@@ -61,10 +61,7 @@ map.addEventListener('route:compared', ({ detail }) => {
     const {
         distanceDeltaM,
         durationDeltaSec,
-        reason,
-        degraded,
-        beforeSource,
-        afterSource
+        reason
     } = detail;
 });
 
@@ -115,7 +112,7 @@ POI 的地图内部格式是 GeoJSON Point FeatureCollection，唯一键为 `pro
 - `getClientConfig()`、`getPois()`、`getCurrentItinerary()`、`getItinerary(id)`、`getHeatmap()`
 - `getPhotoSpots()`、`getGoldenWindow()`、`getArData()`
 - `planItinerary()`、`startItinerary()`、`pauseItinerary()`、`resumeItinerary()`
-- `skipStop()`、`endItinerary()`、`acceptProposal()`、`rejectProposal()`
+- `skipStop()`、`endItinerary()`、`abandonItinerary()`、`acceptProposal()`、`rejectProposal()`
 - `reportPosition()`、`cancel(key)`、`cancelAll()`、`destroy()`
 
 所有行程写方法都携带服务端 version。返回完整行程后，调用方必须整体替换 Store；不得在前端修改站点、ETA 或 version。Socket 只触发 REST 校准。`rejectProposal()` 已在 Client 内兼容后端仅返回 `{version}` 的现状，会再读取 `/current`。

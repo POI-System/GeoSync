@@ -3,7 +3,7 @@
 ## 运行
 
 ```powershell
-Set-Location -LiteralPath 'D:\poi项目-pr2-review\poi'
+Set-Location -LiteralPath 'D:\spmap\GeoSync\poi'
 npm.cmd install
 npm.cmd run vendor:sync
 npm.cmd start
@@ -15,7 +15,11 @@ npm.cmd start
 node test/tour/server.js
 ```
 
-然后打开 `http://127.0.0.1:4177/tour?demo=1`。Mock 只在显式 `demo=1` 时启用，不会成为生产降级路径。
+然后打开 `http://127.0.0.1:4177/tour?demo=1`。Mock 演示使用无敏感信息的本地夹具，无需演示账号。Mock 只在显式 `demo=1` 时启用，不会成为生产降级路径；正式环境使用现场微信会话，不在仓库中保存共享账号或真实 openId。
+
+## 契约基线
+
+游客端以冲刺文档 09～14 和当前服务端标准响应包为准。早期 03/04/06 文档中冲突的高德地图、`localStorage` openId、`X-Open-Id` 生产鉴权和 `itinerary:updated` 已被 SuperMap、同源签名会话及 `itinerary:progress` 取代。页面流程与降级原则仍继续适用。
 
 ## 身份与配置
 
@@ -23,6 +27,7 @@ node test/tour/server.js
 - `X-Open-Id` 只在 localhost 且 URL 显式包含 `legacyAuth=1` 时发送。
 - 地图从 `/api/geosync/client-config` 读取 `gis.center`、`gis.extent`、`gis.crs` 和 `gis.publicServices.map`。
 - 三维入口只在 `features.threeD=true` 且 `gis.publicServices.scene` 存在时启用。
+- 三维 scene 必须能解析为无用户名和密码的 HTTP(S) URL；空值或其他协议直接显示不可用。
 - 不把 `.env`、真实 openId、位置数据、iServer 账号或 SuperMap 激活文件放入前端目录。
 
 ## 页面流程
@@ -45,7 +50,7 @@ home -> plan -> preview -> touring -> proposal -> completed
 对外事件：
 
 - `poi:selected`：`{ poiId, feature }`
-- `route:compared`：`{ distanceDeltaM, durationDeltaSec, reason, degraded, beforeSource, afterSource }`
+- `route:compared`：`{ distanceDeltaM, durationDeltaSec, reason }`
 - `map:error`：`{ code, message }`
 
 初始化失败同时抛出 `MapFacadeError`，其 `code` 为 `MAP_SDK_LOAD_FAILED`、`MAP_SERVICE_UNAVAILABLE` 或 `MAP_CONFIG_INVALID`。
@@ -62,7 +67,12 @@ home -> plan -> preview -> touring -> proposal -> completed
 | 2103 | 显示定位精度过差；该样本不计为服务端已接受 |
 | 1203 | 关闭过期本地状态并重新拉取 current |
 | 1204/1205 | 关闭失效提案并刷新行程 |
+| 1206 | 显示“继续已有行程 / 放弃并重新规划”，放弃操作携带当前 version |
+| 8201/8202 | 显示路径服务不可用或超时，不生成半成品行程 |
+| 8203 | 提示调整起点或联系运营人员 |
 | 8204 | 提示无已验证无障碍路线，由用户主动切换模式 |
+| 8205 | 阻止继续规划并提示刷新服务配置 |
+| 8206 | 不显示错误折线，提示路线几何无效 |
 
 ## 验证
 
@@ -78,7 +88,7 @@ npm.cmd test
 
 正式截图位于 `docs/screenshots/`。其中视口矩阵在 375×812、390×844、768×1024、1366×768 下分别覆盖首页、规划、预览、地图失败列表模式、Socket 断线、定位拒绝、提案、200% 字体和安全区，共 36 张；另有 7 张主流程截图，共 43 张。
 
-2026-08-05 最终本地验证结果为：游客端 Playwright `44/44`、纯函数 `17/17`、后端测试 `493/493`，游客端语法检查 29 个文件通过，后端语法检查与离线资源扫描通过。Playwright 同时覆盖非 Demo 生产 REST 提案、current 首次失败退避、重连后迟到轮询失效、页面销毁后的迟到响应和缺失路线指标降级。时限断言只证明本地 Mock 演示链路满足首个可交互地图小于 3 秒、封路通知到提案小于 5 秒、接受提案后完整状态替换小于 2 秒；它不能替代真实 iServer、真实 Socket 和微信 H5 环境的性能验收。逐项证据与未签字项见 `TOUR_ACCEPTANCE_EVIDENCE.md`。
+2026-08-05 最终本地验证结果为：游客端 Playwright `59/59`、纯函数 `17/17`、后端测试 `493/493`，游客端语法检查 29 个文件通过，后端语法检查与离线资源扫描通过。Playwright 同时覆盖非 Demo 生产 REST 提案、1206 继续/放弃重规划及两步操作的失败/冲突边界、8201～8206、Socket 重连后的 config/current/heatmap 校准、公共 MapFacade 方法、current 首次失败退避、重连后迟到轮询失效、页面销毁后的迟到响应、200% 根字号和缺失路线指标降级。微信 UA 与触摸测试为 Chromium 仿真，不替代微信、iOS 或 Android 实机验收。正式截图固定浏览器时间并等待地图相机动画完成，连续产图后的 43 张 PNG 内容哈希不变。时限断言只证明本地 Mock 演示链路满足首个可交互地图小于 3 秒、封路通知到提案小于 5 秒、接受提案后完整状态替换小于 2 秒；它不能替代真实 iServer、真实 Socket 和微信 H5 环境的性能验收。逐项证据与未签字项见 `TOUR_ACCEPTANCE_EVIDENCE.md`。
 
 ## 当前上游契约差异
 
