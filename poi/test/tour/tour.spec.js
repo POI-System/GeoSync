@@ -6,17 +6,32 @@ const { test, expect } = require('@playwright/test');
 
 const screenshotDir = path.resolve(__dirname, '..', '..', 'docs', 'screenshots');
 fs.mkdirSync(screenshotDir, { recursive: true });
+const EVIDENCE_NOW = Date.parse('2026-08-05T08:00:00.000Z');
+
+async function installEvidenceClock(page) {
+    await page.addInitScript(now => { Date.now = () => now; }, EVIDENCE_NOW);
+}
+
+async function captureEvidence(page, filename) {
+    await page.waitForTimeout(750);
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    await page.screenshot({ path: path.join(screenshotDir, filename), fullPage: true, animations: 'disabled' });
+}
+
+test.beforeEach(async ({ page }) => {
+    await installEvidenceClock(page);
+});
 
 test('completes plan, start, reroute acceptance, and refresh recovery', async ({ page }) => {
     const consoleErrors = [];
     page.on('console', message => {
         if (message.type() === 'error') consoleErrors.push(message.text());
     });
-    const mapStartedAt = Date.now();
+    const mapStartedAt = performance.now();
     await page.goto('/tour?demo=1');
     await expect(page.locator('#map-status-dot')).toHaveAttribute('data-state', 'online');
     await expect(page.locator('#tour-map canvas')).toBeVisible();
-    expect(Date.now() - mapStartedAt).toBeLessThan(3000);
+    expect(performance.now() - mapStartedAt).toBeLessThan(3000);
 
     await page.getByRole('button', { name: '帮我规划' }).click();
     await page.locator('#hours-range').fill('4');
@@ -24,24 +39,24 @@ test('completes plan, start, reroute acceptance, and refresh recovery', async ({
     await expect(page.getByRole('heading', { name: '路线预览' })).toBeVisible();
     await expect(page.locator('#preview-badges').getByText('遮荫模式')).toBeVisible();
     await expect(page.locator('#tour-app')).toHaveAttribute('data-itinerary-version', '0');
-    await page.screenshot({ path: path.join(screenshotDir, 'tour-route-preview.png'), fullPage: true });
+    await captureEvidence(page, 'tour-route-preview.png');
 
-    const proposalStartedAt = Date.now();
+    const proposalStartedAt = performance.now();
     await page.getByRole('button', { name: '开始游览' }).click();
     await expect(page.getByRole('heading', { name: /游览/ })).toBeVisible();
     await expect(page.locator('#tour-app')).toHaveAttribute('data-itinerary-version', '1');
     await expect(page.getByText(/检测到临时封路/)).toBeVisible({ timeout: 3000 });
     await expect(page.getByRole('heading', { name: '路线调整建议' })).toBeVisible({ timeout: 6000 });
-    expect(Date.now() - proposalStartedAt).toBeLessThan(5000);
+    expect(performance.now() - proposalStartedAt).toBeLessThan(5000);
     await expect(page.locator('#proposal-reason')).toContainText('道路临时关闭');
     await expect(page.getByText(/新旧路线已标注/)).toBeVisible();
-    await page.screenshot({ path: path.join(screenshotDir, 'tour-reroute-proposal.png'), fullPage: true });
+    await captureEvidence(page, 'tour-reroute-proposal.png');
 
-    const acceptedAt = Date.now();
+    const acceptedAt = performance.now();
     await page.getByRole('button', { name: '接受新路线' }).click();
     await expect(page.getByRole('heading', { name: '游览中' })).toBeVisible();
     await expect(page.locator('#tour-app')).toHaveAttribute('data-itinerary-version', '2');
-    expect(Date.now() - acceptedAt).toBeLessThan(2000);
+    expect(performance.now() - acceptedAt).toBeLessThan(2000);
 
     await page.reload();
     await expect(page.getByRole('heading', { name: '游览中' })).toBeVisible();
@@ -55,11 +70,50 @@ test('renders photo spot detail and gated 3D entry', async ({ page }) => {
     await expect(page.getByText('樱顶西望')).toBeVisible();
     await page.locator('.spot-row').filter({ hasText: '樱顶西望' }).getByRole('button', { name: '详情' }).click();
     await expect(page.getByText(/今日窗口：17:12/)).toBeVisible();
+    await expect(page.getByText('未含天气修正', { exact: true })).toBeVisible();
     await expect(page.getByText(/焦段建议：26mm/)).toBeVisible();
     await expect(page.getByText(/当前客流：较忙/)).toBeVisible();
     await expect(page.getByRole('button', { name: '打开三维场景' })).toBeEnabled();
-    await page.screenshot({ path: path.join(screenshotDir, 'tour-photo-spot.png'), fullPage: true });
+    await expect(page.locator('#toast')).toBeHidden();
+    await captureEvidence(page, 'tour-photo-spot.png');
 });
+
+for (const sceneCase of [
+    {
+        label: 'feature flag is disabled',
+        mutate(config) {
+            config.features.threeD = false;
+            config.gis.features.threeD = true;
+        }
+    },
+    {
+        label: 'scene URL is missing',
+        mutate(config) { delete config.gis.publicServices.scene; }
+    },
+    {
+        label: 'scene URL has an unsafe protocol',
+        mutate(config) { config.gis.publicServices.scene = 'javascript:alert(1)'; }
+    }
+]) {
+    test(`keeps the 3D entry unavailable when ${sceneCase.label}`, async ({ page }) => {
+        await page.route('**/assets/mock/client-config.json', async route => {
+            const response = await route.fetch();
+            const config = await response.json();
+            sceneCase.mutate(config);
+            await route.fulfill({
+                status: response.status(),
+                headers: response.headers(),
+                contentType: 'application/json',
+                body: JSON.stringify(config)
+            });
+        });
+        await page.goto('/tour?demo=1');
+        await page.getByRole('button', { name: '摄影机位' }).click();
+        await expect(page.locator('#spot-list .spot-row')).toHaveCount(2);
+        await expect(page.getByRole('button', { name: '三维场景不可用' })).toBeDisabled();
+        await expect(page.getByRole('button', { name: '三维场景不可用' })).toHaveAttribute('data-scene-url', '');
+    });
+}
 
 test('handles API errors, cancellation, empty crowd, 2102, and socket reconnect', async ({ page }) => {
     const errorCases = {
@@ -344,6 +398,7 @@ for (const viewport of [
     test(`fits viewport ${viewport.width}x${viewport.height} without overflow`, async ({ browser }) => {
         const context = await browser.newContext({ viewport });
         const page = await context.newPage();
+        await installEvidenceClock(page);
         await page.goto('/tour?demo=1');
         await expect(page.locator('#map-status-dot')).toHaveAttribute('data-state', 'online');
         const layout = await page.evaluate(() => ({
@@ -358,10 +413,7 @@ for (const viewport of [
         expect(layout.appHeight).toBeLessThanOrEqual(layout.viewportHeight + 1);
         expect(layout.canvasWidth).toBeGreaterThan(100);
         expect(layout.canvasHeight).toBeGreaterThan(100);
-        await page.screenshot({
-            path: path.join(screenshotDir, `tour-${viewport.width}x${viewport.height}.png`),
-            fullPage: true
-        });
+        await captureEvidence(page, `tour-${viewport.width}x${viewport.height}.png`);
         if (viewport.width === 390) {
             const scaled = await page.evaluate(() => {
                 document.documentElement.style.fontSize = '200%';

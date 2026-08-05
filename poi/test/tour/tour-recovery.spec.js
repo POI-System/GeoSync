@@ -108,7 +108,8 @@ async function installStableSocketTransport(page) {
                 };
                 socket.disconnect = () => {};
                 window.__tourSocketTest = {
-                    incoming(name, payload) { socket.incoming(name, payload); }
+                    incoming(name, payload) { socket.incoming(name, payload); },
+                    reconnect() { manager.incoming('reconnect'); }
                 };
                 setTimeout(() => socket.incoming('connect'), 10);
                 return socket;
@@ -175,6 +176,66 @@ test('treats an unauthenticated current request as reachable browse-only state',
     await expect(page.getByRole('heading', { name: '现在出发', exact: true })).toBeVisible();
 });
 
+test('refreshes config, current itinerary, and heatmap together after socket reconnect', async ({ page }) => {
+    const initialConfig = invalidMapConfig();
+    initialConfig.scenicName = '重连前景区';
+    const refreshedConfig = structuredClone(initialConfig);
+    refreshedConfig.scenicName = '重连后景区';
+    const refreshedItinerary = fixture('itinerary.json');
+    refreshedItinerary.itineraryId = 'reconnected-itinerary';
+    refreshedItinerary.state = 'draft';
+    refreshedItinerary.version = 6;
+    const counts = { config: 0, current: 0, heatmap: 0 };
+
+    await installStableSocketTransport(page);
+    await page.route('**/api/geosync/client-config', route => {
+        counts.config += 1;
+        return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: envelope(counts.config === 1 ? initialConfig : refreshedConfig)
+        });
+    });
+    await page.route('**/api/poi/all', route => route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: envelope(publicPois())
+    }));
+    await page.route('**/api/itinerary/current', route => {
+        counts.current += 1;
+        return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: envelope(counts.current === 1 ? null : refreshedItinerary)
+        });
+    });
+    await page.route('**/api/crowd/heatmap', route => {
+        counts.heatmap += 1;
+        return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: envelope(counts.heatmap === 1
+                ? { items: [], lowConfidence: false, generatedAt: '2026-08-05T00:00:00.000Z' }
+                : {
+                    items: [{ poiId: 'poi_photo', level: 'high', ci: 0.91 }],
+                    lowConfidence: true,
+                    generatedAt: '2026-08-05T00:01:00.000Z'
+                })
+        });
+    });
+
+    await page.goto('/tour');
+    await expect(page.locator('#socket-status-dot')).toHaveAttribute('data-state', 'connected');
+    await expect(page.locator('#scenic-name')).toHaveText('重连前景区');
+    await page.evaluate(() => window.__tourSocketTest.reconnect());
+
+    await expect(page.locator('#scenic-name')).toHaveText('重连后景区');
+    await expect(page.locator('#tour-app')).toHaveAttribute('data-itinerary-version', '6');
+    await expect(page.locator('#crowd-confidence')).toHaveText('参考人流');
+    await expect.poll(() => counts).toEqual({ config: 2, current: 2, heatmap: 2 });
+    await expect(page.locator('#live-region')).toHaveText('实时连接已恢复，配置、行程和客流已同步');
+});
+
 test('keeps the API offline when every fallback poll request fails', async ({ page }) => {
     await installUnavailableSocketTransport(page);
     await page.route(/^http:\/\/127\.0\.0\.1:4177\/api\//, route => route.fulfill({
@@ -235,6 +296,231 @@ test('does not let a delayed boot current response overwrite a newly planned iti
     await expect(page.getByRole('heading', { name: '路线预览', exact: true })).toBeVisible();
     await expect(page.locator('#tour-app')).toHaveAttribute('aria-busy', 'false');
     await expect(page.locator('#tour-app')).toHaveAttribute('data-itinerary-version', '4');
+});
+
+test('shows the three-second planning status and suppresses duplicate submission', async ({ page }) => {
+    const itinerary = fixture('itinerary.json');
+    itinerary.state = 'draft';
+    itinerary.version = 2;
+    let planRequests = 0;
+    await installStableSocketTransport(page);
+    await installBaseRoutes(page);
+    await page.route('**/api/itinerary/current', route => route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: envelope(null)
+    }));
+    await page.route('**/api/itinerary/plan', async route => {
+        planRequests += 1;
+        await new Promise(resolve => setTimeout(resolve, 3250));
+        await route.fulfill({ status: 200, contentType: 'application/json', body: envelope(itinerary) });
+    });
+
+    await page.goto('/tour');
+    await expect(page.locator('#tour-app')).toHaveAttribute('aria-busy', 'false');
+    await page.getByRole('button', { name: '帮我规划' }).click();
+    const disabledAfterFirst = await page.locator('#submit-plan').evaluate(button => {
+        button.click();
+        const disabled = button.disabled;
+        button.click();
+        return disabled;
+    });
+
+    expect(disabledAfterFirst).toBe(true);
+    await expect(page.locator('#tour-app')).toHaveAttribute('aria-busy', 'false');
+    await expect(page.locator('#plan-message')).toHaveText('仍在规划，请稍候…', { timeout: 5000 });
+    await expect(page.getByRole('heading', { name: '路线预览', exact: true })).toBeVisible();
+    expect(planRequests).toBe(1);
+});
+
+test('offers both 1206 recovery choices and replans only after versioned abandon', async ({ page }) => {
+    const existing = fixture('itinerary.json');
+    existing.itineraryId = 'existing-itinerary';
+    existing.state = 'draft';
+    existing.version = 3;
+    const routes = fixture('routes.json');
+    existing.route = routes.before;
+    existing.pendingProposal = {
+        proposalId: 'existing-proposal',
+        type: 'barrierReroute',
+        reason: '已有行程存在待处理改道',
+        expireAt: '2099-08-05T08:10:00.000Z',
+        distanceDeltaM: 120,
+        durationDeltaSec: 90,
+        beforeRoute: routes.before,
+        afterRoute: routes.after
+    };
+    const abandoned = { ...existing, pendingProposal: null, state: 'abandoned', version: 4 };
+    const replacement = fixture('itinerary.json');
+    replacement.itineraryId = 'replacement-itinerary';
+    replacement.state = 'draft';
+    replacement.version = 0;
+    let currentRequests = 0;
+    let planRequests = 0;
+    let abandonBody = null;
+    const planBodies = [];
+
+    await installStableSocketTransport(page);
+    await installBaseRoutes(page);
+    await page.route('**/api/itinerary/current', route => {
+        currentRequests += 1;
+        return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: envelope(currentRequests === 1 ? null : existing)
+        });
+    });
+    await page.route('**/api/itinerary/plan', route => {
+        planRequests += 1;
+        planBodies.push(route.request().postDataJSON());
+        if (planRequests < 3) {
+            return route.fulfill({
+                status: 400,
+                contentType: 'application/json',
+                body: JSON.stringify({
+                    success: false,
+                    code: 1206,
+                    data: { existingId: existing.itineraryId },
+                    message: 'private existing itinerary detail'
+                })
+            });
+        }
+        return route.fulfill({ status: 200, contentType: 'application/json', body: envelope(replacement) });
+    });
+    await page.route('**/api/itinerary/existing-itinerary/abandon', route => {
+        abandonBody = route.request().postDataJSON();
+        return route.fulfill({ status: 200, contentType: 'application/json', body: envelope(abandoned) });
+    });
+
+    await page.goto('/tour');
+    await expect(page.locator('#tour-app')).toHaveAttribute('aria-busy', 'false');
+    await page.getByRole('button', { name: '帮我规划' }).click();
+    await page.getByRole('button', { name: '生成路线' }).click();
+    await expect(page.locator('#plan-message')).toHaveText('已有未完成行程，请继续原行程或放弃后重新规划');
+    await expect(page.getByRole('button', { name: '继续已有行程' })).toBeFocused();
+
+    await page.getByRole('button', { name: '继续已有行程' }).click();
+    await expect(page.getByRole('heading', { name: '路线调整建议', exact: true })).toBeVisible();
+    await expect(page.locator('#tour-app')).toHaveAttribute('data-itinerary-version', '3');
+
+    await page.evaluate(() => { window.location.hash = '#plan'; });
+    await expect(page.getByRole('heading', { name: '规划行程', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: '生成路线' }).click();
+    await expect(page.getByRole('button', { name: '放弃并重新规划' })).toBeVisible();
+    await page.getByRole('button', { name: '放弃并重新规划' }).click();
+
+    await expect(page.getByRole('heading', { name: '路线预览', exact: true })).toBeVisible();
+    await expect(page.locator('#tour-app')).toHaveAttribute('data-itinerary-version', '0');
+    expect(planRequests).toBe(3);
+    expect(abandonBody).toEqual({ version: 3 });
+    expect(planBodies[2]).toEqual(expect.objectContaining({
+        hours: 4,
+        interests: ['photography'],
+        pace: 'normal',
+        accessible: false,
+        shadeFirst: true
+    }));
+});
+
+test('keeps the abandoned server state when replacement planning fails and allows a clean retry', async ({ page }) => {
+    const existing = fixture('itinerary.json');
+    existing.itineraryId = 'replace-failure-existing';
+    existing.state = 'draft';
+    existing.version = 7;
+    const abandoned = { ...existing, state: 'abandoned', version: 8, pendingProposal: null };
+    const replacement = { ...fixture('itinerary.json'), itineraryId: 'replace-failure-new', state: 'draft', version: 0 };
+    let currentRequests = 0;
+    let planRequests = 0;
+    let abandonRequests = 0;
+
+    await installStableSocketTransport(page);
+    await installBaseRoutes(page);
+    await page.route('**/api/itinerary/current', route => {
+        currentRequests += 1;
+        return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: envelope(currentRequests === 1 ? null : existing)
+        });
+    });
+    await page.route('**/api/itinerary/plan', route => {
+        planRequests += 1;
+        if (planRequests === 1) {
+            return route.fulfill({
+                status: 400,
+                contentType: 'application/json',
+                body: JSON.stringify({ success: false, code: 1206, data: null, message: 'private detail' })
+            });
+        }
+        if (planRequests === 2) {
+            return route.fulfill({
+                status: 503,
+                contentType: 'application/json',
+                body: JSON.stringify({ success: false, code: 9001, data: null, message: 'private detail' })
+            });
+        }
+        return route.fulfill({ status: 200, contentType: 'application/json', body: envelope(replacement) });
+    });
+    await page.route('**/api/itinerary/replace-failure-existing/abandon', route => {
+        abandonRequests += 1;
+        return route.fulfill({ status: 200, contentType: 'application/json', body: envelope(abandoned) });
+    });
+
+    await page.goto('/tour');
+    await expect(page.locator('#tour-app')).toHaveAttribute('aria-busy', 'false');
+    await page.getByRole('button', { name: '帮我规划' }).click();
+    await page.getByRole('button', { name: '生成路线' }).click();
+    await page.getByRole('button', { name: '放弃并重新规划' }).click();
+
+    await expect(page.locator('#plan-message')).toHaveText('服务暂时不可用，请稍后重试');
+    await expect(page.locator('#existing-itinerary-choice')).toBeHidden();
+    await expect(page.locator('#tour-app')).toHaveAttribute('data-itinerary-state', 'abandoned');
+    await expect(page.locator('#tour-app')).toHaveAttribute('data-itinerary-version', '8');
+
+    await page.getByRole('button', { name: '生成路线' }).click();
+    await expect(page.getByRole('heading', { name: '路线预览', exact: true })).toBeVisible();
+    await expect(page.locator('#tour-app')).toHaveAttribute('data-itinerary-version', '0');
+    expect(abandonRequests).toBe(1);
+    expect(planRequests).toBe(3);
+});
+
+test('refreshes the authoritative itinerary when abandon reports a version conflict', async ({ page }) => {
+    const existing = fixture('itinerary.json');
+    existing.itineraryId = 'replace-conflict-existing';
+    existing.state = 'draft';
+    existing.version = 4;
+    const authoritative = { ...existing, version: 5 };
+    let currentRequests = 0;
+
+    await installStableSocketTransport(page);
+    await installBaseRoutes(page);
+    await page.route('**/api/itinerary/current', route => {
+        currentRequests += 1;
+        const current = currentRequests === 1 ? null : currentRequests === 2 ? existing : authoritative;
+        return route.fulfill({ status: 200, contentType: 'application/json', body: envelope(current) });
+    });
+    await page.route('**/api/itinerary/plan', route => route.fulfill({
+        status: 400,
+        contentType: 'application/json',
+        body: JSON.stringify({ success: false, code: 1206, data: null, message: 'private detail' })
+    }));
+    await page.route('**/api/itinerary/replace-conflict-existing/abandon', route => route.fulfill({
+        status: 409,
+        contentType: 'application/json',
+        body: JSON.stringify({ success: false, code: 1203, data: null, message: 'private detail' })
+    }));
+
+    await page.goto('/tour');
+    await expect(page.locator('#tour-app')).toHaveAttribute('aria-busy', 'false');
+    await page.getByRole('button', { name: '帮我规划' }).click();
+    await page.getByRole('button', { name: '生成路线' }).click();
+    await page.getByRole('button', { name: '放弃并重新规划' }).click();
+
+    await expect(page.getByRole('heading', { name: '路线预览', exact: true })).toBeVisible();
+    await expect(page.locator('#tour-app')).toHaveAttribute('data-itinerary-version', '5');
+    await expect(page.locator('#existing-itinerary-choice')).toBeHidden();
+    await expect(page.locator('#toast')).toHaveText('行程已在其他位置更新，已同步最新版本');
+    expect(currentRequests).toBe(3);
 });
 
 test('ignores a current response that resolves after page destruction even when fetch ignores abort', async ({ page }) => {

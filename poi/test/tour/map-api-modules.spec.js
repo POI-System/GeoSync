@@ -17,7 +17,10 @@ test('ApiClient preserves null data, safe errors, success codes, timeout, cancel
             '/api/module-409': [409, { success: false, code: 1203, data: null, message: 'private detail' }],
             '/api/module-429': [429, { success: false, code: 2101, data: null, message: 'private detail' }],
             '/api/module-500': [500, { success: false, code: 9001, data: null, message: 'stack trace' }],
-            '/api/module-8204': [400, { success: false, code: 8204, data: null, message: 'internal gis detail' }]
+            '/api/module-8203': [422, { success: false, code: 8203, data: null, message: 'internal gis detail' }],
+            '/api/module-8204': [422, { success: false, code: 8204, data: null, message: 'internal gis detail' }],
+            '/api/module-8205': [409, { success: false, code: 8205, data: null, message: 'internal gis detail' }],
+            '/api/module-8206': [502, { success: false, code: 8206, data: null, message: 'internal gis detail' }]
         };
         const [status, body] = responses[path];
         return route.fulfill({
@@ -44,6 +47,20 @@ test('ApiClient preserves null data, safe errors, success codes, timeout, cancel
         contentType: 'application/json',
         body: JSON.stringify({ success: false, code: 1204, data: null, message: 'private detail' })
     }));
+    let abandonBody = null;
+    await page.route('**/api/itinerary/it-1/abandon', async route => {
+        abandonBody = route.request().postDataJSON();
+        return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({
+                success: true,
+                code: 0,
+                data: { ...fullItinerary, state: 'abandoned', version: 9 },
+                message: ''
+            })
+        });
+    });
 
     await page.goto('/tour?demo=1');
     const result = await page.evaluate(async () => {
@@ -53,7 +70,7 @@ test('ApiClient preserves null data, safe errors, success codes, timeout, cancel
         const code2102 = await client.request('/api/module-2102');
         const code2103 = await client.request('/api/module-2103');
         const errors = {};
-        for (const key of ['401', '403', '409', '429', '500', '8204']) {
+        for (const key of ['401', '403', '409', '429', '500', '8203', '8204', '8205', '8206']) {
             try {
                 await client.request(`/api/module-${key}`);
             } catch (error) {
@@ -88,6 +105,7 @@ test('ApiClient preserves null data, safe errors, success codes, timeout, cancel
         client.cancel('module-cancel');
         const cancelled = await cancelledPromise;
         const rejected = await client.rejectProposal('it-1', 'p-1', 7);
+        const abandoned = await client.abandonItinerary('it-1', 8);
         let detailError;
         try {
             await client.getItinerary('missing');
@@ -109,6 +127,7 @@ test('ApiClient preserves null data, safe errors, success codes, timeout, cancel
             timeout,
             cancelled,
             rejected,
+            abandoned,
             detailError,
             endpoints: {
                 currentItinerary: ENDPOINTS.currentItinerary,
@@ -125,13 +144,27 @@ test('ApiClient preserves null data, safe errors, success codes, timeout, cancel
     expect(result.errors['409']).toMatchObject({ category: 'conflict', code: 1203 });
     expect(result.errors['429']).toMatchObject({ category: 'rate_limit', retryable: true });
     expect(result.errors['500']).toMatchObject({ category: 'server', retryable: true });
+    expect(result.errors['8203']).toMatchObject({
+        category: 'business', code: 8203, retryable: false,
+        message: '起点或终点无法连接步行路网，请调整起点后重试'
+    });
     expect(result.errors['8204']).toMatchObject({ category: 'business', code: 8204, message: '没有已验证的无障碍路线' });
+    expect(result.errors['8205']).toMatchObject({
+        category: 'conflict', code: 8205, retryable: false,
+        message: '地图服务契约或数据版本不一致，请刷新配置后重试'
+    });
+    expect(result.errors['8206']).toMatchObject({
+        category: 'server', code: 8206, retryable: false,
+        message: '地图返回的路线几何无效，未显示该路线'
+    });
     expect(Object.values(result.errors).every(item => !item.message.includes('private') && !item.message.includes('script') && !item.message.includes('stack'))).toBe(true);
     expect(result.errors['401'].requestId).toBe('request-401');
     expect(result.malformed).toMatchObject({ category: 'response', message: '服务返回了无法识别的数据', causeSummary: 'SyntaxError' });
     expect(result.timeout).toEqual({ category: 'timeout', retryable: true, message: '请求超时，请稍后重试' });
     expect(result.cancelled).toEqual({ category: 'cancelled', retryable: false, message: '请求已取消' });
     expect(result.rejected).toEqual(fullItinerary);
+    expect(result.abandoned).toEqual({ ...fullItinerary, state: 'abandoned', version: 9 });
+    expect(abandonBody).toEqual({ version: 8 });
     expect(result.detailError).toEqual({
         category: 'business',
         httpStatus: 404,
@@ -220,10 +253,11 @@ test('DemoApiClient uses external fixtures, validates versions, supports scenari
         }
         demo.clearScenario('proposal');
         const rejected = await demo.rejectProposal(started.itineraryId, 'demo_proposal', started.version);
+        const abandoned = await demo.abandonItinerary(rejected.itineraryId, rejected.version);
         demo.setScenario('position', 2103);
         const position = await demo.reportPosition({ lng: 114.35, lat: 30.54 });
         const planErrors = {};
-        for (const code of [8201, 8202, 8204]) {
+        for (const code of [8201, 8202, 8203, 8204, 8205, 8206]) {
             demo.setScenario('plan', code);
             try {
                 await demo.plan({ hours: 4 });
@@ -240,7 +274,7 @@ test('DemoApiClient uses external fixtures, validates versions, supports scenari
             config, boundaryType: boundary.type, poiCount: pois.length,
             firstSuggestedStayMin: pois[0]?.suggestedStayMin,
             heatmapCount: heatmap.items.length, closedCount: closedEdges.items.length,
-            planned, versionError, proposalError, rejected, position, planErrors, cancelled
+            planned, versionError, proposalError, rejected, abandoned, position, planErrors, cancelled
         };
     });
 
@@ -254,10 +288,14 @@ test('DemoApiClient uses external fixtures, validates versions, supports scenari
     expect(result.versionError).toBe(1203);
     expect(result.proposalError).toBe(1205);
     expect(result.rejected).toMatchObject({ state: 'active', version: 2, pendingProposal: null });
+    expect(result.abandoned).toMatchObject({ state: 'abandoned', version: 3, pendingProposal: null });
     expect(result.position).toMatchObject({ accepted: false, code: 2103 });
     expect(result.planErrors['8201']).toEqual({ code: 8201, category: 'server', retryable: true });
     expect(result.planErrors['8202']).toEqual({ code: 8202, category: 'server', retryable: true });
+    expect(result.planErrors['8203']).toEqual({ code: 8203, category: 'business', retryable: false });
     expect(result.planErrors['8204']).toEqual({ code: 8204, category: 'business', retryable: false });
+    expect(result.planErrors['8205']).toEqual({ code: 8205, category: 'conflict', retryable: false });
+    expect(result.planErrors['8206']).toEqual({ code: 8206, category: 'server', retryable: false });
     expect(result.cancelled).toEqual({ category: 'cancelled' });
 });
 
@@ -391,6 +429,41 @@ test('MapFacade adapter covers strict lifecycle, route compatibility, styles, ev
             layer.type === 'circle' && JSON.stringify(layer.filter || []).includes('status'));
         const closedLabelFilter = poiLabelLayer.filter;
         const poiSource = first.sources.get(poiCrowdEntry[1].source);
+
+        facade.setBoundary({
+            type: 'FeatureCollection',
+            features: [{
+                type: 'Feature',
+                properties: { name: '验收范围' },
+                geometry: {
+                    type: 'Polygon',
+                    coordinates: [[[114.34, 30.53], [114.37, 30.53], [114.37, 30.55], [114.34, 30.55], [114.34, 30.53]]]
+                }
+            }]
+        });
+        const boundarySnapshot = structuredClone(layerAccess.getSource('boundary').data);
+        facade.setUserLocation({ lng: 114.351, lat: 30.541, accuracy: 24 });
+        const userSnapshot = structuredClone(layerAccess.getSource('user').data);
+        facade.setUserLocation({ lng: 999, lat: 999 });
+        const invalidUserFeatureCount = layerAccess.getSource('user').data.features.length;
+        facade.setClosedEdges([
+            {
+                edgeId: 'edge-1', status: 'closed', reason: '施工',
+                geometry: { type: 'LineString', coordinates: [[114.35, 30.54], [114.351, 30.541]] }
+            },
+            {
+                edgeId: 'edge-2', status: 'closed', reason: '积水',
+                geometry: { type: 'LineString', coordinates: [[114.352, 30.542], [114.353, 30.543]] }
+            }
+        ]);
+        facade.selectEdge('edge-2');
+        const closedEdgesSnapshot = structuredClone(layerAccess.getSource('closedEdges').data);
+        facade.setConnectionState('reconnecting');
+        const connectionState = host.dataset.connectionState;
+        const easeCallsBeforeDirectFit = first.easeCalls.length;
+        facade.fitToGeometry({ type: 'Point', coordinates: [114.354, 30.544] });
+        const directFitEase = first.easeCalls.at(-1);
+        const directFitUsedEase = first.easeCalls.length === easeCallsBeforeDirectFit + 1;
 
         const poi = {
             type: 'Feature', geometry: { type: 'Point', coordinates: [114.35, 30.54] },
@@ -532,6 +605,13 @@ test('MapFacade adapter covers strict lifecycle, route compatibility, styles, ev
             countsBeforeReinstall,
             countsAfterReinstall,
             closedLabelFilter,
+            boundarySnapshot,
+            userSnapshot,
+            invalidUserFeatureCount,
+            closedEdgesSnapshot,
+            connectionState,
+            directFitEase,
+            directFitUsedEase,
             crowdSnapshot,
             crowdAfterSingle,
             apiPoiCollection,
@@ -578,6 +658,24 @@ test('MapFacade adapter covers strict lifecycle, route compatibility, styles, ev
     expect(result.pendingMapRemoved).toBe(true);
     expect(result.countsAfterReinstall).toEqual(result.countsBeforeReinstall);
     expect(result.closedLabelFilter).toEqual(['!=', ['get', 'status'], 'closed']);
+    expect(result.boundarySnapshot.features).toHaveLength(1);
+    expect(result.boundarySnapshot.features[0]).toMatchObject({
+        properties: { name: '验收范围' },
+        geometry: { type: 'Polygon' }
+    });
+    expect(result.userSnapshot.features[0]).toMatchObject({
+        geometry: { type: 'Point', coordinates: [114.351, 30.541] },
+        properties: { accuracy: 24 }
+    });
+    expect(result.invalidUserFeatureCount).toBe(0);
+    expect(result.closedEdgesSnapshot.features).toHaveLength(2);
+    expect(result.closedEdgesSnapshot.features.map(feature => [feature.properties.edgeId, feature.properties.selected])).toEqual([
+        ['edge-1', false],
+        ['edge-2', true]
+    ]);
+    expect(result.connectionState).toBe('reconnecting');
+    expect(result.directFitUsedEase).toBe(true);
+    expect(result.directFitEase).toMatchObject({ center: [114.354, 30.544], zoom: 16 });
     expect(result.crowdSnapshot.features[0].properties).toMatchObject({
         crowdLevel: 'medium', lowConfidence: true, crowdLabel: '参考人流 · 较忙'
     });
@@ -598,10 +696,7 @@ test('MapFacade adapter covers strict lifecycle, route compatibility, styles, ev
     expect(result.comparison).toEqual({
         distanceDeltaM: 120,
         durationDeltaSec: -30,
-        reason: '封路绕行',
-        degraded: true,
-        beforeSource: 'cache',
-        afterSource: 'local-fallback'
+        reason: '封路绕行'
     });
     expect(result.comparisonEvent).toEqual(result.comparison);
     expect(result.routeOpacityDuringComparison).toBe(0);

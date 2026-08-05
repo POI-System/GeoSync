@@ -16,6 +16,11 @@ const VIEWPORTS = [
 
 const LONG_PROPOSAL_REASON =
     '游客中心通往湖畔摄影点的主步道因临时管制已关闭，建议绕行山北林荫步道并同步更新预计到达时间与完整时刻表';
+const EVIDENCE_NOW = Date.parse('2026-08-05T08:00:00.000Z');
+
+async function installEvidenceClock(page) {
+    await page.addInitScript(now => { Date.now = () => now; }, EVIDENCE_NOW);
+}
 
 function screenshotPath(state, viewport) {
     return path.join(
@@ -25,6 +30,8 @@ function screenshotPath(state, viewport) {
 }
 
 async function capture(page, state, viewport) {
+    await page.waitForTimeout(750);
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     await page.screenshot({
         path: screenshotPath(state, viewport),
         animations: 'disabled'
@@ -88,7 +95,12 @@ async function assertActivePanelUsable(page, label, { safeBottom = 0 } = {}) {
     const activePanel = page.locator('.panel:not(.hidden)');
     await expect(activePanel, `${label}: one active panel`).toHaveCount(1);
 
-    const targets = await activePanel.locator('button, .choice span, .switch-row').evaluateAll(elements =>
+    const targets = await page.locator([
+        '.panel:not(.hidden) button',
+        '.panel:not(.hidden) .choice span',
+        '.panel:not(.hidden) .switch-row',
+        '#tour-map .maplibregl-ctrl button'
+    ].join(', ')).evaluateAll(elements =>
         elements.map(element => {
             const style = getComputedStyle(element);
             const rect = element.getBoundingClientRect();
@@ -141,6 +153,7 @@ async function assertActivePanelUsable(page, label, { safeBottom = 0 } = {}) {
 }
 
 async function assertStateLayout(page, label, options) {
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     await assertNoHorizontalOverflow(page, label);
     await assertActivePanelUsable(page, label, options);
     await assertFloatingLayersDoNotOverlap(page, label);
@@ -284,6 +297,7 @@ test.describe('tour mobile and desktop viewport matrix', () => {
         test(`${viewport.width}x${viewport.height} covers workflow and degradation states`, async ({ page }) => {
             test.setTimeout(45000);
             const label = `${viewport.width}x${viewport.height}`;
+            await installEvidenceClock(page);
             await page.setViewportSize(viewport);
             await page.addInitScript(() => {
                 Object.defineProperty(navigator, 'geolocation', {
@@ -332,12 +346,27 @@ test.describe('tour mobile and desktop viewport matrix', () => {
             await assertStateLayout(page, `${label} proposal`);
             await capture(page, 'proposal', viewport);
 
-            await page.locator('#proposal-reason').evaluate((element, text) => {
-                element.textContent = text;
-                document.documentElement.style.fontSize = '200%';
-            }, LONG_PROPOSAL_REASON);
+            const fontSelectors = [
+                '#proposal-reason',
+                '#proposal-countdown',
+                '#proposal-metrics .metric strong',
+                '#accept-proposal'
+            ];
+            const baseFontSizes = await page.evaluate(selectors => Object.fromEntries(selectors.map(selector => [
+                selector,
+                Number.parseFloat(getComputedStyle(document.querySelector(selector)).fontSize)
+            ])), fontSelectors);
+            await page.locator('#proposal-reason').evaluate((element, text) => { element.textContent = text; }, LONG_PROPOSAL_REASON);
+            await page.evaluate(() => { document.documentElement.style.fontSize = '200%'; });
             await expect(page.locator('#proposal-reason')).toHaveText(LONG_PROPOSAL_REASON);
-            await assertStateLayout(page, `${label} proposal at 200 percent font`);
+            const scaledFontSizes = await page.evaluate(selectors => Object.fromEntries(selectors.map(selector => [
+                selector,
+                Number.parseFloat(getComputedStyle(document.querySelector(selector)).fontSize)
+            ])), fontSelectors);
+            for (const selector of fontSelectors) {
+                expect(scaledFontSizes[selector], `${label}: ${selector} root text scale`).toBeGreaterThanOrEqual(baseFontSizes[selector] * 1.95);
+            }
+            await assertStateLayout(page, `${label} proposal at 200 percent root text scale`);
             await capture(page, 'proposal-font-200', viewport);
 
             await page.evaluate(() => {
@@ -372,5 +401,62 @@ test.describe('tour mobile and desktop viewport matrix', () => {
             await assertStateLayout(page, `${label} socket disconnected`);
             await capture(page, 'socket-disconnected', viewport);
         });
+    }
+});
+
+test('keeps map notices below a growing header without ResizeObserver', async ({ page }) => {
+    await page.addInitScript(() => {
+        Object.defineProperty(window, 'ResizeObserver', { configurable: true, value: undefined });
+    });
+    await page.goto('/tour?demo=1');
+    await expect(page.locator('#tour-app')).toHaveAttribute('aria-busy', 'false');
+    await page.evaluate(() => { document.documentElement.style.fontSize = '200%'; });
+
+    await expect.poll(() => page.evaluate(() => {
+        const header = document.querySelector('.app-header').getBoundingClientRect();
+        const notice = document.querySelector('.map-notice-stack').getBoundingClientRect();
+        return notice.top >= header.bottom + 10;
+    }), { timeout: 2500 }).toBe(true);
+});
+
+test('synthetic WeChat UA touch workflow smoke', async ({ browser }) => {
+    test.info().annotations.push({
+        type: 'scope',
+        description: 'Chromium emulation only; this is not WeChat, iOS, or Android device certification.'
+    });
+    const context = await browser.newContext({
+        viewport: { width: 390, height: 844 },
+        screen: { width: 390, height: 844 },
+        deviceScaleFactor: 3,
+        isMobile: true,
+        hasTouch: true,
+        locale: 'zh-CN',
+        userAgent: 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Mobile MicroMessenger/8.0.0'
+    });
+    try {
+        const page = await context.newPage();
+        await installEvidenceClock(page);
+        await page.addInitScript(() => {
+            globalThis.addEventListener('pointerup', event => {
+                globalThis.__lastTourPointerType = event.pointerType;
+            }, true);
+        });
+        await page.goto('/tour?demo=1');
+        await expect(page.locator('#tour-app')).toHaveAttribute('aria-busy', 'false');
+        await expect.poll(() => page.evaluate(() => navigator.maxTouchPoints)).toBeGreaterThan(0);
+        await expect.poll(() => page.evaluate(() => navigator.userAgent)).toContain('MicroMessenger');
+
+        await page.getByRole('button', { name: '帮我规划' }).tap();
+        await expect(page.getByRole('heading', { name: '规划行程' })).toBeVisible();
+        await expect.poll(() => page.evaluate(() => globalThis.__lastTourPointerType)).toBe('touch');
+        await assertStateLayout(page, 'synthetic WeChat touch plan');
+
+        await page.getByRole('button', { name: '生成路线' }).tap();
+        await expect(page.getByRole('heading', { name: '路线预览' })).toBeVisible();
+        await page.getByRole('button', { name: '开始游览' }).tap();
+        await expect(page.getByRole('heading', { name: '游览中', exact: true })).toBeVisible();
+        await assertStateLayout(page, 'synthetic WeChat touch touring');
+    } finally {
+        await context.close();
     }
 });

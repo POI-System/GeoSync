@@ -256,6 +256,27 @@ test('shows the actionable 8204 planning state without creating a partial itiner
     expect(await readDemoItinerary(page)).toBeNull();
 });
 
+for (const gisFailure of [
+    { code: 8201, message: '地图路径服务暂时不可用' },
+    { code: 8202, message: '地图路径服务响应超时' },
+    { code: 8203, message: '起点或终点无法连接步行路网，请调整起点后重试' },
+    { code: 8205, message: '地图服务契约或数据版本不一致，请刷新配置后重试' },
+    { code: 8206, message: '地图返回的路线几何无效，未显示该路线' }
+]) {
+    test(`shows the safe ${gisFailure.code} planning failure without a partial itinerary`, async ({ page }) => {
+        await page.goto(`/tour?demo=1&scenario=${gisFailure.code}`);
+        await waitForBoot(page);
+        await page.getByRole('button', { name: '帮我规划' }).click();
+        await page.getByRole('button', { name: '生成路线' }).click();
+
+        await expect(page.getByRole('heading', { name: '规划行程' })).toBeVisible();
+        await expect(page.locator('#plan-message')).toHaveText(gisFailure.message);
+        await expect(page.locator('#plan-message')).toBeVisible();
+        await expect(page.locator(APP)).toHaveAttribute('data-itinerary-version', '');
+        expect(await readDemoItinerary(page)).toBeNull();
+    });
+}
+
 test('shows 1203 conflict recovery and keeps the complete current version', async ({ page }) => {
     await planFourHourPhotoShade(page, '/tour?demo=1&scenario=1203');
     await page.getByRole('button', { name: '开始游览' }).click();
