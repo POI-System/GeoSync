@@ -9,6 +9,8 @@ npm.cmd run vendor:sync
 npm.cmd start
 ```
 
+普通开发安装会包含 `devDependencies`，供 `vendor:sync` 从固定版本 SDK 重建浏览器资源。运行所需 JS/CSS 已提交到 `public/assets/vendor/`；生产部署可使用 `npm.cmd ci --omit=dev`，无需在服务器安装 SuperMap iClient、MapLibreGL 或 Socket.io Client 包。
+
 生产入口为 `http://<host>:<port>/tour`。本地无数据库和 iServer 时，可运行：
 
 ```powershell
@@ -84,11 +86,12 @@ npm.cmd run test:tour:unit
 npm.cmd run test:tour
 npm.cmd run check:syntax
 npm.cmd test
+npm.cmd audit --omit=dev --audit-level=high
 ```
 
 正式截图位于 `docs/screenshots/`。其中视口矩阵在 375×812、390×844、768×1024、1366×768 下分别覆盖首页、规划、预览、地图失败列表模式、Socket 断线、定位拒绝、提案、200% 字体和安全区，共 36 张；另有 7 张主流程截图，共 43 张。
 
-2026-08-05 最终本地验证结果为：游客端 Playwright `59/59`、纯函数 `17/17`、后端测试 `493/493`，游客端语法检查 29 个文件通过，后端语法检查与离线资源扫描通过。Playwright 同时覆盖非 Demo 生产 REST 提案、1206 继续/放弃重规划及两步操作的失败/冲突边界、8201～8206、Socket 重连后的 config/current/heatmap 校准、公共 MapFacade 方法、current 首次失败退避、重连后迟到轮询失效、页面销毁后的迟到响应、200% 根字号和缺失路线指标降级。微信 UA 与触摸测试为 Chromium 仿真，不替代微信、iOS 或 Android 实机验收。正式截图固定浏览器时间并等待地图相机动画完成，连续产图后的 43 张 PNG 内容哈希不变。时限断言只证明本地 Mock 演示链路满足首个可交互地图小于 3 秒、封路通知到提案小于 5 秒、接受提案后完整状态替换小于 2 秒；它不能替代真实 iServer、真实 Socket 和微信 H5 环境的性能验收。逐项证据与未签字项见 `TOUR_ACCEPTANCE_EVIDENCE.md`。
+2026-08-05 最终本地验证结果为：游客端 Playwright `59/59`、纯函数 `17/17`、后端测试 `493/493`，游客端语法检查 29 个文件通过，后端语法检查与离线资源扫描通过。Node 生产依赖 `npm audit --omit=dev` 为 `0 vulnerabilities`；完整依赖树仍有固定浏览器 vendor 上游告警 `high 3 / moderate 5`，不能据此宣称全部运行时代码无风险。Playwright 同时覆盖非 Demo 生产 REST 提案、1206 继续/放弃重规划及两步操作的失败/冲突边界、8201～8206、Socket 重连后的 config/current/heatmap 校准、公共 MapFacade 方法、current 首次失败退避、重连后迟到轮询失效、页面销毁后的迟到响应、200% 根字号和缺失路线指标降级。微信 UA 与触摸测试为 Chromium 仿真，不替代微信、iOS 或 Android 实机验收。正式截图固定浏览器时间并等待地图相机动画完成，连续产图后的 43 张 PNG 内容哈希不变。时限断言只证明本地 Mock 演示链路满足首个可交互地图小于 3 秒、封路通知到提案小于 5 秒、接受提案后完整状态替换小于 2 秒；它不能替代真实 iServer、真实 Socket 和微信 H5 环境的性能验收。逐项证据与未签字项见 `TOUR_ACCEPTANCE_EVIDENCE.md`。
 
 ## 当前上游契约差异
 

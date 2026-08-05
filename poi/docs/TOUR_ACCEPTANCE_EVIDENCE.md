@@ -12,7 +12,8 @@
 | `npm.cmd run check:tour-syntax` | 29 个文件通过 | 游客端 ES Modules、脚本和测试语法。 |
 | `npm.cmd run check:syntax` | 通过 | 后端关键模块与测试语法。 |
 | `npm.cmd run check:tour-offline` | 通过 | 无 CDN、无弹窗 API、固定 vendor 版本，并校验边界与 5 个 POI 离线夹具。 |
-| `npm.cmd audit --omit=dev --audit-level=high` | `critical 0 / high 5 / moderate 5` | 现有生产依赖基线仍有 10 项告警；本次未升级依赖，上线前需单独修复并回归。 |
+| `npm.cmd audit --omit=dev --audit-level=high` | `0 vulnerabilities` | Node 服务端生产依赖审计清零；前端 SDK 是生成已提交 vendor 文件的开发输入，不参与生产 `npm ci --omit=dev`。 |
+| `npm.cmd audit --audit-level=high` | `critical 0 / high 3 / moderate 5` | 完整依赖树仍有 8 项浏览器 vendor 上游告警；不能据上一行宣称全部运行时代码无风险。 |
 | `git diff --check` | 通过 | 无空白错误。 |
 
 ## P0 浏览器闭环
@@ -22,6 +23,8 @@ Playwright 已验证：规划 4 小时摄影路线、预览、开始、暂停、
 后端工作流还使用同一个可变行程实例验证 `graph close -> barrierReroute 持久化 -> GET /current 公共投影 -> accept`，确认提案私有 payload 不泄漏，接受后的路线、站点、ETA、时刻表、version 和进度事件保持一致。
 
 本地 Mock 性能断言已通过：首个可交互地图 `<3s`，封路通知到提案 `<5s`，接受提案后完整状态替换 `<2s`。这些结果只证明本地同源 Mock 链路，不等同于真实 iServer 性能签字。
+
+SuperMap iClient、MapLibreGL 和 Socket.io Client 仅用于 `vendor:sync`，运行所需 JS/CSS 已固定并提交到 `public/assets/vendor/`；生产安装使用 `npm ci --omit=dev` 时不会安装这三个构建输入。锁文件同时把 `socket.io-parser` 更新到 `4.2.7`、`ip-address` 更新到 `10.4.0`，Node 生产依赖审计结果为 0。完整依赖树仍报告 SuperMap 预编译 bundle 所含 ECharts/fast-xml-parser/XLSX，以及固定 Socket.io Client `4.7.4` 链路的 `high 3 / moderate 5`；SuperMap `12.1.0-r` 当前没有更高可替代版本，Socket.io Client 升级会违反本次明确版本约束，因此作为上线前需由依赖负责人确认的浏览器资产风险保留。
 
 ## 视口与截图
 

@@ -19,7 +19,7 @@
 
 - 新增受用户认证和所有权校验保护的 `GET /api/itinerary/:id`，用于完成态刷新恢复；不存在、越权或非法 ID 统一返回 `404/1204`。
 - `/api/poi/all` 增加顶层 `suggestedStayMin`；`barrierReroute` 的 `pendingProposal` 增加脱敏后的 `beforeRoute/afterRoute/distanceDeltaM/durationDeltaSec`。
-- `poi/package.json` 增加固定版本前端 SDK、Playwright、`vendor:sync`、`check:tour-offline` 和 `test:tour`。
+- `poi/package.json` 增加固定版本前端 SDK、Playwright、`vendor:sync`、`check:tour-offline` 和 `test:tour`；三个浏览器 SDK 作为 vendor 生成输入放在 `devDependencies`，生产运行使用仓库内已提交的静态资产。
 - 非封路提案仍可能缺少接受前路线几何，兼容字段与降级表现见 `docs/tourist-client.md`。
 
 ## 验证方式
@@ -41,7 +41,8 @@ npm.cmd test
 - 后端全量测试：`493/493` 通过。
 - 游客端语法检查：29 个文件通过；后端 Node 语法检查通过。
 - 离线资源扫描：通过，固定版本为 SuperMap iClient `12.1.0-r`、MapLibreGL `5.6.0`、Socket.io Client `4.7.4`。
-- 生产依赖审计：`critical 0 / high 5 / moderate 5`；属于现有依赖基线，本次未升级，上线前需单独修复并完成兼容性回归。
+- Node 生产依赖审计：`npm audit --omit=dev` 为 `0 vulnerabilities`；干净的 `npm ci --omit=dev` 不安装前端 SDK，服务端模块可正常加载。
+- 完整依赖树审计：`critical 0 / high 3 / moderate 5`；剩余项来自固定浏览器 vendor 的 SuperMap/ECharts/fast-xml-parser/XLSX 与 Socket.io Client/ws 链路，不能表述为全部运行时代码无风险。
 - 演示环境性能断言：首图 `<3s`、封路通知到提案 `<5s`、接受后完整状态替换 `<2s`。
 
 ## 页面截图
@@ -62,6 +63,7 @@ npm.cmd test
 - 封路提案已支持接受前权威新旧路线比较；其他提案类型仍需后端在创建提案时预计算并公开脱敏路线。
 - 生产 `graph:update` 暂缺封闭路段几何；当前保留状态与提示，收到公开几何后可直接渲染。
 - 微信 H5 的签名会话 Cookie、Socket Cookie、定位授权、JSBridge 与设备安全区仍需在微信/iOS/Android 实机签字；Chromium 微信 UA 触摸测试不替代该验收。
+- SuperMap `12.1.0-r` 当前没有更高可替代版本；固定 Socket.io Client `4.7.4` 的浏览器 bundle 仍有上游告警。升级固定版本前需得到依赖约束变更确认并重新同步 vendor、离线扫描和回归。
 
 ## 提交前确认
 
