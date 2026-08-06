@@ -27,15 +27,10 @@
 <body>
   <div class="box">正在进入核验工作台...</div>
   <script>
-    const params = new URLSearchParams(location.search);
-    const openid = params.get('openid') || localStorage.getItem('user_openid') || localStorage.getItem('userOpenId') || '';
-    if (openid) {
-      localStorage.setItem('user_openid', openid);
-      localStorage.setItem('userOpenId', openid);
-    }
+    localStorage.removeItem('user_openid');
+    localStorage.removeItem('userOpenId');
     localStorage.setItem('userRole', 'verifier');
     const target = new URL('/portal.html', location.origin);
-    if (openid) target.searchParams.set('openid', openid);
     target.searchParams.set('role', 'verifier');
     target.searchParams.set('tab', 'map');
     location.replace(target.toString());

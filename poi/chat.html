@@ -28,15 +28,11 @@
   <div class="box">正在进入消息协同...</div>
   <script>
     const params = new URLSearchParams(location.search);
-    const openid = params.get('openid') || localStorage.getItem('user_openid') || localStorage.getItem('userOpenId') || '';
     const role = params.get('role') || localStorage.getItem('userRole') || 'collector';
-    if (openid) {
-      localStorage.setItem('user_openid', openid);
-      localStorage.setItem('userOpenId', openid);
-    }
+    localStorage.removeItem('user_openid');
+    localStorage.removeItem('userOpenId');
     localStorage.setItem('userRole', role);
     const target = new URL('/portal.html', location.origin);
-    if (openid) target.searchParams.set('openid', openid);
     target.searchParams.set('role', role);
     target.searchParams.set('tab', 'messages');
     location.replace(target.toString());

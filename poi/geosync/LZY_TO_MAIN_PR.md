@@ -1,0 +1,456 @@
+# Pull Request: Complete GeoSync Backend and SuperMap Integration
+
+Base branch: `main`
+
+Head branch: `LZY`
+
+## Summary
+
+This PR integrates GeoSync into the existing POI Node.js process and completes
+the Li Ziya backend boundary for SuperMap access, itinerary routing, barrier
+rerouting, operations events, migration tooling, and degradation handling.
+
+The production process continues to use one Express application, one HTTP/
+Socket.io server, one Mongoose connection, and the existing POI identity/models.
+GeoSync is attached through dependency injection before static files and before
+`server.listen(...)`.
+
+## Main Changes
+
+- Attach `poi/geosync` to `poi/server.js` as the single production service.
+- Remove the obsolete tracked root `geosync/` duplicate after its original
+  regression suite and the migrated single-service tree both passed.
+- Reuse the host POI/User models, Mongoose connection, authentication identity,
+  Socket.io instance, mail/template helpers, OCR helper, uploads, and static host.
+- Add a dependency-injected `SuperMapGateway` as the only business-layer iServer
+  access boundary.
+- Add manifest validation, safe public configuration, Mock transport fixtures,
+  request IDs, timeout/retry limits, credential handling, and sanitized errors.
+- Normalize public geometry to WGS84/EPSG:4326 GeoJSON `LineString` with
+  `[lng,lat]` ordering while retaining legacy `pathGeometry`.
+- Support `normal`, `accessible`, and `shade` routing with canonical distance,
+  duration, segments, snap data, GIS provenance, and accessibility verification.
+- Add canonical route caching, directional keys, sorted barriers, TTL handling,
+  manifest-version invalidation, and cache diagnostics.
+- Keep exact-coordinate cache aliases isolated even when requests snap to the
+  same node pair, and bound the route cache with TTL plus deterministic LRU
+  eviction so one request cannot receive another request's connector geometry.
+- Disable iServer redirects, cap Axios responses at 10 MiB by default, and reject
+  route/feature geometries above 100,000 input positions before expensive
+  normalization scoring.
+- Implement the documented `8201` through `8206` route error contracts.
+- Route itinerary planning and proposal acceptance through the injected Gateway
+  adapter while preserving route, ETA, timetable, version, and legacy fields.
+- Load the authoritative complete closed-edge snapshot for ordinary itinerary
+  planning as well as reroute proposals. Snapshot load or mapping failures stop
+  routing with `8205` instead of silently calling iServer without barriers.
+- Add full closed-edge snapshots, barrier fingerprints, per-scenic serialization,
+  idempotent graph-event handling, reroute proposals, and operations impact/status
+  contracts.
+- Persist graph-event ownership in MongoDB with a unique `eventId`, canonical
+  payload hash, bounded lease, heartbeat, stale-owner recovery, conflict
+  detection, and seven-day TTL cleanup so multiple application instances cannot
+  independently apply the same closure event.
+- Bound one graph event to six concurrent itinerary rebuilds by default while
+  preserving result order and per-scenic event serialization.
+- Use one validated WalkEdge contract for meters, seconds, slope percentage, and
+  zero-to-one ratios across seed, administrator mutation, migration, and runtime
+  routing. Administrator node creation enforces WGS84 ranges, and edge create/
+  patch requires geometry endpoints to remain anchored within five meters of
+  `from/to`. Local fallback now uses Dijkstra over weighted edge travel time.
+- Protect route replacement with a versioned compare-and-set that writes
+  `geometry + distanceM + walkSec` together and returns HTTP 409/code 8102 for a
+  stale snapshot instead of overwriting a newer itinerary.
+- Make natural-language itinerary edits explicit preview-only responses until the
+  complete edit vocabulary can participate in versioned route/preference commits;
+  previews no longer occupy `pendingProposal` or block executable proposals.
+- Track capacity-token ownership through candidate selection and persistence so
+  assembly exceptions, later failures, threshold rejection, and CAS loss release
+  tokens without relying on periodic reconciliation.
+- Add authenticated GIS status and route-test administration endpoints.
+- Persist closure metadata, route provenance, barrier proposal metadata, and
+  proposal lifecycle records.
+- Extend the existing host POI schema before model compilation with validated
+  WGS84 GeoJSON, structured visit metadata, deferred GIS references, and the
+  required geospatial/review indexes without replacing the legacy collection.
+- Add a dry-run-first, conditional, idempotent POI geo/visit migration with
+  concurrent-change protection and explicit deferred-authority counts.
+- Add a dry-run-first, conditional, idempotent SuperMap WalkEdge `sourceRef`
+  migration using explicit authoritative mappings only.
+- Track MongoDB, graph, POI-index, and scheduler readiness independently. Health
+  returns 503 for pending/failed core startup but remains 200 when only GIS is
+  degraded or offline.
+- Add dependency-free liveness and host-aware readiness probes. Production Mongo
+  initial-connection failure is fail-fast by default with sanitized diagnostics,
+  while an attached GeoSync graph/index failure is reported as degraded without
+  removing an otherwise database-ready host POI process from traffic.
+- Retry failed manifest loads automatically after a bounded failure TTL and
+  accept common boolean environment forms with warnings for unknown values.
+- Start the planner's three-second optimization budget only after its MongoDB
+  candidate queries are ready, avoiding false `1202` results caused by slow data
+  preparation.
+- Limit global JSON and URL-encoded request bodies to 1 MiB, retain route-local
+  10 MiB multipart upload limits, reduce the Nginx ceiling to 12 MiB, and install
+  an idempotent SIGTERM/SIGINT drain before `server.listen(...)` with a 10-second
+  default application deadline and a 12-second PM2 kill timeout.
+- Remove the scheduled empty `trailMining` placeholder and report actual primary,
+  non-primary, or explicitly disabled job state.
+- Restrict itinerary proposal/progress Socket payloads to documented public
+  fields; full OpenIDs, tokens, raw proposals, routes, and barrier mappings stay
+  internal.
+- Remove OpenID from browser OAuth redirect URLs and QR polling success payloads.
+  The portal now restores identity only through `GET /api/auth/session` backed by
+  the signed HttpOnly `poi_user_session` cookie, and starts OAuth only after an
+  explicit anonymous response so session outages cannot create redirect loops.
+- Remove OpenID from Portal request URLs, request bodies, Socket queries, and the
+  three legacy entry wrappers. Portal logout now calls `POST /api/auth/logout`
+  and visibly warns when server-side logout cannot be confirmed instead of
+  claiming that the server cookie was cleared.
+- Make Portal administrator access Cookie-only: remove the retired
+  `sessionStorage` marker and all URL/body/Bearer marker transport, restore state
+  through protected `GET /api/admin/session`, and provide explicit persistent
+  `POST /api/admin/logout` revocation. Revalidate on focus/visibility and clear
+  cached management data immediately when an administrator request returns
+  HTTP 401/403.
+- Persist SHA-256 digests of both user and administrator signed-session `jti`
+  values in separate MongoDB TTL collections. HTTP and Socket authorization fail
+  closed when revocation state is unavailable, and copied signed credentials are
+  rejected after logout across application instances.
+- Reject every nonempty legacy identity hint that conflicts with the signed
+  principal, including simultaneous aliases in HTTP and Socket handshakes.
+  Multipart routes authenticate before writing, recheck parsed aliases after
+  Multer, remove unowned files on rejection or pre-persistence failure, and
+  retain files only after a durable database reference. Host and GeoSync photo
+  uploads share bounded JSON errors for invalid type, the 10 MiB limit, or
+  sanitized server-side storage failure; cleanup logs contain only bounded error
+  codes.
+- Bound pending browser and QR OAuth flows with one shared per-network quota
+  (`AUTH_FLOW_MAX_PENDING_PER_NETWORK`, default `8`) in addition to the global
+  `2048` cap, while retaining the server-bound `sid` plus HttpOnly QR claim.
+- Remove the plaintext `init-admin.js` path and disconnected `AdminUser` model;
+  administrator identity is environment/session based.
+- Replace plaintext administrator password configuration with a versioned scrypt
+  `ADMIN_PASSWORD_HASH`, a stdin-only hash tool, fail-closed legacy variable
+  handling, and a backup-protected dry-run-first cleanup tool for inert historical
+  `adminusers` rows.
+- Keep AMap `securityJsCode` entirely out of browser configuration. The browser
+  uses the same-origin `/_AMapService/` host while Nginx injects the rotated
+  secret from a root-only snippet into a fixed AMap upstream and strips
+  credential-bearing headers.
+- Replace the repository-root static mount with exact routes for the five legacy
+  entry URLs and a general static root restricted to `poi/public`. Private HTML,
+  source, package documentation, and unrelated repository assets now return 404.
+- Harden production delivery by aligning TLS preflight paths with the active
+  Let's Encrypt configuration, fixing the deployment directory contract, and
+  enforcing Node.js 20 or newer.
+- Disable Mongoose runtime `autoIndex` in production and add an explicit
+  deployment manifest for 25 host indexes across seven collections plus all
+  declared GeoSync indexes.
+- Add a dependency-free Node test runner that works on Node 20 and Windows without
+  shell globs, remove the obsolete AliCloud OCR package fallback, and upgrade
+  `nodemailer` and `node-cron` through their reviewed current contracts.
+- Apply `SCENIC_TIME_ZONE` consistently to opening windows, sunlight output,
+  photospot dates, DST-aware daily offsets, and scheduled daily jobs. Derive blank
+  `AUTH_COOKIE_SECURE` from the public host, require a credential-free exact
+  HTTPS origin in production, reject downgraded cookies, and enable LLM
+  features only when URL, key, and an explicit model are all configured.
+- Complete the placeholder-only environment template for background jobs,
+  reroute/alert notification channels, tuning, optional providers, upload paths,
+  and development-only simulation controls.
+- Preserve the existing POI endpoints and single-process startup behavior.
+
+## API and Event Contracts
+
+Updated or added HTTP surfaces include:
+
+- `GET /api/geosync/client-config`
+- `GET /api/geosync/health`
+- `GET /api/geosync/health/live`
+- `GET /api/geosync/health/ready`
+- `GET /api/admin/geosync/health`
+- `GET /api/screen/geosync/health`
+- `POST /api/itinerary/plan`
+- `POST /api/admin/geosync/graph/edge/:edgeId/close`
+- `POST /api/admin/geosync/graph/edge/:edgeId/open`
+- `GET /api/admin/geosync/gis/status`
+- `POST /api/admin/geosync/gis/route-test`
+- `POST /api/admin/screen/session`
+- `POST /api/admin/screen/logout`
+- `GET /api/auth/session`
+- `POST /api/auth/logout`
+- `GET /api/admin/session`
+- `POST /api/admin/logout`
+- `GET /auth/wechat`
+- `GET /auth/wechat/qr`
+- `GET /auth/status`
+
+Operations event contracts include:
+
+- `ops:impact`
+- `ops:proposal-status`
+
+Allowed proposal lifecycle statuses are `shown`, `accepted`, `rejected`,
+`expired`, and `failed`.
+
+## Data and Configuration Changes
+
+- Route and stop schemas persist geometry, distance, duration, GIS provenance,
+  segments, snap metadata, accessibility verification, and `pathGeometry`.
+- WalkEdge persists `sourceRef`, `closedReason`, and `closedAt`.
+- The host POI model adds optional `geo`, `visitMeta`, `gateNodeId`, and
+  `superMapRef`. `visitMeta.openHours` follows the established planner/data-model
+  array contract of validated `{start, end}` `HH:mm` windows; the conflicting
+  single-String documentation example is not used.
+- Barrier proposals and reroute log entries persist proposal/event IDs, edge ID,
+  barrier fingerprint, lifecycle status, and decision metadata.
+- `.env.example` contains placeholder-only SuperMap configuration; blank
+  server-side credentials and reviewer identities; signed-session settings; and
+  bounded user, administrator, and screen session lifetimes.
+- `MONGO_STARTUP_FAIL_FAST` defaults to enabled only in production, and
+  `SUPERMAP_MANIFEST_RETRY_MS` controls automatic recovery from transient
+  manifest-load failures.
+- `BARRIER_REROUTE_CONCURRENCY`, `SUPERMAP_MAX_RESPONSE_BYTES`, and
+  `SHUTDOWN_TIMEOUT_MS` expose bounded operational limits with conservative
+  defaults of 6, 10485760 bytes, and 10000 milliseconds respectively.
+- `POI_MIGRATION_BATCH_SIZE` and `POI_MIGRATION_REPORT_LIMIT` default to 250 and
+  1000. The report limit caps each detailed output array at 10000 maximum while
+  preserving full aggregate counts and explicit omitted-row metadata.
+- `poi/config/supermap-manifest.example.json` is a placeholder contract only.
+
+The WalkEdge migration mapping format is an explicit JSON array of:
+
+```text
+{edgeId, datasetName, smId, sourceId?, dataVersion}
+```
+
+Dry-run is the default. Apply mode requires both `--apply` and an explicitly
+configured `MONGO_URI`. Mapping files are capped at 10 MiB and 10,000 entries. No
+GIS identifiers or versions are derived from edge IDs.
+The POI migration follows the same dry-run-first policy, reports
+`total/success/skipped/failed` plus deferred `gateNodeId` and `superMapRef`
+counts, refuses to overwrite a record changed after planning, and reports
+bounded-detail truncation without losing full aggregate totals.
+
+## Verification Commands
+
+Run from `D:\poi项目\poi` after all changes are stable:
+
+```powershell
+& 'D:\nodejs\npm.cmd' ci
+& 'D:\nodejs\npm.cmd' run check:syntax
+& 'D:\nodejs\npm.cmd' run test:geosync
+& 'D:\nodejs\npm.cmd' run test:integration
+& 'D:\nodejs\npm.cmd' test
+& 'D:\nodejs\npm.cmd' run audit:prod
+```
+
+Evidence captured on August 3, 2026 after `npm ci`:
+
+- `npm ci`: passed from the committed lock file.
+- `check:syntax`: passed.
+- Legacy root GeoSync suite before removal: 67 passed, 0 failed.
+- GeoSync unit suite: 480 passed, 0 failed.
+- Integration suite: 16 passed, 0 failed.
+- Combined unit and integration suite: 496 passed, 0 failed.
+- `git diff --check`: passed with only the existing Windows LF/CRLF conversion
+  notices and no whitespace errors.
+- Production dependency audit: passed with 0 vulnerabilities.
+
+## Security Review
+
+- No default administrator token remains.
+- No plaintext administrator initializer or disconnected administrator database
+  model remains.
+- Browser administrator login accepts only the versioned scrypt
+  `ADMIN_PASSWORD_HASH`; the legacy plaintext `ADMIN_PASSWORD` variable disables
+  password login rather than falling back. Hash generation reads stdin only and
+  administrator KDF work is concurrency bounded.
+- Historical `adminusers` rows remain completely outside runtime authentication.
+  A dry-run-first cleanup command reports only collection existence/count and
+  requires backup plus an exact confirmation before dropping that one collection.
+- Production requires signed user identity; legacy `X-Open-Id` compatibility is
+  available only when explicitly enabled outside production.
+- User and administrator sessions are signed, expiring, and transported through
+  HttpOnly SameSite cookies or explicitly supported authorization headers.
+- User and administrator logout persist only SHA-256 digests of signed-session
+  `jti` values in separate shared MongoDB collections with TTL cleanup. Signed
+  HTTP and Socket access fails closed when the corresponding revocation state
+  cannot be verified; the independent opaque `ADMIN_TOKEN` recovery credential
+  does not depend on either collection.
+- Real HTTP logout coverage presents distinct user Cookie/header credentials and
+  an administrator Cookie in one request, verifies both revocation collections,
+  rejects every replay, and proves that a one-sided storage failure clears only
+  the credential class whose revocation completed.
+- Real multipart HTTP coverage proves authentication precedes disk writes,
+  identity conflicts and validation failures leave no orphan files, bounded
+  upload errors remain JSON, and a successfully persisted photo remains owned.
+  Host POI/OCR routes use the same tested upload-error middleware factory with
+  their custom disk storage; source-level assertions verify the host wiring, and
+  upload cleanup never logs raw filesystem messages or paths.
+- Host and GeoSync runtime diagnostics for HTTP routes, Socket handlers, jobs,
+  events, itinerary repair, OCR, LLM, and DEM processing retain only bounded
+  error codes and structured request metadata, never raw upstream messages.
+- Public `GET /api/geosync/health` exposes only `{state}` and public readiness only
+  `{state, ready}`. Detailed MongoDB, startup, GIS, manifest, cache, index, and
+  scheduler diagnostics require administrator or screen credentials.
+- Administrator GIS endpoints reject missing, malformed, query/body, or invalid
+  credentials and accept only a signed administrator session or configured
+  Bearer token.
+- Reviewer entitlement is granted only through the server-side
+  `REVIEWER_OPENIDS` allowlist; a historical database reviewer role or subscription
+  flag alone is downgraded to collector authority. The database role remains the
+  allowlisted user's current UI mode and is never accepted from the client as an
+  authorization claim.
+- Screen credentials are rejected in query strings. The administrator bootstrap
+  endpoint issues a bounded signed `screen` cookie and never stores the raw
+  `SCREEN_TOKEN` in it; the optional strong opaque token remains header-only.
+  Signed screen expiry is enforced server-side: an expired screen cookie alone
+  is rejected, while an independently valid signed administrator cookie remains
+  an authorized fallback for screen-protected routes and fresh-session bootstrap.
+- Browser OAuth state is random, short-lived, cookie-bound, and reserved before
+  the upstream exchange. It is committed exactly once only after the returned
+  OpenID is validated and the user is resolved; a failed or aborted exchange
+  releases the still-valid reservation so a later retry can reserve it. QR OAuth
+  state is `sid`-bound, while `/auth/status` also requires the separate HttpOnly
+  SameSite=Strict `poi_qr_login_claim` cookie, preventing a scanning device or
+  bare-`sid` caller from claiming the desktop session.
+- Administrator login and browser/QR OAuth issuance use bounded fixed-window
+  throttles and return HTTP 429 with `Retry-After` when limits are exceeded.
+- Authentication throttles key `req.ip` through the explicit Express proxy trust
+  policy. `TRUST_PROXY=loopback` is the safe default; non-loopback deployments
+  must use a reviewed hop count from 0 through 10 or name exact trusted proxy
+  IPs/CIDRs/lists. Unsafe `true`, `*`, and out-of-range counts fall back to
+  `loopback` rather than enabling blanket trust.
+- Socket handshakes accept only signed session auth/cookies in production, reload
+  current user roles server-side, reject query-only or mismatched identities, and
+  derive user/admin room membership without trusting client-declared roles. Host
+  and GeoSync identities revalidate every 60 seconds even while idle.
+- iServer and MongoDB credentials remain server-side.
+- Client configuration excludes private service paths, datasets, credentials,
+  administrator tokens, and MongoDB URI.
+- Dataset/field allowlists and bounded feature counts are manifest-controlled.
+- Request IDs and GIS logs are sanitized; raw upstream responses are not logged.
+- Nginx cannot serve `.env`, application source, package metadata, GeoSync
+  internals, private HTML, or PM2 logs directly. Only the dedicated uploads alias
+  bypasses Node; exact legacy entry routes and the `poi/public` root remain the
+  complete static surface.
+- AMap jscode is absent from client configuration and browser source. Nginx reads
+  it from a root-owned mode-0600 snippet, proxies only to the fixed AMap host,
+  strips Cookie and Authorization, sanitizes Referer, disables caching, and
+  suppresses access logging for that location.
+- The development-only standalone entry logs connection state and sanitized error
+  codes without printing the MongoDB endpoint or query options.
+- Accessible routing cannot use unverified local fallback.
+- Migration output omits credentials, MongoDB URI, and raw database errors.
+- Public itinerary Socket events use explicit allowlists and omit full OpenIDs,
+  capacity token IDs, raw proposal payloads, raw routes, and barrier mappings.
+
+## Degradation and Recovery
+
+- Missing or incompatible manifest: main service starts, GIS is `offline`.
+- Partial GIS service availability: health remains HTTP 200 with GIS `degraded`
+  when MongoDB and required startup components are ready.
+- Pending/failed graph or POI-index initialization: public health is HTTP 503;
+  protected detailed health contains component-level and scheduler status.
+- Timeout with route cache: `source=cache`, `degraded=true`.
+- Trusted normal/shade local route: `source=local-fallback`, `degraded=true`.
+- Unverified accessible local route: explicit `8204` failure.
+- No usable source: explicit `8201` failure.
+- Edge transitions invalidate route cache and evaluate the complete closed-edge
+  barrier set.
+
+See `poi/geosync/DEPLOYMENT_RECOVERY.md` for deployment gates, migration recovery,
+health interpretation, error handling, and application rollback.
+
+## Residual Risks and External Blockers
+
+- Independently deployed clients may continue sending legacy identity hint
+  fields, but every nonempty value must now match the signed principal. Client
+  owners must remove stale or conflicting aliases before rollout; mismatches are
+  intentionally rejected rather than silently reassigned.
+- Reviewer rollout requires an authoritative identity inventory before
+  `REVIEWER_OPENIDS` is populated. Historical `role='reviewer'` and
+  `reviewerSubscribed=true` rows are not trusted and must be cleaned through a
+  reviewed conditional database change. An allowlisted reviewer may temporarily
+  choose collector UI mode without losing the persisted subscription flag, then
+  return to reviewer mode because entitlement remains allowlist-controlled.
+- No real iServer integration has been executed. Unit and integration coverage
+  uses Mock/internal contracts only.
+- The upstream owner must confirm whether authoritative responses may contain
+  `[lng,lat,z]`; the reviewed public contract currently accepts only
+  two-dimensional `[lng,lat]` coordinates.
+- Automated shutdown coverage exercises SIGTERM/SIGINT, repeated-signal
+  idempotence, phase failures, and the total timeout through injected process and
+  timer boundaries. Windows `child.kill()` cannot execute the production POSIX
+  signal path, so a real Linux/PM2 restart with in-flight HTTP and Socket work is
+  still a deployment gate.
+- User/administrator revocation and barrier-event lease/heartbeat schemas,
+  fail-closed reads/writes, recovery semantics, and TTL metadata are covered
+  locally. Staging must still verify TTL cleanup, cross-instance logout, stale
+  event recovery, and single event ownership against the deployed MongoDB
+  topology.
+- Real validation still requires the actual base, published service paths,
+  validated manifest, account permissions, representative raw responses, and an
+  authoritative WalkEdge mapping with matching `dataVersion`.
+- The currently seeded graph has no proven authoritative sourceRef mapping.
+  Local fallback must not be described as deployable until migration dry-run and
+  apply succeed against real data.
+- Barrier-event ownership and dedupe are Mongo-backed, but Socket event delivery
+  still has no transactional outbox or shared broker. Operations clients must
+  reload authoritative MongoDB-backed API state after reconnect or restart.
+- The AMap owner must rotate the formerly exposed jscode, restrict the Web JS key
+  domain allowlist, and provide the root-only Nginx snippet. Deployment must apply
+  the CDN no-cache rule, pass `nginx -t`, reload, and complete a real-browser map
+  smoke test.
+- Historical `adminusers` removal is an operator-controlled production data
+  change. The cleanup command defaults to dry-run and has not dropped the
+  collection; backup and exact confirmation remain required.
+- Real OCR, SMTP, AMap, tourist, operations-screen, and multi-instance MongoDB
+  end-to-end validation remains a deployment gate.
+- GitHub Pull Request #1 remains the `LZY` to `main` review boundary. This P3
+  batch is deliverable only after its final clean-install gates pass and its
+  commit is non-force-pushed to `origin/LZY`; do not push or merge `main`
+  directly.
+- Repository protection requires one approving human review after the final
+  push; request that approval only after the last commit because a subsequent
+  update dismisses stale approval.
+
+## Rollback Plan
+
+1. Remove traffic and capture sanitized health/GIS diagnostics and request IDs.
+2. Stop the single POI process.
+3. Restore the last approved `LZY` release commit without modifying `main`.
+4. Run `npm ci`, syntax checks, and the full regression on the rollback commit.
+5. Restore MongoDB only from the approved snapshot or an explicit authoritative
+   reverse mapping; never infer previous sourceRef values.
+6. Restore the manifest, network publication, graph mapping, and `dataVersion` as
+   one aligned set.
+7. Restart and repeat legacy POI, health, client-config, admin GIS, route, Socket,
+   and SSE smoke checks.
+
+## Reviewer Focus
+
+- Verify no business route constructs iServer URLs or Axios parameters directly.
+- Verify close/open handlers accept only real state transitions and invalidate
+  cache once.
+- Verify reroute processing uses the full current barrier set and avoids stale
+  proposals through version/proposal CAS filters while respecting the configured
+  itinerary concurrency window.
+- Verify accessible fallback requires explicit verification.
+- Verify client configuration and logs contain no private values.
+- Verify signed session expiry, legacy-header production rejection, server-side
+  reviewer authorization, query/body credential rejection, and signed Socket
+  room derivation without query-only identity fallback.
+- Verify multipart authentication/identity ordering, 10 MiB and JPEG/PNG error
+  contracts, pre-persistence cleanup, and post-persistence file retention.
+- Verify migration apply remains explicit, conditional, idempotent, and sanitized.
+- Verify host POI schema/index compatibility, strict opening-hour validation, and
+  concurrent-change-safe POI migration behavior.
+- Verify health distinguishes core readiness from GIS degradation and reports
+  only public state unless administrator/screen authorization grants detailed
+  core, GIS, and scheduler diagnostics.
+- Verify JSON bodies above 1 MiB receive 413, iServer redirects are disabled,
+  response and geometry budgets are enforced, and PM2 permits the application
+  shutdown deadline to complete.
+- Verify proposal/progress Socket payloads contain only documented public fields.
+- Verify the final combined regression is green after all concurrent edits stop.

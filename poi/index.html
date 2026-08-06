@@ -27,16 +27,11 @@
 <body>
   <div class="box">正在进入采集工作台...</div>
   <script>
-    const params = new URLSearchParams(location.search);
-    const openid = params.get('openid') || localStorage.getItem('user_openid') || localStorage.getItem('userOpenId') || '';
-    if (openid) {
-      localStorage.setItem('user_openid', openid);
-      localStorage.setItem('userOpenId', openid);
-    }
+    localStorage.removeItem('user_openid');
+    localStorage.removeItem('userOpenId');
     localStorage.setItem('userRole', 'collector');
     const target = new URL('/portal.html', location.origin);
     target.searchParams.set('v', 'ui-i18n-chat-20260512-1131');
-    if (openid) target.searchParams.set('openid', openid);
     target.searchParams.set('role', 'collector');
     target.searchParams.set('tab', 'collect');
     location.replace(target.toString());
