@@ -165,6 +165,31 @@ function emitProposalDecision(itinerary, proposal, status, at) {
     });
 }
 
+function publicBarrierProposalPreview(publicRoute, proposal) {
+    const source = proposal?.toObject ? proposal.toObject() : proposal;
+    const payload = source?.payload?.toObject ? source.payload.toObject() : source?.payload;
+    if (source?.type !== 'barrierReroute' || !payload?.route) return {};
+
+    const beforeRoute = serializedRouteFields(publicRoute);
+    const afterRoute = serializedRouteFields(payload.route);
+    if (!beforeRoute.geometry || !afterRoute.geometry) return {};
+
+    const preview = { beforeRoute, afterRoute };
+    const beforeDistance = beforeRoute.distanceM;
+    const afterDistance = afterRoute.distanceM;
+    if (Number.isFinite(beforeDistance) && beforeDistance >= 0
+        && Number.isFinite(afterDistance) && afterDistance >= 0) {
+        preview.distanceDeltaM = afterDistance - beforeDistance;
+    }
+    const beforeDuration = beforeRoute.durationSec;
+    const afterDuration = afterRoute.durationSec;
+    if (Number.isFinite(beforeDuration) && beforeDuration >= 0
+        && Number.isFinite(afterDuration) && afterDuration >= 0) {
+        preview.durationDeltaSec = afterDuration - beforeDuration;
+    }
+    return preview;
+}
+
 // ---- 序列化 ----
 async function serialize(it) {
     if (!it) return null;
@@ -202,20 +227,25 @@ async function serialize(it) {
     });
     const cur = it.stops.find(s => ['approaching', 'arrived'].includes(s.state)) ||
         it.stops.find(s => s.state === 'pending');
+    const publicRoute = it.route
+        ? serializedRouteFields(it.route)
+        : aggregateRouteFromStops(it.stops, it.preferences);
+    const pendingProposal = it.pendingProposal?.proposalId
+        ? {
+            ...engine.publicProposalView(
+                it.pendingProposal,
+                engine.proposalDiff(it, it.pendingProposal)
+            ),
+            ...publicBarrierProposalPreview(publicRoute, it.pendingProposal)
+        }
+        : null;
     return {
         itineraryId: it._id, version: it.version, state: it.state,
         date: it.date, preferences: it.preferences,
         stops,
-        route: it.route
-            ? serializedRouteFields(it.route)
-            : aggregateRouteFromStops(it.stops, it.preferences),
+        route: publicRoute,
         currentStopId: cur?._id || null,
-        pendingProposal: it.pendingProposal?.proposalId
-            ? engine.publicProposalView(
-                it.pendingProposal,
-                engine.proposalDiff(it, it.pendingProposal)
-            )
-            : null,
+        pendingProposal,
         savedMinutesTotal: it.savedMinutesTotal,
         rerouteCount: it.rerouteCount
     };
@@ -274,6 +304,20 @@ router.get('/current', wrap(async (req, res) => {
     const it = await Itinerary.findOne({
         openId: req.openId, state: { $in: ['draft', 'active', 'paused'] }
     }).sort({ createTime: -1 });
+    ok(res, await serialize(it));
+}));
+
+// GET /:id
+router.get('/:id', wrap(async (req, res) => {
+    const { Itinerary } = getModels();
+    let it;
+    try {
+        it = await Itinerary.findOne({ _id: req.params.id, openId: req.openId });
+    } catch (error) {
+        if (error?.name === 'CastError') return fail(res, 404, 1204, '行程不存在');
+        throw error;
+    }
+    if (!it) return fail(res, 404, 1204, '行程不存在');
     ok(res, await serialize(it));
 }));
 

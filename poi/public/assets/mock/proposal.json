@@ -1,0 +1,12 @@
+{
+  "itineraryId": "demo_itinerary",
+  "version": 1,
+  "proposalId": "demo_proposal",
+  "type": "barrierReroute",
+  "reason": "老图书馆东侧道路临时关闭，建议绕行林荫路",
+  "gainMin": 11,
+  "distanceDeltaM": 126,
+  "durationDeltaSec": -60,
+  "expireAt": "2026-08-03T10:08:00.000Z",
+  "diff": { "before": ["poi_photo", "poi_history", "poi_lake"], "after": ["poi_photo", "poi_lake"] }
+}

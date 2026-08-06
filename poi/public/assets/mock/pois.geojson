@@ -1,0 +1,80 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "poiId": "poi_gate",
+        "name": "珞珈山门",
+        "category": "history",
+        "status": "approved",
+        "suggestedStayMin": 10,
+        "description": "演示景区入口，也是定位不可用时的默认规划起点。"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [114.3518, 30.5374]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "poiId": "poi_photo",
+        "name": "樱顶摄影点",
+        "category": "photography",
+        "status": "approved",
+        "suggestedStayMin": 25,
+        "description": "可远眺校园建筑群，与樱顶西望摄影机位关联。"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [114.3558, 30.5404]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "poiId": "poi_history",
+        "name": "老图书馆",
+        "category": "history",
+        "status": "limited",
+        "suggestedStayMin": 25,
+        "description": "历史建筑参观点，当前为限流开放状态。"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [114.3596, 30.5421]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "poiId": "poi_lake",
+        "name": "珞珈湖步道",
+        "category": "nature",
+        "status": "approved",
+        "suggestedStayMin": 25,
+        "description": "湖畔步行和倒影拍摄区域，与湖畔倒影摄影机位关联。"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [114.3648, 30.5441]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "poiId": "poi_family",
+        "name": "林荫亲子草坪",
+        "category": "family",
+        "status": "approved",
+        "suggestedStayMin": 30,
+        "description": "适合亲子休息和短时活动的林荫草坪。"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [114.3615, 30.5394]
+      }
+    }
+  ]
+}

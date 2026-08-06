@@ -13,6 +13,8 @@
 **/logs/
 **/coverage/
 **/.cache/
+**/test-results/
+**/playwright-report/
 **/*.log
 npm-debug.log*
 yarn-debug.log*
@@ -57,6 +59,8 @@ Thumbs.db
 *.sbx
 *.gpkg
 *.geojson
+!poi/public/assets/mock/boundary.geojson
+!poi/public/assets/mock/pois.geojson
 *.kml
 *.kmz
 *.osm

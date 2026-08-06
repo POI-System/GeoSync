@@ -14,6 +14,19 @@ const WALK_SPEED_MPS = 1.4;
 const PLANNER_OPTIMIZATION_BUDGET_MS = 3000;
 const scenicClockFormatters = new Map();
 
+function finiteNonNegative(value) {
+    if (value === null || value === undefined) return null;
+    if (typeof value === 'string' && value.trim() === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function suggestedStayMinutes(poi) {
+    return finiteNonNegative(poi?.visitMeta?.suggestedStayMin)
+        ?? finiteNonNegative(poi?.visitMeta?.dwellMin)
+        ?? 20;
+}
+
 function scenicClockFormatter(timeZone = CONFIG.scenicTimeZone) {
     if (!scenicClockFormatters.has(timeZone)) {
         scenicClockFormatters.set(timeZone, new Intl.DateTimeFormat('en-CA', {
@@ -146,7 +159,7 @@ async function plan({
             const route = syncEstimate(estimateBetween, cursor, poi, mode);
             if (!routeUsable(route, mode)) continue;
             const walkMin = route.walkSec / 60;
-            const stayMin = (poi.visitMeta?.suggestedStayMin || 20) * paceF;
+            const stayMin = suggestedStayMinutes(poi) * paceF;
             const eta = new Date(t.getTime() + walkMin * 60000);
             const ciPred = forecast.predictAtEta(poi._id, eta) ?? 0.3;
             const queueMin = queueMinutes(ciPred);
@@ -309,7 +322,7 @@ function buildTimeline(order, startLocation, t0, paceF, mode, estimateBetween = 
         }
         const walkMin = r.walkSec / 60;
         const arrive = new Date(t.getTime() + walkMin * 60000);
-        const stayMin = (poi.visitMeta?.suggestedStayMin || 20) * paceF;
+        const stayMin = suggestedStayMinutes(poi) * paceF;
         const queueMin = queueMinutes(forecast.predictAtEta(poi._id, arrive) ?? 0.3);
         const leave = new Date(arrive.getTime() + (stayMin + queueMin) * 60000);
         out.push({
@@ -421,7 +434,7 @@ async function buildAuthoritativeTimeline(
         const route = routes[index];
         const poi = order[index];
         const arrive = new Date(cursorAt.getTime() + route.durationSec * 1000);
-        const stayMin = (poi.visitMeta?.suggestedStayMin || 20) * paceF;
+        const stayMin = suggestedStayMinutes(poi) * paceF;
         const queueMin = queueMinutes(forecast.predictAtEta(poi._id, arrive) ?? 0.3);
         const leave = new Date(arrive.getTime() + (stayMin + queueMin) * 60000);
         if (budgetDeadline && leave > budgetDeadline) break;
@@ -587,6 +600,7 @@ module.exports = {
     defaultEstimateBetween,
     aggregateAuthoritativeRoutes,
     routeUsable,
+    suggestedStayMinutes,
     scenicMinuteOfDay,
     scenicDateStr
 };

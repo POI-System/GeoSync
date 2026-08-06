@@ -1,0 +1,50 @@
+{
+  "itineraryId": "demo_itinerary",
+  "version": 2,
+  "state": "active",
+  "date": "2026-08-03",
+  "preferences": {
+    "hours": 4,
+    "interests": ["photography"],
+    "pace": "normal",
+    "accessible": false,
+    "shadeFirst": true
+  },
+  "stops": [
+    {
+      "stopId": "stop_photo",
+      "poiId": "poi_photo",
+      "poiName": "樱顶摄影点",
+      "state": "approaching",
+      "plannedArrive": "2026-08-03T10:20:00.000Z",
+      "plannedLeave": "2026-08-03T10:45:00.000Z",
+      "ci": { "predictedAtArrive": 0.56 }
+    },
+    {
+      "stopId": "stop_lake",
+      "poiId": "poi_lake",
+      "poiName": "珞珈湖步道",
+      "state": "pending",
+      "plannedArrive": "2026-08-03T11:32:00.000Z",
+      "plannedLeave": "2026-08-03T11:57:00.000Z",
+      "ci": { "predictedAtArrive": 0.38 }
+    }
+  ],
+  "route": {
+    "geometry": {
+      "type": "LineString",
+      "coordinates": [[114.3518, 30.5374], [114.3558, 30.5404], [114.3615, 30.5394], [114.3648, 30.5441]]
+    },
+    "distanceM": 1078,
+    "durationSec": 724,
+    "reason": "临时封路绕行",
+    "gis": { "source": "iserver", "mode": "shade", "degraded": false, "durationMs": 166, "dataVersion": "demo-v1" },
+    "verifiedAccessible": null
+  },
+  "currentStopId": "stop_photo",
+  "pendingProposal": null,
+  "savedMinutesTotal": 11,
+  "rerouteCount": 1,
+  "totalWalkMin": 34,
+  "planNote": "已按封路状态重建剩余行程"
+}

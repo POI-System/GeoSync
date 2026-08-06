@@ -1,0 +1,24 @@
+{
+  "scenicId": "whu_demo",
+  "scenicCenter": [114.3592, 30.541],
+  "features": {
+    "supermap": true,
+    "threeD": true,
+    "rain": true
+  },
+  "gis": {
+    "enabled": true,
+    "state": "online",
+    "center": [114.3592, 30.541],
+    "extent": [114.3468, 30.5332, 114.3722, 30.5486],
+    "crs": "EPSG:4326",
+    "features": {
+      "supermap": true,
+      "threeD": true
+    },
+    "publicServices": {
+      "map": "demo://map",
+      "scene": "/tour?demo=1#spot/spot_roof"
+    }
+  }
+}

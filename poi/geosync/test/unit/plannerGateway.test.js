@@ -83,6 +83,16 @@ function poi(id, coordinates, stayMin) {
     };
 }
 
+test('planner preserves zero stay time and falls back through dwell metadata', () => {
+    assert.equal(planner.suggestedStayMinutes({
+        visitMeta: { suggestedStayMin: 0, dwellMin: 15 }
+    }), 0);
+    assert.equal(planner.suggestedStayMinutes({
+        visitMeta: { suggestedStayMin: null, dwellMin: 15 }
+    }), 15);
+    assert.equal(planner.suggestedStayMinutes({ visitMeta: {} }), 20);
+});
+
 function idOf(value) {
     return value?._id || 'start';
 }

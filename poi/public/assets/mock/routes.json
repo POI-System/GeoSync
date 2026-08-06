@@ -1,0 +1,33 @@
+{
+  "before": {
+    "geometry": {
+      "type": "LineString",
+      "coordinates": [[114.3518, 30.5374], [114.3558, 30.5404], [114.3596, 30.5421], [114.3648, 30.5441]]
+    },
+    "distanceM": 952,
+    "durationSec": 784,
+    "gis": { "source": "iserver", "mode": "shade", "degraded": false, "durationMs": 148, "dataVersion": "demo-v1" },
+    "verifiedAccessible": null
+  },
+  "after": {
+    "geometry": {
+      "type": "LineString",
+      "coordinates": [[114.3518, 30.5374], [114.3558, 30.5404], [114.3615, 30.5394], [114.3648, 30.5441]]
+    },
+    "distanceM": 1078,
+    "durationSec": 724,
+    "reason": "临时封路绕行",
+    "gis": { "source": "iserver", "mode": "shade", "degraded": false, "durationMs": 166, "dataVersion": "demo-v1" },
+    "verifiedAccessible": null
+  },
+  "offlineAccessible": {
+    "geometry": {
+      "type": "LineString",
+      "coordinates": [[114.3518, 30.5374], [114.3558, 30.5404]]
+    },
+    "distanceM": 420,
+    "durationSec": 360,
+    "gis": { "source": "local-fallback", "mode": "accessible", "degraded": true },
+    "verifiedAccessible": false
+  }
+}
