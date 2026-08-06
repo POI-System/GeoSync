@@ -8,6 +8,7 @@ const mongoose = require('mongoose');
 const { registerModels } = require('../models');
 const {
     SuperMapRefMappingError,
+    normalizeMappingArray,
     runSuperMapRefMigration
 } = require('../services/supermapRefMigration');
 
@@ -130,6 +131,7 @@ async function runCli({
         }
 
         const mappings = readMappings(args.mappingPath, fileSystem);
+        normalizeMappingArray(mappings);
         if (typeof mongooseInstance.set === 'function') {
             mongooseInstance.set('autoIndex', false);
             mongooseInstance.set('autoCreate', false);

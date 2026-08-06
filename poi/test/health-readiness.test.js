@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const http = require('node:http');
 const express = require('express');
 const {
     createRuntimeReadiness,
@@ -35,6 +36,21 @@ async function listen(app) {
 
 async function close(server) {
     await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+}
+
+function request(url) {
+    return new Promise((resolve, reject) => {
+        const req = http.get(url, response => {
+            let body = '';
+            response.setEncoding('utf8');
+            response.on('data', chunk => { body += chunk; });
+            response.on('end', () => resolve({
+                status: response.statusCode,
+                json: async () => JSON.parse(body)
+            }));
+        });
+        req.once('error', reject);
+    });
 }
 
 test('health endpoint distinguishes core readiness from GIS online, degraded, and offline states', async () => {
@@ -88,27 +104,24 @@ test('health endpoint distinguishes core readiness from GIS online, degraded, an
     const { server, base } = await listen(app);
 
     try {
-        let response = await fetch(`${base}/api/geosync/health/live`);
+        let response = await request(`${base}/api/geosync/health/live`);
         let body = await response.json();
         assert.equal(response.status, 200);
         assert.deepEqual(body, { state: 'live', live: true });
 
-        response = await fetch(`${base}/api/geosync/health/ready`);
+        response = await request(`${base}/api/geosync/health/ready`);
         body = await response.json();
         assert.equal(response.status, 200);
-        assert.equal(body.state, 'ready');
-        assert.equal(body.ready, true);
-        assert.equal(body.mongoReady, true);
-        assert.equal(body.geosyncReady, true);
+        assert.deepEqual(body, { state: 'ready', ready: true });
 
-        response = await fetch(`${base}/api/geosync/health`);
+        response = await request(`${base}/api/geosync/health`);
         body = await response.json();
         assert.equal(response.status, 200);
         assert.deepEqual(body, { state: 'online' });
         assert.equal(JSON.stringify(body).includes('mongo'), false);
         assert.equal(JSON.stringify(body).includes('manifest'), false);
 
-        response = await fetch(`${base}/api/admin/geosync/health`);
+        response = await request(`${base}/api/admin/geosync/health`);
         body = await response.json();
         assert.equal(response.status, 200);
         assert.equal(body.state, 'online');
@@ -119,21 +132,21 @@ test('health endpoint distinguishes core readiness from GIS online, degraded, an
         assert.equal(body.poiIndexCount, 2);
 
         gisState.value = 'degraded';
-        response = await fetch(`${base}/api/admin/geosync/health`);
+        response = await request(`${base}/api/admin/geosync/health`);
         body = await response.json();
         assert.equal(response.status, 200);
         assert.equal(body.state, 'degraded');
         assert.equal(body.gis.state, 'degraded');
 
         gisState.value = 'offline';
-        response = await fetch(`${base}/api/admin/geosync/health`);
+        response = await request(`${base}/api/admin/geosync/health`);
         body = await response.json();
         assert.equal(response.status, 200);
         assert.equal(body.state, 'degraded');
         assert.equal(body.gis.state, 'offline');
 
         gisState.throws = true;
-        response = await fetch(`${base}/api/admin/geosync/health`);
+        response = await request(`${base}/api/admin/geosync/health`);
         body = await response.json();
         assert.equal(response.status, 200);
         assert.equal(body.gis.state, 'offline');
@@ -141,21 +154,18 @@ test('health endpoint distinguishes core readiness from GIS online, degraded, an
         assert.doesNotMatch(JSON.stringify(body), /private upstream detail/);
 
         mongoose.connection.readyState = 0;
-        response = await fetch(`${base}/api/admin/geosync/health`);
+        response = await request(`${base}/api/admin/geosync/health`);
         body = await response.json();
         assert.equal(response.status, 503);
         assert.equal(body.state, 'offline');
         assert.equal(body.core.ready, false);
 
-        response = await fetch(`${base}/api/geosync/health/ready`);
+        response = await request(`${base}/api/geosync/health/ready`);
         body = await response.json();
         assert.equal(response.status, 503);
-        assert.equal(body.state, 'not-ready');
-        assert.equal(body.ready, false);
-        assert.equal(body.mongoReady, false);
-        assert.equal(body.geosyncReady, false);
+        assert.deepEqual(body, { state: 'not-ready', ready: false });
 
-        response = await fetch(`${base}/api/geosync/health/live`);
+        response = await request(`${base}/api/geosync/health/live`);
         assert.equal(response.status, 200);
     } finally {
         await close(server);
@@ -193,21 +203,17 @@ test('health endpoint returns 503 while a required startup component is pending 
     const { server, base } = await listen(app);
 
     try {
-        let response = await fetch(`${base}/api/geosync/health/ready`);
+        let response = await request(`${base}/api/geosync/health/ready`);
         let body = await response.json();
         assert.equal(response.status, 200);
-        assert.equal(body.state, 'degraded');
-        assert.equal(body.ready, true);
-        assert.equal(body.mongoReady, true);
-        assert.equal(body.geosyncReady, false);
-        assert.equal(body.geosync.state, 'pending');
+        assert.deepEqual(body, { state: 'degraded', ready: true });
 
-        response = await fetch(`${base}/api/geosync/health`);
+        response = await request(`${base}/api/geosync/health`);
         body = await response.json();
         assert.equal(response.status, 503);
         assert.deepEqual(body, { state: 'offline' });
 
-        response = await fetch(`${base}/api/admin/geosync/health`);
+        response = await request(`${base}/api/admin/geosync/health`);
         body = await response.json();
         assert.equal(response.status, 503);
         assert.equal(body.startup.state, 'pending');
@@ -220,19 +226,16 @@ test('health endpoint returns 503 while a required startup component is pending 
         await readiness.track('poiIndex', async () => 0, {
             details: count => ({ count })
         });
-        response = await fetch(`${base}/api/admin/geosync/health`);
+        response = await request(`${base}/api/admin/geosync/health`);
         body = await response.json();
         assert.equal(response.status, 503);
         assert.equal(body.startup.state, 'failed');
         assert.equal(body.startup.components.graph.error.code, 'GRAPH_LOAD_FAILED');
 
-        response = await fetch(`${base}/api/geosync/health/ready`);
+        response = await request(`${base}/api/geosync/health/ready`);
         body = await response.json();
         assert.equal(response.status, 200);
-        assert.equal(body.state, 'degraded');
-        assert.equal(body.ready, true);
-        assert.equal(body.geosyncReady, false);
-        assert.equal(body.geosync.state, 'failed');
+        assert.deepEqual(body, { state: 'degraded', ready: true });
     } finally {
         await close(server);
     }

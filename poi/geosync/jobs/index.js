@@ -7,6 +7,7 @@ const { getModels } = require('../models');
 const geo = require('../lib/geo');
 const memCache = require('../lib/memCache');
 const bus = require('../lib/eventBus');
+const { safeErrorCode } = require('../lib/respond');
 const crowdService = require('../services/crowdService');
 const forecastService = require('../services/forecastService');
 const rainService = require('../services/rainService');
@@ -29,7 +30,7 @@ async function runJob(name, fn) {
         await fn();
         console.log(`[JOB] ${name} ok in ${Date.now() - t0}ms`);
     } catch (e) {
-        console.error(`[JOB] ${name} FAILED:`, e.message);
+        console.error(`[JOB] ${name} FAILED:`, safeErrorCode(e, 'JOB_FAILED'));
     } finally {
         running.delete(name);
     }
@@ -304,7 +305,10 @@ async function expirePendingProposals(deps = {}) {
         try {
             await releaseTokens(proposal.tokenIds || [], it._id);
         } catch (error) {
-            logger.error(`[JOB] proposal token release failed (${it._id}):`, error.message);
+            logger.error(
+                `[JOB] proposal token release failed (${it._id}):`,
+                safeErrorCode(error, 'PROPOSAL_TOKEN_RELEASE_FAILED')
+            );
         }
         eventBus.emit(eventBus.EVENTS.REROUTE_DECIDED, {
             openId: updated.openId || it.openId,
@@ -327,11 +331,15 @@ async function minuteSweep() {
     const now = new Date();
     await expirePendingProposals({ Itinerary, clock: () => now });
     const tokenStats = await antiHerding.reconcileTokens(now).catch(error => {
-        console.error('[JOB] capacity token reconcile failed:', error.message);
+        console.error('[JOB] capacity token reconcile failed:',
+            safeErrorCode(error, 'TOKEN_RECONCILE_FAILED'));
         return null;
     });
     if (tokenStats?.arrivalIndexError) {
-        console.error('[JOB] capacity token arrival index retry failed:', tokenStats.arrivalIndexError);
+        console.error(
+            '[JOB] capacity token arrival index retry failed:',
+            safeErrorCode({ code: tokenStats.arrivalIndexError }, 'ARRIVAL_INDEX_RETRY_FAILED')
+        );
     }
     // 停留兜底关闭
     await crowdService.sweepStaleSamples();
@@ -343,12 +351,14 @@ async function minuteSweep() {
         onReleaseTokens: (tokenIds, context) =>
             antiHerding.releaseTokens(tokenIds, context.itinerary._id)
     }).catch(error => {
-        console.error('[JOB] itinerary presence reconcile failed:', error.message);
+        console.error('[JOB] itinerary presence reconcile failed:',
+            safeErrorCode(error, 'PRESENCE_RECONCILE_FAILED'));
         return null;
     });
     if (presence?.updated) {
         await forecastService.rebuildArrivalIndex().catch(error =>
-            console.error('[JOB] arrival index rebuild failed:', error.message));
+            console.error('[JOB] arrival index rebuild failed:',
+                safeErrorCode(error, 'ARRIVAL_INDEX_REBUILD_FAILED')));
         for (const itinerary of presence.itineraries) {
             bus.emit(bus.EVENTS.ITINERARY_PROGRESS, {
                 openId: itinerary.openId,

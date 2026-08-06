@@ -5,7 +5,7 @@
 const axios = require('axios');
 const { CONFIG } = require('../config');
 const { getModels } = require('../models');
-const { BizError } = require('../lib/respond');
+const { BizError, safeErrorCode } = require('../lib/respond');
 
 const LLM_TIMEOUT_MS = 8000;
 
@@ -115,7 +115,7 @@ async function callLLM(prompt, maxTokens) {
         return text;
     } catch (e) {
         if (e instanceof BizError) throw e;
-        console.error('[GeoSync] [LLM]', e.message);
+        console.error('[GeoSync] [LLM]', safeErrorCode(e, 'LLM_REQUEST_FAILED'));
         throw new BizError(6101, 'AI服务暂不可用', 503);
     }
 }

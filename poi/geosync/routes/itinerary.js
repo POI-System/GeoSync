@@ -5,7 +5,7 @@ const express = require('express');
 const crypto = require('crypto');
 const { CONFIG } = require('../config');
 const { getModels } = require('../models');
-const { ok, fail, wrap, BizError } = require('../lib/respond');
+const { ok, fail, wrap, BizError, safeErrorCode } = require('../lib/respond');
 const { requireUser } = require('../lib/auth');
 const bus = require('../lib/eventBus');
 const memCache = require('../lib/memCache');
@@ -66,7 +66,8 @@ async function bestEffort(label, operation) {
     try {
         return await operation();
     } catch (error) {
-        console.error(`[GeoSync] [ITINERARY] ${label}:`, error.message);
+        console.error(`[GeoSync] [ITINERARY] ${label}:`,
+            safeErrorCode(error, 'ITINERARY_POST_COMMIT_FAILED'));
         return null;
     }
 }
@@ -195,7 +196,8 @@ async function serialize(it) {
     const { ExternalPoi } = getModels();
     const poiIds = it.stops.map(s => s.poiId);
     const pois = await ExternalPoi.find({ _id: { $in: poiIds } }).lean().catch(error => {
-        console.error('[GeoSync] [ITINERARY] POI enrichment unavailable:', error.message);
+        console.error('[GeoSync] [ITINERARY] POI enrichment unavailable:',
+            safeErrorCode(error, 'POI_ENRICHMENT_FAILED'));
         return [];
     });
     const poiMap = new Map(pois.map(p => [String(p._id), p]));
@@ -330,7 +332,8 @@ router.post('/:id/start', wrap(async (req, res) => {
         return fail(res, 409, 1203, '行程版本已过期，请刷新');
     }
     if (result.releaseError) {
-        console.error('[GeoSync] [ITINERARY] start token release failed:', result.releaseError.message);
+        console.error('[GeoSync] [ITINERARY] start token release failed:',
+            safeErrorCode(result.releaseError, 'TOKEN_RELEASE_FAILED'));
     }
     if (result.status === 'updated') {
         await bestEffort('arrival index rebuild failed', () => forecast.rebuildArrivalIndex());
@@ -398,7 +401,8 @@ router.post('/:id/stops/:stopId/skip', wrap(async (req, res) => {
         return fail(res, 409, 1203, '行程版本已过期或站点不可跳过');
     }
     if (result.releaseError) {
-        console.error('[GeoSync] [ITINERARY] skip token release failed:', result.releaseError.message);
+        console.error('[GeoSync] [ITINERARY] skip token release failed:',
+            safeErrorCode(result.releaseError, 'TOKEN_RELEASE_FAILED'));
     }
     if (result.status === 'updated') {
         await bestEffort('arrival index rebuild failed', () => forecast.rebuildArrivalIndex());
@@ -542,11 +546,13 @@ router.post('/:id/proposal/:proposalId/:decision(accept|reject)', wrap(async (re
             await forecast.rebuildArrivalIndex();
             arrivalIndexReady = true;
         } catch (error) {
-            console.error('[GeoSync] [ITINERARY] arrival index rebuild failed:', error.message);
+            console.error('[GeoSync] [ITINERARY] arrival index rebuild failed:',
+                safeErrorCode(error, 'ARRIVAL_INDEX_REBUILD_FAILED'));
         }
         if (arrivalIndexReady) {
             await antiHerding.finalizeClaimedTokens(pp.tokenIds, it._id, claimId).catch(error =>
-                console.error('[GeoSync] [ITINERARY] token finalize failed:', error.message));
+                console.error('[GeoSync] [ITINERARY] token finalize failed:',
+                    safeErrorCode(error, 'TOKEN_FINALIZE_FAILED')));
         }
         emitProposalDecision(updated, lifecycleProposal, 'accepted', commitNow);
         emitProgress(updated);

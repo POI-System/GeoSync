@@ -7,6 +7,7 @@ const path = require('path');
 const { CONFIG } = require('../config');
 const { getModels } = require('../models');
 const { destination } = require('../lib/geo');
+const { safeErrorCode } = require('../lib/respond');
 
 const SIZE = 3601;
 const tileCache = new Map(); // 'N32E118' → Buffer|null
@@ -98,7 +99,7 @@ async function drain() {
             await spot.save();
             console.log(`[GeoSync] [HORIZON] spot ${spotId} built in ${Date.now() - t0}ms`);
         } catch (e) {
-            console.error('[GeoSync] [HORIZON]', e.message);
+            console.error('[GeoSync] [HORIZON]', safeErrorCode(e, 'HORIZON_BUILD_FAILED'));
         }
     }
     running = false;

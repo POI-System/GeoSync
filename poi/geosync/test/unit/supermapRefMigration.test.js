@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const {
+    MAX_MAPPING_ENTRIES,
     SuperMapRefMappingError,
     normalizeMappingArray,
     planSuperMapRefMigration,
@@ -128,6 +129,33 @@ test('duplicate and conflicting edge mappings are both rejected before planning'
         () => normalizeMappingArray([mapping('edge-1', 1), mapping('edge-1', 2)]),
         error => error instanceof SuperMapRefMappingError
             && error.errors[0].code === 'CONFLICTING_EDGE_ID'
+    );
+});
+
+test('mapping normalization rejects input above the hard entry limit', () => {
+    assert.throws(
+        () => normalizeMappingArray(new Array(MAX_MAPPING_ENTRIES + 1).fill(null)),
+        error => error instanceof SuperMapRefMappingError
+            && error.summary.total === MAX_MAPPING_ENTRIES + 1
+            && error.summary.failed === MAX_MAPPING_ENTRIES + 1
+            && error.summary.total === error.summary.success
+                + error.summary.skipped + error.summary.failed
+            && error.errors[0].code === 'MAPPING_LIMIT_EXCEEDED'
+    );
+});
+
+test('batch validation failure accounts for every rejected mapping entry', () => {
+    assert.throws(
+        () => normalizeMappingArray([
+            mapping('edge-valid', 1),
+            { edgeId: '', datasetName: 'WalkEdge@Test', smId: 2, dataVersion: 'graph-v1' }
+        ]),
+        error => error instanceof SuperMapRefMappingError
+            && error.summary.total === 2
+            && error.summary.success === 0
+            && error.summary.skipped === 0
+            && error.summary.failed === 2
+            && error.errors.length === 1
     );
 });
 
@@ -268,6 +296,30 @@ test('CLI requires an explicit mapping path and MONGO_URI before either mode con
         assert.equal(connectCalls, 0);
         assert.equal(JSON.parse(stderr.value()).code, 'MONGO_URI_REQUIRED');
     }
+
+    const oversizedMappings = JSON.stringify(new Array(MAX_MAPPING_ENTRIES + 1).fill(null));
+    const invalidErr = captureStream();
+    let invalidConnectCalls = 0;
+    const invalidCode = await runCli({
+        argv: ['--mapping', 'mapping.json'],
+        env: { MONGO_URI: 'mongodb://db.internal/poi-test' },
+        stderr: invalidErr.stream,
+        stdout: captureStream().stream,
+        fileSystem: {
+            statSync: () => ({ isFile: () => true, size: Buffer.byteLength(oversizedMappings) }),
+            readFileSync: () => oversizedMappings
+        },
+        mongooseInstance: {
+            connect: async () => { invalidConnectCalls++; },
+            disconnect: async () => {}
+        }
+    });
+    assert.equal(invalidCode, EXIT.INPUT_ERROR);
+    assert.equal(invalidConnectCalls, 0);
+    const invalidBody = JSON.parse(invalidErr.value());
+    assert.equal(invalidBody.code, 'INVALID_SUPERMAP_REF_MAPPING');
+    assert.equal(invalidBody.total, MAX_MAPPING_ENTRIES + 1);
+    assert.equal(invalidBody.failed, MAX_MAPPING_ENTRIES + 1);
 });
 
 test('SuperMap dry-run disables automatic collection and index creation', async () => {

@@ -7,6 +7,7 @@ const { CONFIG } = require('../config');
 const { getModels } = require('../models');
 const forecast = require('./forecastService');
 const memCache = require('../lib/memCache');
+const { safeErrorCode } = require('../lib/respond');
 
 const CLAIM_TTL_MS = 2 * 60000;
 
@@ -299,7 +300,7 @@ async function reconcileTokens(now = new Date()) {
                 stats.finalizedClaims += r.modifiedCount || 0;
             }
         } catch (error) {
-            stats.arrivalIndexError = error.message;
+            stats.arrivalIndexError = safeErrorCode(error, 'ARRIVAL_INDEX_REBUILD_FAILED');
         }
     }
     for (const token of restore) {

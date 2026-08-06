@@ -2,6 +2,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { access, mkdtemp, readFile, rm, writeFile } = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
 const mongoose = require('mongoose');
 
 const modelModule = require('../../models');
@@ -13,6 +16,10 @@ const {
     createSessionToken
 } = require('../../lib/sessionAuth');
 const { hashAdminSessionId } = require('../../services/adminSessionRevocation');
+const { hashUserSessionId } = require('../../services/userSessionRevocation');
+const {
+    rejectMismatchedMultipartIdentity
+} = require('../../lib/identityHints');
 
 const users = new Map([
     ['user-1', { openId: 'user-1', role: 'collector' }],
@@ -43,7 +50,28 @@ const AdminSessionRevocation = {
     }
 };
 
-modelModule.registerModels(new mongoose.Mongoose(), { User: ExternalUser, AdminSessionRevocation });
+const revokedUserSessionIds = new Set();
+let userRevocationReadError = null;
+const UserSessionRevocation = {
+    findOne(filter) {
+        return {
+            lean: async () => {
+                if (userRevocationReadError) throw userRevocationReadError;
+                return revokedUserSessionIds.has(filter._id) ? { _id: filter._id } : null;
+            }
+        };
+    },
+    async updateOne(filter, update) {
+        revokedUserSessionIds.add(filter._id);
+        return { acknowledged: true, update };
+    }
+};
+
+modelModule.registerModels(new mongoose.Mongoose(), {
+    User: ExternalUser,
+    AdminSessionRevocation,
+    UserSessionRevocation
+});
 const {
     LEGACY_ADMIN_SESSION_MARKER,
     requireUser,
@@ -129,22 +157,46 @@ function screenSessionToken(now = NOW, ttlSec = 600) {
     });
 }
 
-test('signed user session is authoritative over a forged X-Open-Id header', async () => {
+test('signed user session rejects mismatched legacy identity hints', async () => {
     const previous = snapshotConfig();
     Object.assign(CONFIG, {
         nodeEnv: 'production', isProduction: true,
         authSignRequired: true, legacyOpenIdEnabled: false,
         sessionSecret: SESSION_SECRET
     });
-    const req = {
-        headers: {
-            [DEFAULT_HEADER_NAMES.user]: userToken('user-1'),
-            'x-open-id': 'user-2'
-        }
-    };
-    const res = response();
-    let nextCalled = false;
     try {
+        for (const request of [{
+            headers: {
+                [DEFAULT_HEADER_NAMES.user]: userToken('user-1'),
+                'x-open-id': 'user-2'
+            }
+        }, {
+            headers: { [DEFAULT_HEADER_NAMES.user]: userToken('user-1') },
+            body: { openId: 'user-2' }
+        }, {
+            headers: { [DEFAULT_HEADER_NAMES.user]: userToken('user-1') },
+            query: { openid: 'user-2' }
+        }, {
+            headers: { [DEFAULT_HEADER_NAMES.user]: userToken('user-1') },
+            body: { userOpenId: 'user-2' }
+        }]) {
+            const res = response();
+            let nextCalled = false;
+            await requireUser(request, res, () => { nextCalled = true; });
+            assert.equal(nextCalled, false);
+            assert.equal(res.statusCode, 403);
+        }
+
+        const req = {
+            headers: {
+                [DEFAULT_HEADER_NAMES.user]: userToken('user-1'),
+                'x-open-id': 'user-1'
+            },
+            body: { openId: 'user-1' },
+            query: { userOpenId: 'user-1' }
+        };
+        const res = response();
+        let nextCalled = false;
         await requireUser(req, res, () => { nextCalled = true; });
         assert.equal(nextCalled, true);
         assert.equal(req.openId, 'user-1');
@@ -152,6 +204,40 @@ test('signed user session is authoritative over a forged X-Open-Id header', asyn
         assert.equal(req.authSession.subject, 'user-1');
     } finally {
         restoreConfig(previous);
+    }
+});
+
+test('post-Multer identity conflicts delete uploaded files before returning 403', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'geosync-upload-identity-'));
+    try {
+        for (const field of ['openId', 'openid', 'userOpenId']) {
+            const uploadPath = path.join(tempDir, `${field}.jpg`);
+            await writeFile(uploadPath, `conflict-${field}`);
+            const rejected = await rejectMismatchedMultipartIdentity({
+                body: { [field]: 'user-2' },
+                file: { path: uploadPath }
+            }, 'user-1');
+            assert.equal(rejected, true);
+            await assert.rejects(access(uploadPath), error => error.code === 'ENOENT');
+        }
+
+        const duplicateFieldPath = path.join(tempDir, 'duplicate-openid.jpg');
+        await writeFile(duplicateFieldPath, 'duplicate-conflict');
+        assert.equal(await rejectMismatchedMultipartIdentity({
+            body: { openid: ['user-1', 'user-2'] },
+            file: { path: duplicateFieldPath }
+        }, 'user-1'), true);
+        await assert.rejects(access(duplicateFieldPath), error => error.code === 'ENOENT');
+
+        const matchingPath = path.join(tempDir, 'matching.jpg');
+        await writeFile(matchingPath, 'matching-session');
+        assert.equal(await rejectMismatchedMultipartIdentity({
+            body: { openId: 'user-1', openid: 'user-1', userOpenId: '' },
+            file: { path: matchingPath }
+        }, 'user-1'), false);
+        assert.equal(await readFile(matchingPath, 'utf8'), 'matching-session');
+    } finally {
+        await rm(tempDir, { recursive: true, force: true });
     }
 });
 
@@ -172,7 +258,29 @@ test('signed user authentication rejects missing, malformed, and revoked session
         await requireUser({ headers: { [DEFAULT_HEADER_NAMES.user]: userToken('disabled-user') } }, res,
             () => assert.fail('next must not run'));
         assert.equal(res.statusCode, 401);
+
+        revokedUserSessionIds.add(hashUserSessionId('session-user-1'));
+        for (const headers of [{
+            [DEFAULT_HEADER_NAMES.user]: userToken('user-1')
+        }, {
+            authorization: `Bearer ${userToken('user-1')}`
+        }]) {
+            const revokedRes = response();
+            await requireUser({ headers }, revokedRes,
+                () => assert.fail('revoked session must not run next'));
+            assert.equal(revokedRes.statusCode, 401);
+        }
+
+        revokedUserSessionIds.delete(hashUserSessionId('session-user-1'));
+        userRevocationReadError = new Error('private database detail');
+        const unavailableRes = response();
+        await requireUser({
+            headers: { [DEFAULT_HEADER_NAMES.user]: userToken('user-1') }
+        }, unavailableRes, () => assert.fail('unavailable revocation state must fail closed'));
+        assert.equal(unavailableRes.statusCode, 503);
     } finally {
+        revokedUserSessionIds.clear();
+        userRevocationReadError = null;
         restoreConfig(previous);
     }
 });

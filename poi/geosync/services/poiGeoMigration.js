@@ -14,6 +14,8 @@ const BOOLEAN_VISIT_FIELDS = new Set([
     'accessible', 'ticketRequired', 'sheltered'
 ]);
 const DEFAULT_BATCH_SIZE = 250;
+const DEFAULT_REPORT_LIMIT = 1000;
+const MAX_REPORT_LIMIT = 10000;
 const POI_PROJECTION = Object.freeze({
     _id: 1,
     category: 1,
@@ -279,6 +281,20 @@ function migrationBatchSize(value) {
     return batchSize;
 }
 
+function migrationReportLimit(value) {
+    if (value === undefined || value === null || value === '') return DEFAULT_REPORT_LIMIT;
+    const reportLimit = Number(value);
+    if (!Number.isInteger(reportLimit) || reportLimit < 0 || reportLimit > MAX_REPORT_LIMIT) {
+        throw new TypeError(`reportLimit must be an integer between 0 and ${MAX_REPORT_LIMIT}`);
+    }
+    return reportLimit;
+}
+
+function appendReport(list, value, limit, omitted, key) {
+    if (list.length < limit) list.push(value);
+    else omitted[key]++;
+}
+
 async function* iteratePoiDocuments(POI, batchSize) {
     const query = POI.find({}, POI_PROJECTION);
     const leanQuery = query && typeof query.lean === 'function' ? query.lean() : query;
@@ -304,19 +320,23 @@ async function runPoiGeoMigration({
     POI,
     apply = false,
     scenicId = DEFAULT_SCENIC_ID,
-    batchSize
+    batchSize,
+    reportLimit
 }) {
     if (!POI || typeof POI.find !== 'function' || typeof POI.updateOne !== 'function') {
         throw new TypeError('POI model with find and updateOne is required');
     }
     const normalizedScenicId = String(scenicId || DEFAULT_SCENIC_ID).trim() || DEFAULT_SCENIC_ID;
     const normalizedBatchSize = migrationBatchSize(batchSize);
+    const normalizedReportLimit = migrationReportLimit(reportLimit);
     const operations = [];
     const items = [];
     const errors = [];
+    const omitted = { operations: 0, items: 0, errors: 0 };
     let total = 0;
     let success = 0;
     let skipped = 0;
+    let failed = 0;
     let gateNodeIdDeferred = 0;
     let superMapRefDeferred = 0;
 
@@ -327,26 +347,35 @@ async function runPoiGeoMigration({
         if (planned.deferred?.includes('superMapRef')) superMapRefDeferred++;
 
         if (planned.status === 'failed') {
-            errors.push(planned.error);
-            items.push({
+            failed++;
+            appendReport(errors, planned.error, normalizedReportLimit, omitted, 'errors');
+            appendReport(items, {
                 poiId: planned.error.poiId,
                 status: 'failed',
                 deferred: planned.deferred,
                 error: planned.error
-            });
+            }, normalizedReportLimit, omitted, 'items');
             continue;
         }
         if (planned.status === 'skipped') {
             skipped++;
-            items.push({ poiId: planned.poiId, status: 'skipped', deferred: planned.deferred });
+            appendReport(items, {
+                poiId: planned.poiId,
+                status: 'skipped',
+                deferred: planned.deferred
+            }, normalizedReportLimit, omitted, 'items');
             continue;
         }
 
         const operation = planned.operation;
-        operations.push(operation);
+        appendReport(operations, operation, normalizedReportLimit, omitted, 'operations');
         if (!apply) {
             success++;
-            items.push({ poiId: planned.poiId, status: 'planned', deferred: planned.deferred });
+            appendReport(items, {
+                poiId: planned.poiId,
+                status: 'planned',
+                deferred: planned.deferred
+            }, normalizedReportLimit, omitted, 'items');
             continue;
         }
 
@@ -357,7 +386,10 @@ async function runPoiGeoMigration({
             );
             if (matchedCount(result) > 0) {
                 success++;
-                items.push({ poiId: operation.poiId, status: 'updated' });
+                appendReport(items, {
+                    poiId: operation.poiId,
+                    status: 'updated'
+                }, normalizedReportLimit, omitted, 'items');
                 continue;
             }
 
@@ -366,7 +398,10 @@ async function runPoiGeoMigration({
                 const currentPlan = planPoi(current, total - 1, normalizedScenicId);
                 if (currentPlan.status === 'skipped') {
                     skipped++;
-                    items.push({ poiId: operation.poiId, status: 'skipped' });
+                    appendReport(items, {
+                        poiId: operation.poiId,
+                        status: 'skipped'
+                    }, normalizedReportLimit, omitted, 'items');
                     continue;
                 }
             }
@@ -378,8 +413,13 @@ async function runPoiGeoMigration({
                     ? 'POI changed after migration planning'
                     : 'POI was removed after migration planning'
             );
-            errors.push(error);
-            items.push({ poiId: operation.poiId, status: 'failed', error });
+            failed++;
+            appendReport(errors, error, normalizedReportLimit, omitted, 'errors');
+            appendReport(items, {
+                poiId: operation.poiId,
+                status: 'failed',
+                error
+            }, normalizedReportLimit, omitted, 'items');
         } catch (_error) {
             const error = migrationError(
                 null,
@@ -387,8 +427,13 @@ async function runPoiGeoMigration({
                 'WRITE_FAILED',
                 'Conditional POI update failed'
             );
-            errors.push(error);
-            items.push({ poiId: operation.poiId, status: 'failed', error });
+            failed++;
+            appendReport(errors, error, normalizedReportLimit, omitted, 'errors');
+            appendReport(items, {
+                poiId: operation.poiId,
+                status: 'failed',
+                error
+            }, normalizedReportLimit, omitted, 'items');
         }
     }
 
@@ -397,11 +442,16 @@ async function runPoiGeoMigration({
         operations,
         items,
         errors,
+        report: {
+            limit: normalizedReportLimit,
+            truncated: Object.values(omitted).some(value => value > 0),
+            omitted
+        },
         summary: {
             total,
             success,
             skipped,
-            failed: errors.length,
+            failed,
             gateNodeIdDeferred,
             superMapRefDeferred
         }
@@ -409,6 +459,10 @@ async function runPoiGeoMigration({
 }
 
 module.exports = {
+    DEFAULT_REPORT_LIMIT,
+    MAX_REPORT_LIMIT,
     planPoiGeoMigration,
-    runPoiGeoMigration
+    runPoiGeoMigration,
+    migrationBatchSize,
+    migrationReportLimit
 };

@@ -6,6 +6,9 @@ const { isDeepStrictEqual } = require('node:util');
 
 const { visitMetaDefaults } = require('../../services/hostPoiSchema');
 const {
+    MAX_REPORT_LIMIT,
+    migrationBatchSize,
+    migrationReportLimit,
     planPoiGeoMigration,
     runPoiGeoMigration
 } = require('../../services/poiGeoMigration');
@@ -273,6 +276,46 @@ test('migration streams production queries through a bounded lean cursor', async
     });
 });
 
+test('migration bounds report arrays without losing aggregate totals', async () => {
+    const documents = [];
+    for (let index = 0; index < 3; index++) {
+        documents.push({
+            _id: `poi-valid-${index}`,
+            category: 'museum',
+            location: { lng: 120 + index / 100, lat: 30 }
+        });
+        documents.push({
+            _id: `poi-invalid-${index}`,
+            category: 'museum',
+            location: { lng: 200 + index, lat: 30 }
+        });
+    }
+    const model = createModel(documents);
+
+    const result = await runPoiGeoMigration({
+        POI: model,
+        scenicId: 'scenic-a',
+        reportLimit: 2
+    });
+
+    assert.equal(result.summary.total, 6);
+    assert.equal(result.summary.success, 3);
+    assert.equal(result.summary.failed, 3);
+    assert.equal(result.operations.length, 2);
+    assert.equal(result.items.length, 2);
+    assert.equal(result.errors.length, 2);
+    assert.deepEqual(result.report, {
+        limit: 2,
+        truncated: true,
+        omitted: { operations: 1, items: 4, errors: 1 }
+    });
+    assert.equal(model.calls.updates.length, 0);
+    assert.equal(migrationBatchSize(undefined), 250);
+    assert.throws(() => migrationBatchSize(5001), /batchSize/);
+    assert.equal(migrationReportLimit(undefined), 1000);
+    assert.throws(() => migrationReportLimit(MAX_REPORT_LIMIT + 1), /reportLimit/);
+});
+
 test('apply continues after sanitized per-POI write failures', async () => {
     const model = createModel([{
         _id: 'poi-fail', location: { lng: 120, lat: 30 }
@@ -362,6 +405,35 @@ test('CLI defaults to dry-run, rejects unsafe input, and disables automatic DB w
     assert.equal(connectCalls, 0);
     assert.match(missingErr.value(), /MONGO_URI_REQUIRED/);
 
+    for (const [envOverride, expectedCode] of [[
+        { POI_MIGRATION_BATCH_SIZE: '0' },
+        'POI_MIGRATION_BATCH_SIZE_INVALID'
+    ], [
+        { POI_MIGRATION_BATCH_SIZE: '5001' },
+        'POI_MIGRATION_BATCH_SIZE_INVALID'
+    ], [
+        { POI_MIGRATION_REPORT_LIMIT: '-1' },
+        'POI_MIGRATION_REPORT_LIMIT_INVALID'
+    ], [
+        { POI_MIGRATION_REPORT_LIMIT: '10001' },
+        'POI_MIGRATION_REPORT_LIMIT_INVALID'
+    ]]) {
+        let invalidConnectCalls = 0;
+        const invalidErr = captureStream();
+        const invalidCode = await runCli({
+            env: { MONGO_URI: 'mongodb://example.invalid/poi', ...envOverride },
+            stdout: captureStream().stream,
+            stderr: invalidErr.stream,
+            mongooseInstance: {
+                async connect() { invalidConnectCalls++; },
+                async disconnect() {}
+            }
+        });
+        assert.equal(invalidCode, EXIT.INPUT_ERROR);
+        assert.equal(invalidConnectCalls, 0);
+        assert.equal(JSON.parse(invalidErr.value()).code, expectedCode);
+    }
+
     const model = createModel([{
         _id: 'poi-1', location: { lng: 120, lat: 30 }
     }]);
@@ -393,4 +465,9 @@ test('CLI defaults to dry-run, rejects unsafe input, and disables automatic DB w
     assert.equal(summary.success, 1);
     assert.equal(summary.gateNodeIdDeferred, 1);
     assert.equal(summary.superMapRefDeferred, 1);
+    assert.deepEqual(summary.report, {
+        limit: 1000,
+        truncated: false,
+        omitted: { operations: 0, items: 0, errors: 0 }
+    });
 });

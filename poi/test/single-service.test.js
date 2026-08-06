@@ -12,6 +12,14 @@ const POI_ROOT = path.resolve(__dirname, '..');
 const TEST_ADMIN_PASSWORD = 'phase5-password-2026';
 const TEST_ADMIN_PASSWORD_HASH = '$scrypt$v=1$ln=15,r=8,p=3$'
     + 'cGhhc2U1LXRlc3Qtc2FsdA$SfaAtmf0OyIUgNuRkV16XX6BdcUReNmk4eFLEPxP2a4';
+const FORBIDDEN_FETCH_PORTS = new Set([
+    1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69,
+    77, 79, 87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119,
+    123, 135, 137, 139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515,
+    526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990,
+    993, 995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000,
+    6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080
+]);
 
 function countOf(source, pattern) {
     return (source.match(pattern) || []).length;
@@ -30,14 +38,17 @@ function cookiePair(setCookie) {
 }
 
 async function reservePort() {
-    const server = net.createServer();
-    await new Promise((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(0, '127.0.0.1', resolve);
-    });
-    const { port } = server.address();
-    await new Promise(resolve => server.close(resolve));
-    return port;
+    for (let attempt = 0; attempt < 20; attempt++) {
+        const server = net.createServer();
+        await new Promise((resolve, reject) => {
+            server.once('error', reject);
+            server.listen(0, '127.0.0.1', resolve);
+        });
+        const { port } = server.address();
+        await new Promise(resolve => server.close(resolve));
+        if (!FORBIDDEN_FETCH_PORTS.has(port)) return port;
+    }
+    throw new Error('Unable to reserve a Fetch-compatible test port');
 }
 
 async function waitForResponse(url, timeoutMs = 10000) {
@@ -84,6 +95,20 @@ async function stopChild(child) {
 test('POI server contains one production runtime and attaches GeoSync before listen', async () => {
     const source = await readFile(path.join(POI_ROOT, 'server.js'), 'utf8');
     const geosyncSource = await readFile(path.join(POI_ROOT, 'geosync', 'index.js'), 'utf8');
+    const hostAuthSource = await readFile(
+        path.join(POI_ROOT, 'geosync', 'services', 'hostAuth.js'),
+        'utf8'
+    );
+    const checkinServiceSource = await readFile(
+        path.join(POI_ROOT, 'geosync', 'services', 'checkinService.js'),
+        'utf8'
+    );
+    const multipartRouteSources = await Promise.all(
+        ['photospots.js', 'checkin.js', 'pairing.js'].map(fileName => readFile(
+            path.join(POI_ROOT, 'geosync', 'routes', fileName),
+            'utf8'
+        ))
+    );
     const portalSource = await readFile(path.join(POI_ROOT, 'portal.html'), 'utf8');
     const legacyEntrySources = await Promise.all(
         ['index.html', 'admin.html', 'chat.html']
@@ -171,8 +196,95 @@ test('POI server contains one production runtime and attaches GeoSync before lis
     assert.match(portalLogoutSource,
         /serverLogoutConfirmed\s*\?\s*['"]anonymous['"]\s*:\s*['"]unavailable['"]/,
         'an unconfirmed server logout must remain observable');
+    assert.match(portalLogoutSource, /The session may still be active/,
+        'an unconfirmed logout must visibly warn that server-side authority may remain');
     assert.match(portalLogoutSource, /setOpenId\(['"]['"]\)/,
         'portal logout must clear the in-memory identity');
+    const serverLogoutAt = source.indexOf("app.post('/api/auth/logout'");
+    const serverSessionAt = source.indexOf("app.get('/api/auth/session'", serverLogoutAt);
+    assert.ok(serverLogoutAt >= 0 && serverSessionAt > serverLogoutAt);
+    const serverLogoutSource = source.slice(serverLogoutAt, serverSessionAt);
+    assert.match(serverLogoutSource, /createGlobalLogoutHandler\(hostAuth\)/,
+        'the global logout route must use the tested host-auth handler');
+    assert.match(hostAuthSource,
+        /function createGlobalLogoutHandler[\s\S]*Promise\.allSettled\(\[[\s\S]*hostAuth\.revokeUserSession\(req\)[\s\S]*hostAuth\.revokeAdminSession\(req\)/,
+        'global logout must attempt persistent user and administrator session revocation');
+    assert.match(hostAuthSource,
+        /if \(userCompleted\) hostAuth\.clearUserSession\(res\)/,
+        'the user cookie must clear only after its revocation check completes safely');
+    assert.match(hostAuthSource,
+        /if \(adminCompleted\) hostAuth\.clearAdminSession\(res\)/,
+        'the administrator cookie must clear only after its revocation check completes safely');
+    const hostUploadAt = source.indexOf("const uploadPoiImage = createImageUpload('poiImage'");
+    const hostCleanupAt = source.indexOf('function cleanupUploadedFile', hostUploadAt);
+    assert.ok(hostUploadAt >= 0 && hostCleanupAt > hostUploadAt);
+    const hostUploadSource = source.slice(hostUploadAt, hostCleanupAt);
+    assert.match(hostUploadSource, /storage:\s*uploadStorage/,
+        'host uploads must retain their reviewed custom disk storage');
+    assert.match(hostUploadSource, /logPrefix:\s*['"]\[POI\] \[UPLOAD\]['"]/,
+        'host upload failures must use a bounded operational log prefix');
+    assert.doesNotMatch(hostUploadSource, /err\.message/,
+        'host uploads must never return raw Multer or storage messages');
+    assert.match(source, /ocrError\s*=\s*['"]OCR_UNAVAILABLE['"]/,
+        'OCR degradation must expose only a stable public error code');
+    assert.doesNotMatch(source, /ocrError\s*=\s*[^;\n]*\.message/,
+        'OCR responses must never contain an upstream SDK message');
+    assert.doesNotMatch(source, /console\.(?:error|warn)\([^\n]*\.message/,
+        'host runtime logs must not emit raw error messages');
+    assert.match(checkinServiceSource, /safeErrorCode\(e, ['"]OCR_FAILED['"]\)/,
+        'checkin OCR degradation must log only a sanitized error code');
+    for (const route of ['/api/ocr/classify', '/api/submit-poi', '/api/poi/update']) {
+        const routeAt = source.indexOf(`app.post('${route}'`);
+        const nextRouteAt = source.indexOf('\napp.', routeAt + 1);
+        const routeSource = source.slice(routeAt, nextRouteAt >= 0 ? nextRouteAt : undefined);
+        assert.match(routeSource, /requireUser, uploadPoiImage/,
+            `${route} must authenticate before Multer writes a file`);
+        assert.match(routeSource,
+            /await rejectMismatchedMultipartIdentity\(req, req\.openId\)/,
+            `${route} must recheck parsed multipart identity hints`);
+    }
+    for (const routeSource of multipartRouteSources) {
+        assert.match(routeSource, /createImageUpload\('photo'\)/,
+            'GeoSync photo routes must use the bounded JSON-error upload middleware');
+        assert.match(routeSource,
+            /post\([\s\S]*uploadPhoto[\s\S]*await rejectMismatchedMultipartIdentity\(req, req\.openId\)/,
+            'GeoSync upload routes must recheck identity after Multer parsing');
+    }
+    const checkinRouteSource = multipartRouteSources[1];
+    assert.match(checkinRouteSource,
+        /router\.post\('\/', enforceCheckinRateLimit, uploadPhoto/,
+        'checkin rate limiting must run before Multer writes a file');
+    assert.match(checkinRouteSource,
+        /onUploadReferencePersisted:\s*\(\)\s*=>\s*\{ uploadCommitted = true; \}/,
+        'checkin must retain an upload as soon as its database reference is durable');
+    assert.match(portalSource, /fetch\(['"]\/api\/admin\/session['"]/,
+        'the administrator UI must restore state from the protected cookie session');
+    assert.match(portalSource, /fetchJson\(['"]\/api\/admin\/logout['"][\s\S]*?method:\s*['"]POST['"]/,
+        'the administrator panel must expose explicit server-side revocation');
+    assert.match(portalSource, /sessionStorage\.removeItem\(\s*['"]adminToken['"]\s*\)/,
+        'the portal must clean the retired administrator marker');
+    assert.doesNotMatch(portalSource,
+        /sessionStorage\.(?:getItem|setItem)\(\s*['"]adminToken['"]/,
+        'administrator state must not be restored from browser storage');
+    assert.doesNotMatch(portalSource,
+        /\badminUrl\b|[?&]adminToken=|Authorization:\s*`Bearer \$\{adminToken\}`/,
+        'administrator requests must rely only on the HttpOnly cookie');
+    assert.doesNotMatch(portalSource, /JSON\.stringify\(\{[^}]*\badminToken\b/,
+        'administrator markers must not be copied into request bodies');
+    assert.match(portalSource, /error\.status\s*=\s*res\.status/,
+        'request failures must preserve HTTP status for authorization recovery');
+    assert.match(portalSource,
+        /window\.addEventListener\(['"]focus['"][\s\S]*document\.addEventListener\(['"]visibilitychange['"]/,
+        'administrator state must be revalidated after tab or window activation');
+    assert.match(portalSource,
+        /const adminProbeRef = useRef\(0\)[\s\S]*const generation = \+\+adminProbeRef\.current[\s\S]*generation !== adminProbeRef\.current/,
+        'only the newest administrator session probe may update UI state');
+    assert.match(portalSource,
+        /response\.status === 401 \|\| response\.status === 403[\s\S]*clearAdminUi\(['"]anonymous['"]\)[\s\S]*setAdminSessionStatus\(['"]unavailable['"]\)/,
+        'administrator probes must distinguish expired sessions from unavailable revocation state');
+    assert.match(portalSource,
+        /async function adminFetch[\s\S]*error\?\.status === 401[\s\S]*error\?\.status === 403[\s\S]*setPois\(\[\]\)[\s\S]*onUnauthorized\(\)/,
+        'administrator requests must clear cached data and close stale UI on authorization loss');
     assert.doesNotMatch(portalSource, /io\(\s*\{\s*query:\s*\{\s*openId/i,
         'Socket authentication must use the signed cookie, not an OpenID query');
     assert.doesNotMatch(portalSource,
@@ -349,9 +461,7 @@ test('single POI process serves old and GeoSync endpoints without exposing backe
         const readyResponse = await fetch(`${base}/api/geosync/health/ready`);
         assert.equal(readyResponse.status, 503);
         const ready = await readyResponse.json();
-        assert.equal(ready.ready, false);
-        assert.equal(ready.mongoReady, false);
-        assert.equal(ready.geosyncReady, false);
+        assert.deepEqual(ready, { state: 'not-ready', ready: false });
 
         const adminResponse = await fetch(`${base}/api/admin/geosync/dashboard`);
         assert.equal(adminResponse.status, 403);
@@ -684,6 +794,14 @@ test('configured host auth uses HttpOnly cookies and rejects unsafe credential t
         const privateHealthBody = await privateHealth.json();
         assert.equal(['connecting', 'offline'].includes(privateHealthBody.mongo.state), true);
         assert.equal(privateHealthBody.gis.error.code, 'SUPERMAP_MANIFEST_NOT_FOUND');
+        const adminSessionStatus = await fetch(`${base}/api/admin/session`, {
+            headers: { authorization: `Bearer ${adminCredential}` }
+        });
+        assert.equal(adminSessionStatus.status, 200);
+        assert.deepEqual(await adminSessionStatus.json(), {
+            success: true,
+            data: { authenticated: true }
+        });
 
         for (let attempt = 0; attempt < 10; attempt++) {
             const failedLogin = await fetch(`${base}/api/admin/login`, {

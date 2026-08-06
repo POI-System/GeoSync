@@ -20,8 +20,16 @@ const { createFixedWindowRateLimiter } = require('./geosync/services/fixedWindow
 const { monitorInitialMongoConnection } = require('./geosync/services/mongoStartup');
 const { installGracefulShutdown } = require('./geosync/services/gracefulShutdown');
 const {
+    buildErrorLogContext,
+    safeErrorCode
+} = require('./geosync/lib/respond');
+const { createImageUpload } = require('./geosync/lib/imageUpload');
+const {
     getAdminSessionRevocationModel
 } = require('./geosync/services/adminSessionRevocation');
+const {
+    getUserSessionRevocationModel
+} = require('./geosync/services/userSessionRevocation');
 const {
     AdminPasswordError,
     AdminPasswordBusyError,
@@ -37,6 +45,7 @@ const {
 const {
     LEGACY_ADMIN_SESSION_MARKER,
     HostAuthError,
+    createGlobalLogoutHandler,
     createHostAuth
 } = require('./geosync/services/hostAuth');
 const {
@@ -48,6 +57,10 @@ const {
     serializeExpiredCookie,
     timingSafeEqualText
 } = require('./geosync/lib/sessionAuth');
+const {
+    cleanupRequestUploads,
+    rejectMismatchedMultipartIdentity
+} = require('./geosync/lib/identityHints');
 
 const OAUTH_STATE_COOKIE_NAME = 'poi_oauth_state';
 const QR_CLAIM_COOKIE_NAME = 'poi_qr_login_claim';
@@ -232,10 +245,12 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model('User', userSchema);
 const AdminSessionRevocation = getAdminSessionRevocationModel(mongoose);
+const UserSessionRevocation = getUserSessionRevocationModel(mongoose);
 
 const hostAuth = createHostAuth({
     User,
     AdminSessionRevocation,
+    UserSessionRevocation,
     sessionSecret: CONFIG.authSessionSecret,
     adminToken: CONFIG.adminToken,
     adminUsername: CONFIG.admin.username || 'admin',
@@ -382,7 +397,7 @@ async function sendTemplate(openId, templateId, data = {}) {
         }
         return r.data;
     } catch (e) {
-        console.error('[Template Error]', e.message);
+        console.error('[Template Error]', safeErrorCode(e, 'TEMPLATE_SEND_FAILED'));
     }
 }
 
@@ -411,27 +426,17 @@ const uploadStorage = multer.diskStorage({
         cb(null, `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${ext}`);
     }
 });
-const upload = multer({
+const uploadPoiImage = createImageUpload('poiImage', {
     storage: uploadStorage,
-    limits: { fileSize: 10 * 1024 * 1024 },
-    fileFilter: (_req, file, cb) => {
-        if (['image/jpeg', 'image/png'].includes(file.mimetype)) return cb(null, true);
-        cb(new Error('仅支持 jpeg/png 图片'));
-    }
+    logPrefix: '[POI] [UPLOAD]'
 });
-
-function uploadPoiImage(req, res, next) {
-    upload.single('poiImage')(req, res, (err) => {
-        if (!err) return next();
-        const message = err.code === 'LIMIT_FILE_SIZE' ? '图片不能超过 10MB' : (err.message || '图片上传失败');
-        return res.status(400).json({ success: false, message });
-    });
-}
 
 function cleanupUploadedFile(file) {
     if (!file || !file.path) return;
     fs.unlink(file.path, (err) => {
-        if (err && err.code !== 'ENOENT') console.warn('[Upload Cleanup]', err.message);
+        if (err && err.code !== 'ENOENT') {
+            console.warn('[Upload Cleanup]', safeErrorCode(err, 'UNLINK_FAILED'));
+        }
     });
 }
 
@@ -553,8 +558,8 @@ async function classifyPoiFromImage(file, poiName, description) {
         try {
             ocrText = await recognizeUploadedImageText(file);
         } catch (e) {
-            ocrError = e.message || 'OCR failed';
-            console.warn('[OCR Skip]', e.message);
+            ocrError = 'OCR_UNAVAILABLE';
+            console.warn('[OCR Skip]', safeErrorCode(e, 'OCR_FAILED'));
         }
     }
     return {
@@ -573,7 +578,9 @@ function cleanupLocalImageUrl(imageUrl) {
     const target = path.resolve(uploadRoot, filename);
     if (!target.startsWith(uploadRoot + path.sep)) return;
     fs.unlink(target, (err) => {
-        if (err && err.code !== 'ENOENT') console.warn('[Image Cleanup]', err.message);
+        if (err && err.code !== 'ENOENT') {
+            console.warn('[Image Cleanup]', safeErrorCode(err, 'UNLINK_FAILED'));
+        }
     });
 }
 
@@ -618,6 +625,42 @@ async function getReviewerTemplateOpenIds() {
         console.warn('[Template Skip] no valid reviewer openId; open the reviewer menu once to subscribe a real WeChat user');
     }
     return openIds;
+}
+
+async function publishPendingPoiNotifications(poi, options = {}) {
+    try {
+        const reviewerOpenIds = await getReviewerTemplateOpenIds();
+        for (const reviewerOpenId of reviewerOpenIds) {
+            void sendTemplate(reviewerOpenId, CONFIG.wechat.templates.newPoiWait, buildTemplateData({
+                poi: poi.poiName,
+                user: COLLECTOR_TEMPLATE_LABEL,
+                time: formatDateTime(poi.createTime)
+            }));
+        }
+    } catch (error) {
+        console.warn('[POI Review Notification]', error?.name || 'Error');
+    }
+
+    try {
+        if (!io) return;
+        const event = {
+            poiId: poi._id,
+            poiName: poi.poiName,
+            ...(options.updated ? { updated: true } : {})
+        };
+        io.to('reviewer_group').emit('newPoi', event);
+        io.to(socketRoomForGroup('reviewer_group')).emit('newPoi', event);
+        if (options.updated) {
+            io.to(`user_${poi.userOpenId}`).emit('poiStatusChanged', {
+                poiId: poi._id,
+                poiName: poi.poiName,
+                status: 'pending',
+                rejectReason: ''
+            });
+        }
+    } catch (error) {
+        console.warn('[POI Socket Notification]', error?.name || 'Error');
+    }
 }
 
 async function isActiveUser(openId) {
@@ -994,7 +1037,7 @@ app.post('/api/user/bind-role', requireUser, async (req, res) => {
         if (!user) return res.status(401).json({ success: false, message: '用户身份无效' });
         res.json({ success: true, message: '绑定成功', role: user.role });
     } catch (e) {
-        console.error('[bind-role]', e.message);
+        console.error('[bind-role]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '服务器错误' });
     }
 });
@@ -1068,10 +1111,12 @@ app.post('/api/admin/logout', async (req, res) => {
     }
 });
 
-app.post('/api/auth/logout', (req, res) => {
-    hostAuth.clearUserSession(res);
-    res.json({ success: true });
+app.get('/api/admin/session', requireAdmin, (_req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json({ success: true, data: { authenticated: true } });
 });
+
+app.post('/api/auth/logout', createGlobalLogoutHandler(hostAuth));
 
 app.get('/api/auth/session', requireUser, (req, res) => {
     res.set('Cache-Control', 'no-store');
@@ -1121,6 +1166,12 @@ app.post('/api/admin/screen/logout', requireAdmin, (_req, res) => {
 
 app.post('/api/ocr/classify', requireUser, uploadPoiImage, async (req, res) => {
     try {
+        if (await rejectMismatchedMultipartIdentity(req, req.openId)) {
+            return res.status(403).json({
+                success: false,
+                message: 'User identity does not match the session.'
+            });
+        }
         const { poiName, description } = req.body;
         if (!req.file) {
             return res.status(400).json({ success: false, message: '请上传图片' });
@@ -1130,15 +1181,22 @@ app.post('/api/ocr/classify', requireUser, uploadPoiImage, async (req, res) => {
         res.json({ success: true, ...result });
     } catch (e) {
         cleanupUploadedFile(req.file);
-        console.error('[ocr-classify]', e.message);
+        console.error('[ocr-classify]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: 'OCR 识别失败' });
     }
 });
 
 app.post('/api/submit-poi', requireUser, uploadPoiImage, async (req, res) => {
+    let uploadCommitted = false;
     try {
+        if (await rejectMismatchedMultipartIdentity(req, req.openId)) {
+            return res.status(403).json({
+                success: false,
+                message: 'User identity does not match the session.'
+            });
+        }
         if (await isCollectionPaused()) {
-            cleanupUploadedFile(req.file);
+            await cleanupRequestUploads(req);
             return res.status(423).json({ success: false, message: '采集已暂停，请等待管理员开放采集' });
         }
         const { poiName, description, lng, lat } = req.body;
@@ -1146,11 +1204,11 @@ app.post('/api/submit-poi', requireUser, uploadPoiImage, async (req, res) => {
         const parsedLng = parseCoordinate(lng);
         const parsedLat = parseCoordinate(lat);
         if (!poiName || !lng || !lat || !req.file) {
-            cleanupUploadedFile(req.file);
+            await cleanupRequestUploads(req);
             return res.status(400).json({ success: false, message: '参数不足' });
         }
         if (parsedLng === null || parsedLat === null) {
-            cleanupUploadedFile(req.file);
+            await cleanupRequestUploads(req);
             return res.status(400).json({ success: false, message: '经纬度格式错误' });
         }
 
@@ -1165,34 +1223,28 @@ app.post('/api/submit-poi', requireUser, uploadPoiImage, async (req, res) => {
             imageUrl: req.file ? `/uploads/${req.file.filename}` : ''
         });
         await poi.save();
-
-        
-        const reviewerOpenIds = await getReviewerTemplateOpenIds();
-        for (const reviewerOpenId of reviewerOpenIds) {
-            sendTemplate(reviewerOpenId, CONFIG.wechat.templates.newPoiWait, buildTemplateData({
-                poi: poi.poiName,
-                user: COLLECTOR_TEMPLATE_LABEL,
-                time: formatDateTime(poi.createTime)
-            }));
-        }
-
-        
-        if (io) {
-            io.to('reviewer_group').emit('newPoi', { poiId: poi._id, poiName });
-            io.to(socketRoomForGroup('reviewer_group')).emit('newPoi', { poiId: poi._id, poiName });
-        }
+        uploadCommitted = true;
+        await publishPendingPoiNotifications(poi);
 
         res.json({ success: true, aiCategory: aiCat, id: poi._id });
     } catch (e) {
-        console.error('[submit-poi]', e.message);
+        if (!uploadCommitted) await cleanupRequestUploads(req);
+        console.error('[submit-poi]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '提交失败' });
     }
 });
 
 app.post('/api/poi/update', requireUser, uploadPoiImage, async (req, res) => {
+    let uploadCommitted = false;
     try {
+        if (await rejectMismatchedMultipartIdentity(req, req.openId)) {
+            return res.status(403).json({
+                success: false,
+                message: 'User identity does not match the session.'
+            });
+        }
         if (await isCollectionPaused()) {
-            cleanupUploadedFile(req.file);
+            await cleanupRequestUploads(req);
             return res.status(423).json({ success: false, message: '采集已暂停，请等待管理员开放采集' });
         }
         const { id, poiName, description, lng, lat } = req.body;
@@ -1200,17 +1252,17 @@ app.post('/api/poi/update', requireUser, uploadPoiImage, async (req, res) => {
         const parsedLng = parseCoordinate(lng);
         const parsedLat = parseCoordinate(lat);
         if (!id || !mongoose.isValidObjectId(id) || !poiName || lng === undefined || lat === undefined) {
-            cleanupUploadedFile(req.file);
+            await cleanupRequestUploads(req);
             return res.status(400).json({ success: false, message: '参数不足' });
         }
         if (parsedLng === null || parsedLat === null) {
-            cleanupUploadedFile(req.file);
+            await cleanupRequestUploads(req);
             return res.status(400).json({ success: false, message: '经纬度格式错误' });
         }
 
         const poi = await POI.findOne({ _id: id, userOpenId, status: 'rejected' });
         if (!poi) {
-            cleanupUploadedFile(req.file);
+            await cleanupRequestUploads(req);
             const existing = await POI.findById(id);
             const message = existing ? '只有被驳回且属于自己的点位可以修改更新' : '点位不存在';
             return res.status(existing ? 400 : 404).json({ success: false, message });
@@ -1227,33 +1279,15 @@ app.post('/api/poi/update', requireUser, uploadPoiImage, async (req, res) => {
         poi.reviewerId = '';
         if (req.file) poi.imageUrl = `/uploads/${req.file.filename}`;
         await poi.save();
+        uploadCommitted = Boolean(req.file);
 
         if (req.file && oldImageUrl !== poi.imageUrl) cleanupLocalImageUrl(oldImageUrl);
-
-        const reviewerOpenIds = await getReviewerTemplateOpenIds();
-        for (const reviewerOpenId of reviewerOpenIds) {
-            sendTemplate(reviewerOpenId, CONFIG.wechat.templates.newPoiWait, buildTemplateData({
-                poi: poi.poiName,
-                user: COLLECTOR_TEMPLATE_LABEL,
-                time: formatDateTime(poi.createTime)
-            }));
-        }
-
-        if (io) {
-            io.to('reviewer_group').emit('newPoi', { poiId: poi._id, poiName: poi.poiName, updated: true });
-            io.to(socketRoomForGroup('reviewer_group')).emit('newPoi', { poiId: poi._id, poiName: poi.poiName, updated: true });
-            io.to(`user_${poi.userOpenId}`).emit('poiStatusChanged', {
-                poiId: poi._id,
-                poiName: poi.poiName,
-                status: 'pending',
-                rejectReason: ''
-            });
-        }
+        await publishPendingPoiNotifications(poi, { updated: true });
 
         res.json({ success: true, aiCategory: aiCat, id: poi._id });
     } catch (e) {
-        cleanupUploadedFile(req.file);
-        console.error('[update-poi]', e.message);
+        if (!uploadCommitted) await cleanupRequestUploads(req);
+        console.error('[update-poi]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '更新提交失败' });
     }
 });
@@ -1339,7 +1373,7 @@ app.post('/api/admin/approve-poi', requireReviewerOrAdmin, async (req, res) => {
 
         res.json({ success: true });
     } catch (e) {
-        console.error('[approve-poi]', e.message);
+        console.error('[approve-poi]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '操作失败' });
     }
 });
@@ -1447,7 +1481,7 @@ app.post('/api/poi/dispute', requireUser, async (req, res) => {
         }
         res.json({ success: true });
     } catch (e) {
-        console.error('[poi-dispute]', e.message);
+        console.error('[poi-dispute]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '异议提交失败' });
     }
 });
@@ -1476,7 +1510,7 @@ app.get('/api/admin/reviewed-pois', requireAdmin, async (req, res) => {
             .limit(size);
         res.json({ success: true, data: data.map(serializePoi) });
     } catch (e) {
-        console.error('[admin-reviewed-pois]', e.message);
+        console.error('[admin-reviewed-pois]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '查询失败' });
     }
 });
@@ -1499,7 +1533,7 @@ app.delete('/api/admin/poi/:id', requireAdmin, async (req, res) => {
         if (io) io.emit('poiStatusChanged', { poiId: poi._id, deleted: true, public: true });
         res.json({ success: true });
     } catch (e) {
-        console.error('[admin-delete-poi]', e.message);
+        console.error('[admin-delete-poi]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '删除失败' });
     }
 });
@@ -1528,7 +1562,7 @@ app.post('/api/admin/email-poi', requireAdmin, async (req, res) => {
         });
         res.json({ success: true, email: targetEmail });
     } catch (e) {
-        console.error('[admin-email-poi]', e.message);
+        console.error('[admin-email-poi]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '邮件发送失败' });
     }
 });
@@ -1541,7 +1575,7 @@ app.get('/api/admin/dispute-settings', requireAdmin, async (_req, res) => {
             thirdPartyEmail: setting.thirdPartyEmail || CONFIG.smtp.defaultTestEmail || ''
         });
     } catch (e) {
-        console.error('[admin-dispute-settings]', e.message);
+        console.error('[admin-dispute-settings]', buildErrorLogContext(_req, e));
         res.status(500).json({ success: false, message: '查询失败' });
     }
 });
@@ -1559,7 +1593,7 @@ app.post('/api/admin/dispute-settings', requireAdmin, async (req, res) => {
         );
         res.json({ success: true, thirdPartyEmail: setting.thirdPartyEmail || CONFIG.smtp.defaultTestEmail || '' });
     } catch (e) {
-        console.error('[admin-save-dispute-settings]', e.message);
+        console.error('[admin-save-dispute-settings]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '保存失败' });
     }
 });
@@ -1569,7 +1603,7 @@ app.get('/api/admin/collection-status', requireAdmin, async (_req, res) => {
         const setting = await getSystemSetting();
         res.json({ success: true, collectionPaused: Boolean(setting.collectionPaused) });
     } catch (e) {
-        console.error('[admin-collection-status]', e.message);
+        console.error('[admin-collection-status]', buildErrorLogContext(_req, e));
         res.status(500).json({ success: false, message: '查询失败' });
     }
 });
@@ -1585,7 +1619,7 @@ app.post('/api/admin/collection-status', requireAdmin, async (req, res) => {
         if (io) io.emit('collectionStatusChanged', { collectionPaused: Boolean(setting.collectionPaused) });
         res.json({ success: true, collectionPaused: Boolean(setting.collectionPaused) });
     } catch (e) {
-        console.error('[admin-set-collection-status]', e.message);
+        console.error('[admin-set-collection-status]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '操作失败' });
     }
 });
@@ -1604,7 +1638,7 @@ app.post('/api/admin/broadcast', requireAdmin, async (req, res) => {
         const result = await broadcastNotification({ audience, title, content, type: 'system' });
         res.json({ success: true, ...result });
     } catch (e) {
-        console.error('[admin-broadcast]', e.message);
+        console.error('[admin-broadcast]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '公告发送失败' });
     }
 });
@@ -1619,7 +1653,7 @@ app.get('/api/dispute/:token', async (req, res) => {
         if (!poi) return res.status(404).json({ success: false, message: '点位不存在' });
         res.json({ success: true, data: serializeDispute(dispute, poi) });
     } catch (e) {
-        console.error('[dispute-detail]', e.message);
+        console.error('[dispute-detail]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '查询失败' });
     }
 });
@@ -1712,7 +1746,7 @@ app.post('/api/dispute/:token/resolve', async (req, res) => {
         }
         res.json({ success: true, status: finalAction });
     } catch (e) {
-        console.error('[dispute-resolve]', e.message);
+        console.error('[dispute-resolve]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '处理失败' });
     }
 });
@@ -1732,7 +1766,7 @@ app.get('/api/notifications', requireUser, async (req, res) => {
         const unreadCount = await Notification.countDocuments({ recipientOpenId: openId, read: false });
         res.json({ success: true, unreadCount, data: data.map(serializeNotification) });
     } catch (e) {
-        console.error('[notifications]', e.message);
+        console.error('[notifications]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '查询失败' });
     }
 });
@@ -1754,7 +1788,7 @@ app.post('/api/notifications/read', requireUser, async (req, res) => {
         await Notification.updateMany(query, { read: true });
         res.json({ success: true });
     } catch (e) {
-        console.error('[notifications-read]', e.message);
+        console.error('[notifications-read]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '操作失败' });
     }
 });
@@ -1770,7 +1804,7 @@ app.get('/api/chat/rooms', requireUser, async (req, res) => {
         }).sort({ lastTime: -1 }).limit(100);
         res.json({ success: true, data: data.map(serializeChatRoom) });
     } catch (e) {
-        console.error('[chat-rooms]', e.message);
+        console.error('[chat-rooms]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: '查询失败' });
     }
 });
@@ -1800,7 +1834,7 @@ app.get('/api/chat/history', requireUser, async (req, res) => {
         const data = await ChatMessage.find({ roomId }).sort({ createTime: -1 }).limit(size);
         res.json({ success: true, data: data.reverse().map(serializeChatMessage) });
     } catch (e) {
-        console.error('[chat-history]', e.message);
+        console.error('[chat-history]', buildErrorLogContext(req, e));
         res.status(500).json({ success: false, message: 'Query failed' });
     }
 });
@@ -2211,7 +2245,7 @@ io.on('connection', async (socket) => {
                 socket.join(`chat_${roomId}`);
             }
         } catch (e) {
-            console.warn('[joinChatRoom]', e.message);
+            console.warn('[joinChatRoom]', safeErrorCode(e, 'CHAT_ROOM_JOIN_FAILED'));
         }
     });
 
@@ -2244,7 +2278,7 @@ io.on('connection', async (socket) => {
             }
             io.to(`chat_${roomId}`).emit('chatMessage', serializeChatMessage(msg));
         } catch (e) {
-            console.error('[chatMessage]', e.message);
+            console.error('[chatMessage]', safeErrorCode(e, 'CHAT_MESSAGE_FAILED'));
         }
     });
 
@@ -2263,7 +2297,7 @@ io.on('connection', async (socket) => {
                 type: 'system'
             });
         } catch (e) {
-            console.error('[notice broadcast]', e.message);
+            console.error('[notice broadcast]', safeErrorCode(e, 'NOTICE_BROADCAST_FAILED'));
         }
     });
 });
@@ -2272,7 +2306,7 @@ geosync.attach({
     app,
     io,
     mongoose,
-    models: { POI, User, AdminSessionRevocation },
+    models: { POI, User, AdminSessionRevocation, UserSessionRevocation },
     helpers: {
         sendTemplate,
         sendMail: sendGeoSyncMail,

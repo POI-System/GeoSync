@@ -18,6 +18,12 @@ const {
     isAdminSessionRevoked,
     revokeAdminSession
 } = require('./adminSessionRevocation');
+const {
+    UserSessionRevocationError,
+    isUserSessionRevoked,
+    revokeUserSession
+} = require('./userSessionRevocation');
+const { hasMismatchedIdentityHint } = require('../lib/identityHints');
 
 const LEGACY_ADMIN_SESSION_MARKER = 'cookie-session';
 const VALID_USER_ROLES = new Set(['collector', 'reviewer', 'thirdParty']);
@@ -29,6 +35,50 @@ class HostAuthError extends Error {
         this.code = code;
         this.httpStatus = httpStatus;
     }
+}
+
+function createGlobalLogoutHandler(hostAuth) {
+    if (!hostAuth
+        || typeof hostAuth.revokeUserSession !== 'function'
+        || typeof hostAuth.revokeAdminSession !== 'function') {
+        throw new TypeError('A configured hostAuth service is required.');
+    }
+    return async function globalLogout(req, res) {
+        res.set('Cache-Control', 'no-store');
+        const [userResult, adminResult] = await Promise.allSettled([
+            hostAuth.revokeUserSession(req),
+            hostAuth.revokeAdminSession(req)
+        ]);
+        const userCompleted = userResult.status === 'fulfilled';
+        const adminCompleted = adminResult.status === 'fulfilled';
+        if (userCompleted) hostAuth.clearUserSession(res);
+        if (adminCompleted) hostAuth.clearAdminSession(res);
+
+        const failure = [userResult, adminResult]
+            .find(result => result.status === 'rejected')?.reason;
+        if (!failure) {
+            return res.json({
+                success: true,
+                userSessionRevoked: userResult.value,
+                adminSessionRevoked: adminResult.value
+            });
+        }
+
+        if (failure instanceof HostAuthError) {
+            return res.status(failure.httpStatus).json({
+                success: false,
+                userSessionCleared: userCompleted,
+                adminSessionCleared: adminCompleted,
+                message: 'Logout is temporarily unavailable'
+            });
+        }
+        return res.status(500).json({
+            success: false,
+            userSessionCleared: userCompleted,
+            adminSessionCleared: adminCompleted,
+            message: 'Logout failed'
+        });
+    };
 }
 
 function boundedSeconds(value, fallback, max = 30 * 24 * 60 * 60) {
@@ -66,6 +116,12 @@ function createHostAuth(options = {}) {
         || typeof AdminSessionRevocation.findOne !== 'function'
         || typeof AdminSessionRevocation.updateOne !== 'function') {
         throw new TypeError('createHostAuth requires AdminSessionRevocation.findOne/updateOne');
+    }
+    const UserSessionRevocation = options.UserSessionRevocation;
+    if (!UserSessionRevocation
+        || typeof UserSessionRevocation.findOne !== 'function'
+        || typeof UserSessionRevocation.updateOne !== 'function') {
+        throw new TypeError('createHostAuth requires UserSessionRevocation.findOne/updateOne');
     }
 
     let adminToken = '';
@@ -153,17 +209,71 @@ function createHostAuth(options = {}) {
         }
     }
 
+    function userSessionRequest(req) {
+        try {
+            return extractRequestToken(req, {
+                headerName: DEFAULT_HEADER_NAMES.user,
+                cookieName: DEFAULT_COOKIE_NAMES.user
+            });
+        } catch {
+            throw new HostAuthError('SESSION_INVALID', 401, 'Session authorization is invalid.');
+        }
+    }
+
+    function userLogoutCredentials(req) {
+        const credentials = [];
+        for (const options of [
+            { headerName: DEFAULT_HEADER_NAMES.user },
+            { cookieName: DEFAULT_COOKIE_NAMES.user },
+            { allowBearer: true }
+        ]) {
+            try {
+                const credential = extractRequestToken(req, options);
+                if (credential) credentials.push(credential);
+            } catch (error) {
+                if (error?.code === 'SESSION_CREDENTIAL_CONFLICT') {
+                    throw new HostAuthError(
+                        'SESSION_CREDENTIAL_CONFLICT',
+                        400,
+                        'Conflicting session credentials cannot be logged out safely.'
+                    );
+                }
+                throw new HostAuthError(
+                    'SESSION_INVALID',
+                    400,
+                    'Invalid session credentials cannot be logged out safely.'
+                );
+            }
+        }
+        return [...new Map(credentials.map(credential => [credential.token, credential])).values()];
+    }
+
+    async function assertUserSessionActive(claims) {
+        try {
+            if (await isUserSessionRevoked(UserSessionRevocation, claims.sessionId)) {
+                throw new HostAuthError(
+                    'USER_SESSION_REVOKED',
+                    401,
+                    'User session has been revoked.'
+                );
+            }
+        } catch (error) {
+            if (error instanceof HostAuthError) throw error;
+            if (error instanceof UserSessionRevocationError) {
+                throw new HostAuthError(
+                    error.code,
+                    503,
+                    'User authentication is unavailable.'
+                );
+            }
+            throw error;
+        }
+    }
+
     async function authenticateUserRequest(req) {
         let credential = null;
         if (sessionSecret) {
-            try {
-                credential = extractRequestToken(req, {
-                    headerName: DEFAULT_HEADER_NAMES.user,
-                    cookieName: DEFAULT_COOKIE_NAMES.user
-                });
-            } catch {
-                throw new HostAuthError('SESSION_INVALID', 401, 'Session authorization is invalid.');
-            }
+            credential = userSessionRequest(req);
         }
 
         let openId;
@@ -179,10 +289,10 @@ function createHostAuth(options = {}) {
             throw new HostAuthError('USER_AUTH_REQUIRED', 401, 'User authorization is required.');
         }
 
-        const claimedOpenId = String(req?.headers?.['x-open-id'] || '').trim();
-        if (claimedOpenId && claimedOpenId !== openId) {
+        if (hasMismatchedIdentityHint(req, openId)) {
             throw new HostAuthError('USER_IDENTITY_MISMATCH', 403, 'User identity does not match the session.');
         }
+        if (claims) await assertUserSessionActive(claims);
         const user = await loadUser(openId);
         if (!user) throw new HostAuthError('USER_AUTH_INVALID', 401, 'User authorization is invalid.');
         return Object.freeze({
@@ -355,12 +465,7 @@ function createHostAuth(options = {}) {
     }
 
     async function revokeAdminSessionRequest(req) {
-        let credential;
-        try {
-            credential = adminCookieRequest(req);
-        } catch {
-            return false;
-        }
+        const credential = adminCookieRequest(req);
         if (!credential) return false;
 
         let claims;
@@ -385,6 +490,35 @@ function createHostAuth(options = {}) {
             }
             throw error;
         }
+    }
+
+    async function revokeUserSessionRequest(req) {
+        const credentials = userLogoutCredentials(req);
+        let revoked = false;
+        for (const credential of credentials) {
+            let claims;
+            try {
+                claims = verifySignedCredential(credential, SESSION_KINDS.USER);
+            } catch (error) {
+                if (error instanceof HostAuthError && error.httpStatus >= 500) throw error;
+                continue;
+            }
+
+            try {
+                await revokeUserSession(UserSessionRevocation, claims);
+                revoked = true;
+            } catch (error) {
+                if (error instanceof UserSessionRevocationError) {
+                    throw new HostAuthError(
+                        error.code,
+                        503,
+                        'User authentication is unavailable.'
+                    );
+                }
+                throw error;
+            }
+        }
+        return revoked;
     }
 
     async function authenticateSocket(socket) {
@@ -421,21 +555,31 @@ function createHostAuth(options = {}) {
         let userClaims = null;
         if (userCredential) {
             userClaims = verifySignedCredential(userCredential, SESSION_KINDS.USER);
+            await assertUserSessionActive(userClaims);
             user = await loadUser(userClaims.subject);
             if (!user) throw new HostAuthError('USER_AUTH_INVALID', 401, 'User authorization is invalid.');
-            const queryOpenId = String(
-                socket?.handshake?.query?.openId || socket?.handshake?.query?.openid || ''
-            ).trim();
-            if (queryOpenId && queryOpenId !== user.openId) {
+            if (hasMismatchedIdentityHint({
+                headers,
+                body: auth,
+                query: socket?.handshake?.query
+            }, user.openId)) {
                 throw new HostAuthError('USER_IDENTITY_MISMATCH', 403, 'User identity does not match the session.');
             }
         }
 
         if (!admin && !user) {
             if (allowLegacyUserHeader) {
+                const query = socket?.handshake?.query || {};
                 const queryOpenId = String(
-                    socket?.handshake?.query?.openId || socket?.handshake?.query?.openid || ''
+                    query.openId || query.openid || query.userOpenId || ''
                 ).trim();
+                if (queryOpenId && hasMismatchedIdentityHint({ query }, queryOpenId)) {
+                    throw new HostAuthError(
+                        'USER_IDENTITY_MISMATCH',
+                        403,
+                        'User identity does not match the session.'
+                    );
+                }
                 if (queryOpenId) user = await loadUser(queryOpenId);
             }
             if (!user) throw new HostAuthError('SOCKET_AUTH_REQUIRED', 401, 'Socket authorization is required.');
@@ -487,9 +631,19 @@ function createHostAuth(options = {}) {
             }
         }
         let user = null;
-        const userSessionValid = identity.userAuthSource === 'legacy'
+        let userSessionValid = identity.userAuthSource === 'legacy'
             ? allowLegacyUserHeader
             : Number.isInteger(identity.userExpiresAt) && identity.userExpiresAt > nowSec;
+        if (userSessionValid && identity.userAuthSource !== 'legacy') {
+            try {
+                userSessionValid = !(await isUserSessionRevoked(
+                    UserSessionRevocation,
+                    identity.userSessionId
+                ));
+            } catch {
+                userSessionValid = false;
+            }
+        }
         if (identity.openId && userSessionValid) user = await loadUser(identity.openId);
         if (!adminValid && !user) return null;
         return {
@@ -513,6 +667,7 @@ function createHostAuth(options = {}) {
         issueAdminSession,
         clearUserSession,
         clearAdminSession,
+        revokeUserSession: revokeUserSessionRequest,
         revokeAdminSession: revokeAdminSessionRequest,
         authenticateSocket,
         socketMiddleware,
@@ -523,5 +678,6 @@ function createHostAuth(options = {}) {
 module.exports = {
     LEGACY_ADMIN_SESSION_MARKER,
     HostAuthError,
+    createGlobalLogoutHandler,
     createHostAuth
 };

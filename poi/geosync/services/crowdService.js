@@ -6,6 +6,7 @@ const { getModels } = require('../models');
 const geo = require('../lib/geo');
 const memCache = require('../lib/memCache');
 const bus = require('../lib/eventBus');
+const { safeErrorCode } = require('../lib/respond');
 
 // ---- 位置内存队列（POST /api/position 只入队，5s flush）----
 const posQueue = [];
@@ -93,7 +94,7 @@ async function flush() {
             await advanceGeofence(p);
             bus.emit(bus.EVENTS.POSITION_REPORTED, p);
         } catch (e) {
-            console.error('[GeoSync] [FENCE]', e.message);
+            console.error('[GeoSync] [FENCE]', safeErrorCode(e, 'FENCE_PROCESSING_FAILED'));
         }
     }
 }
@@ -308,7 +309,10 @@ function getHeatmapSnapshot() { return memCache.get('heatmap') || null; }
 let flushTimer = null;
 function startFlushLoop() {
     if (flushTimer) return;
-    flushTimer = setInterval(() => flush().catch(e => console.error('[GeoSync] [FLUSH]', e.message)), 5000);
+    flushTimer = setInterval(() => flush().catch(e => console.error(
+        '[GeoSync] [FLUSH]',
+        safeErrorCode(e, 'POSITION_FLUSH_FAILED')
+    )), 5000);
     flushTimer.unref();
 }
 
