@@ -1,0 +1,15 @@
+{
+  "items": [
+    {
+      "eventId": "demo_barrier",
+      "edgeId": "edge_library_east",
+      "status": "closed",
+      "reason": "道路临时关闭",
+      "at": "2026-08-03T10:00:00.000Z",
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [[114.3582, 30.5414], [114.3608, 30.5427]]
+      }
+    }
+  ]
+}

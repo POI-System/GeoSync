@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+    <meta name="theme-color" content="#111815">
+    <title>GeoSync 三端工作台</title>
+    <script>
+        if (location.protocol === 'file:') location.replace('http://127.0.0.1:4174/');
+    </script>
+    <link rel="stylesheet" href="/assets/css/workspace.css">
+</head>
+<body>
+    <main class="workspace-shell">
+        <header class="workspace-header">
+            <div class="workspace-brand">
+                <span aria-hidden="true">GS</span>
+                <div><strong>GeoSync</strong><small>三端工作台</small></div>
+            </div>
+            <nav class="workspace-tabs" aria-label="切换应用端" role="tablist">
+                <button type="button" role="tab" data-view="tour" aria-selected="true">
+                    <b>游客端</b><small>行程与导览</small>
+                </button>
+                <button type="button" role="tab" data-view="ops" aria-selected="false">
+                    <b>运营端</b><small>路网与景点管理</small>
+                </button>
+                <button type="button" role="tab" data-view="screen" aria-selected="false">
+                    <b>展示大屏</b><small>实时态势</small>
+                </button>
+            </nav>
+            <a class="workspace-open" data-open-view href="/tour?demo=1" target="_blank" rel="noopener">新窗口打开</a>
+        </header>
+        <section class="workspace-stage" aria-live="polite">
+            <iframe title="游客端" data-frame="tour" src="/tour?demo=1"></iframe>
+            <iframe title="运营端" data-frame="ops" data-src="/ops?gis=1" hidden></iframe>
+            <iframe title="展示大屏" data-frame="screen" data-src="/screen?gis=1" hidden></iframe>
+        </section>
+    </main>
+    <script type="module" src="/assets/js/pages/workspace.js"></script>
+</body>
+</html>

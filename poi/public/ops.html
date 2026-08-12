@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>GeoSync 运营指挥台</title>
+    <link rel="stylesheet" href="/assets/vendor/maplibre/maplibre-gl.css">
+    <link rel="stylesheet" href="/assets/css/ops.css">
+</head>
+<body>
+    <main class="ops-shell" data-boot="loading">
+        <header class="ops-topbar">
+            <div class="ops-brand">
+                <span class="ops-brand__mark" aria-hidden="true">GS</span>
+                <div><strong>GeoSync</strong><span>运营指挥台</span></div>
+            </div>
+            <div class="ops-statuses" aria-label="系统状态">
+                <span class="status-pill" data-status="health"><i></i><b>系统</b><em>检查中</em></span>
+                <span class="status-pill" data-status="gis"><i></i><b>GIS</b><em>检查中</em></span>
+                <span class="status-pill" data-status="mongo"><i></i><b>Mongo</b><em>检查中</em></span>
+                <span class="status-pill" data-status="jobs"><i></i><b>任务</b><em>检查中</em></span>
+                <span class="status-pill" data-status="socket"><i></i><b>实时</b><em>连接中</em></span>
+            </div>
+            <div class="ops-clock"><span>数据时间</span><time data-last-updated>--:--:--</time><b data-version>数据版本 --</b></div>
+        </header>
+
+        <section class="ops-workspace">
+            <section class="ops-map-panel" aria-labelledby="map-title">
+                <div class="section-heading ops-map-heading">
+                    <div><span>实时态势</span><h1 id="map-title">景区运营地图</h1></div>
+                    <div class="map-heading-actions">
+                        <div class="map-legend" aria-label="道路状态图例">
+                            <span><i class="legend-dot low"></i>畅通</span><span><i class="legend-dot medium"></i>较忙</span><span><i class="legend-dot high"></i>拥堵</span>
+                            <strong data-confidence hidden>参考人流</strong>
+                        </div>
+                        <button class="map-tool-button" type="button" data-poi-manager hidden>+ 景点管理</button>
+                    </div>
+                </div>
+                <div class="ops-map" id="ops-map">
+                    <div class="ops-map__base" data-shared-map></div>
+                    <svg class="ops-map__overlay" data-map-overlay viewBox="0 0 1000 700" preserveAspectRatio="none" aria-label="可运营路网"></svg>
+                    <div class="ops-map__fallback"><b>地图服务暂不可用</b><span>路网操作视图仍可使用</span></div>
+                    <div class="ops-map__notice" data-map-notice hidden></div>
+                </div>
+            </section>
+
+            <aside class="ops-sidebar" aria-label="运营数据">
+                <section class="side-section metrics-section">
+                    <div class="section-heading"><div><span>今日概览</span><h2>核心指标</h2></div></div>
+                    <div class="metric-grid">
+                        <div><span>活跃行程</span><strong data-metric="active">--</strong><em>条</em></div>
+                        <div><span>今日打卡</span><strong data-metric="checkins">--</strong><em>次</em></div>
+                        <div><span>平均节省</span><strong data-metric="saved">--</strong><em>分钟</em></div>
+                        <div><span>改道接受率</span><strong data-metric="acceptance">--</strong><em>%</em></div>
+                    </div>
+                </section>
+                <section class="side-section ranking-section">
+                    <div class="section-heading"><div><span>当前快照</span><h2>拥挤 TOP</h2></div><time data-heatmap-slot>--</time></div>
+                    <ol class="ranking-list" data-ranking><li class="empty-row">数据准备中</li></ol>
+                </section>
+                <section class="side-section event-section">
+                    <div class="section-heading"><div><span>处置动态</span><h2>告警与事件</h2></div><b data-event-count>0</b></div>
+                    <div class="event-list" data-events><p class="empty-row">暂无运营事件</p></div>
+                </section>
+            </aside>
+        </section>
+
+        <section class="ops-inspector" aria-label="选中路段与处置">
+            <div class="edge-summary">
+                <div class="section-heading"><div><span>路段详情</span><h2 data-edge-name>请选择可运营路段</h2></div><code data-edge-id>--</code></div>
+                <dl data-edge-details>
+                    <div><dt>类型</dt><dd>--</dd></div><div><dt>长度</dt><dd>--</dd></div><div><dt>台阶</dt><dd>--</dd></div>
+                    <div><dt>坡度</dt><dd>--</dd></div><div><dt>遮荫</dt><dd>--</dd></div><div><dt>无障碍</dt><dd>--</dd></div>
+                </dl>
+            </div>
+            <div class="edge-state">
+                <span>当前状态</span><strong data-edge-status>未选择</strong><small data-edge-note>仅带 edgeId 的正式路网边可操作</small>
+            </div>
+            <div class="proposal-progress">
+                <span>本轮提案进度</span>
+                <div><b data-proposal="shown">0</b><em>已展示</em></div><div><b data-proposal="accepted">0</b><em>接受</em></div>
+                <div><b data-proposal="rejected">0</b><em>拒绝</em></div><div><b data-proposal="expired">0</b><em>过期</em></div><div><b data-proposal="failed">0</b><em>失败</em></div>
+            </div>
+            <div class="edge-actions">
+                <button class="button button--ghost" type="button" data-action="edit-edge" disabled>编辑路段</button>
+                <button class="button button--danger" type="button" data-action="close" disabled>关闭路段</button>
+                <button class="button button--primary" type="button" data-action="open" disabled>恢复通行</button>
+            </div>
+        </section>
+        <div class="ops-toast" role="status" aria-live="polite" data-toast hidden></div>
+    </main>
+
+    <dialog class="operation-dialog" data-operation-dialog>
+        <form method="dialog" data-operation-form>
+            <header><div><span data-dialog-kicker>道路管制</span><h2 data-dialog-title>确认关闭路段</h2></div><button type="button" class="dialog-close" data-dialog-close aria-label="关闭">×</button></header>
+            <div class="dialog-edge"><strong data-dialog-edge>--</strong><code data-dialog-edge-id>--</code></div>
+            <label data-reason-field><span>关闭原因</span><textarea name="reason" maxlength="100" required placeholder="例如：临时施工"></textarea><small><b data-reason-count>0</b>/100</small></label>
+            <label data-duration-field><span>预计持续时间</span><select name="duration"><option value="30">30 分钟</option><option value="60" selected>1 小时</option><option value="120">2 小时</option><option value="240">4 小时</option><option value="">待定</option></select></label>
+            <p class="dialog-warning" data-dialog-warning>关闭后可能触发游客改道。影响人数仅在评估完成后显示。</p>
+            <footer><button type="button" class="button button--ghost" data-dialog-cancel>取消</button><button type="submit" class="button button--danger" data-dialog-submit>确认关闭</button></footer>
+        </form>
+    </dialog>
+
+    <dialog class="management-dialog poi-dialog" data-poi-dialog>
+        <div class="management-dialog__shell">
+            <header><div><span>地图内容</span><h2>景点管理</h2></div><button type="button" class="dialog-close" data-poi-close aria-label="关闭">×</button></header>
+            <div class="poi-manager">
+                <aside class="poi-manager__list">
+                    <button class="button button--primary" type="button" data-poi-new>+ 新建景点</button>
+                    <div data-poi-list></div>
+                </aside>
+                <form class="management-form" data-poi-form>
+                    <input type="hidden" name="poiId">
+                    <label><span>景点名称 <b>*</b></span><input name="name" maxlength="80" required autocomplete="off"></label>
+                    <div class="coordinate-fields">
+                        <label><span>经度 <b>*</b></span><input name="lng" type="number" step="any" min="-180" max="180" required></label>
+                        <label><span>纬度 <b>*</b></span><input name="lat" type="number" step="any" min="-90" max="90" required></label>
+                    </div>
+                    <button class="button button--ghost pick-point-button" type="button" data-poi-pick>在地图上选点</button>
+                    <label><span>照片</span><input name="photo" type="file" accept="image/jpeg,image/png,image/webp"></label>
+                    <div class="photo-preview" data-photo-preview hidden><img alt="景点照片预览"><button type="button" data-photo-remove>移除照片</button></div>
+                    <label><span>备注</span><textarea name="note" maxlength="500" rows="4"></textarea></label>
+                    <footer><button class="button button--danger" type="button" data-poi-delete hidden>删除景点</button><button class="button button--primary" type="submit">保存景点</button></footer>
+                </form>
+            </div>
+        </div>
+    </dialog>
+
+    <dialog class="management-dialog road-dialog" data-road-dialog>
+        <form class="management-dialog__shell management-form" data-road-form>
+            <header><div><span>道路运营</span><h2>编辑路段状态</h2></div><button type="button" class="dialog-close" data-road-close aria-label="关闭">×</button></header>
+            <div class="road-dialog__body">
+                <div class="dialog-edge"><strong data-road-edge>--</strong><code data-road-edge-id>--</code></div>
+                <label><span>通行状态 <b>*</b></span><select name="status" required><option value="open">正常通行</option><option value="closed">关闭</option></select></label>
+                <label><span>拥堵情况 <b>*</b></span><select name="congestion" required><option value="smooth">畅通</option><option value="busy">较忙</option><option value="congested">拥堵</option></select></label>
+                <label><span>警告信息</span><textarea name="warning" maxlength="200" rows="4" placeholder="例如：前方施工，请减速绕行"></textarea></label>
+            </div>
+            <footer><button class="button button--primary" type="submit">保存路段</button></footer>
+        </form>
+    </dialog>
+    <script src="/assets/vendor/maplibre/maplibre-gl.js"></script>
+    <script src="/assets/vendor/supermap-iclient/iclient-maplibregl.min.js"></script>
+    <script type="module" src="/assets/js/pages/ops.js"></script>
+</body>
+</html>

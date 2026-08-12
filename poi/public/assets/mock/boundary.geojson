@@ -1,0 +1,24 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "scenicId": "whu_demo",
+        "name": "武汉大学演示景区"
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [114.3468, 30.5332],
+            [114.3722, 30.5332],
+            [114.3722, 30.5486],
+            [114.3468, 30.5486],
+            [114.3468, 30.5332]
+          ]
+        ]
+      }
+    }
+  ]
+}

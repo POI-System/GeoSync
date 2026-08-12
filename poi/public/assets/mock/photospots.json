@@ -1,0 +1,37 @@
+{
+  "items": [
+    {
+      "spotId": "spot_roof",
+      "poiId": "poi_photo",
+      "name": "樱顶西望",
+      "lnglat": [114.3558, 30.5404],
+      "heading": 285,
+      "score": 0.91,
+      "coverPhoto": null,
+      "todayWindows": [{ "start": "17:12", "end": "17:48", "light": "golden" }],
+      "ciNow": 0.56,
+      "distanceM": 420,
+      "golden": {
+        "date": "2026-08-03",
+        "weatherAdjusted": false,
+        "cloudy": false,
+        "windows": [{ "start": "17:12", "end": "17:48", "light": "golden", "trueSunset": "18:52", "geometricSunset": "19:08", "ciPredicted": 0.47 }]
+      },
+      "ar": { "heading": 285, "tolerance": 10, "focalHint": "26mm 等效", "ciNow": 0.56, "fallbackCard": { "text": "面朝西北，主楼置于画面右三分之一", "photos": [] } }
+    },
+    {
+      "spotId": "spot_lake",
+      "poiId": "poi_lake",
+      "name": "湖畔倒影",
+      "lnglat": [114.3648, 30.5441],
+      "heading": 110,
+      "score": 0.84,
+      "coverPhoto": null,
+      "todayWindows": [{ "start": "08:10", "end": "08:42", "light": "side" }],
+      "ciNow": 0.38,
+      "distanceM": 780,
+      "golden": { "date": "2026-08-03", "weatherAdjusted": false, "cloudy": false, "windows": [{ "start": "08:10", "end": "08:42", "light": "side", "ciPredicted": 0.35 }] },
+      "ar": { "heading": 110, "tolerance": 12, "focalHint": "35mm 等效", "ciNow": 0.38, "fallbackCard": { "text": "贴近湖岸取低机位", "photos": [] } }
+    }
+  ]
+}

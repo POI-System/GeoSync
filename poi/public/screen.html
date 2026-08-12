@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>GeoSync 景区客流态势</title>
+    <link rel="stylesheet" href="/assets/vendor/maplibre/maplibre-gl.css">
+    <link rel="stylesheet" href="/assets/css/screen.css">
+</head>
+<body>
+    <main class="screen-shell" data-mode="realtime" data-boot="loading">
+        <header class="screen-header">
+            <div class="screen-brand"><span>GS</span><div><strong>GeoSync</strong><em>景区客流态势</em></div></div>
+            <div class="screen-heading"><h1>东湖景区运营全景</h1><p data-subtitle>实时客流与调度反馈</p></div>
+            <div class="screen-header__status">
+                <span class="screen-state" data-screen-health><i></i>系统检查中</span>
+                <span class="screen-state" data-screen-connection><i></i>实时连接中</span>
+                <time data-wall-clock>--</time>
+            </div>
+        </header>
+
+        <section class="screen-content">
+            <section class="screen-map-panel" aria-labelledby="screen-map-title">
+                <div class="screen-map-title"><div><span>SCENIC FLOW</span><h2 id="screen-map-title">景区客流态势地图</h2></div><div class="screen-legend"><span><i class="low"></i>舒适</span><span><i class="medium"></i>较忙</span><span><i class="high"></i>拥挤</span><b data-screen-confidence hidden>参考人流</b></div></div>
+                <div class="screen-map" id="screen-map">
+                    <div class="screen-map__base" data-shared-map></div>
+                    <svg class="screen-map__overlay" data-map-overlay viewBox="0 0 1000 700" preserveAspectRatio="none" aria-hidden="true"></svg>
+                    <div class="screen-map__fallback"><strong>态势底图暂不可用</strong><span>保留最后客流帧</span></div>
+                    <div class="screen-map__stamp"><span data-frame-mode>实时帧</span><time data-frame-time>--:--</time><b data-frame-missing hidden>数据缺失区间</b></div>
+                    <div class="screen-reconnect" data-reconnect hidden>实时数据重连中 · 当前保留最后一帧</div>
+                </div>
+            </section>
+
+            <aside class="screen-rail">
+                <section class="screen-metrics" aria-label="运营指标">
+                    <div><span>活跃行程</span><strong data-screen-metric="active">--</strong><em>条</em></div>
+                    <div><span>今日打卡</span><strong data-screen-metric="checkins">--</strong><em>次</em></div>
+                    <div><span>平均节省时间</span><strong data-screen-metric="saved">--</strong><em>分钟</em></div>
+                    <div><span>改道接受率</span><strong data-screen-metric="acceptance">--</strong><em>%</em></div>
+                </section>
+                <section class="screen-ranking"><header><div><span>CROWD INDEX</span><h2>拥挤 TOP</h2></div><time data-screen-slot>--</time></header><ol data-screen-ranking><li>数据准备中</li></ol></section>
+                <section class="screen-alerts"><header><div><span>EVENT STREAM</span><h2>告警与事件</h2></div><b data-screen-alert-count>0</b></header><div data-screen-alerts><p>暂无告警</p></div></section>
+            </aside>
+        </section>
+
+        <footer class="screen-controls">
+            <div class="mode-switch" role="group" aria-label="运行模式"><button type="button" data-screen-mode="realtime" aria-pressed="true">实时</button><button type="button" data-screen-mode="replay" aria-pressed="false">历史回放</button></div>
+            <div class="replay-date"><label for="replay-date">回放日期</label><input id="replay-date" data-replay-date type="date" value="2026-08-07"><button type="button" data-replay-load>载入</button></div>
+            <div class="play-controls"><button type="button" class="icon-button" data-replay-step="-1" aria-label="上一帧" title="上一帧">‹</button><button type="button" class="play-button" data-replay-play aria-label="播放" title="播放">▶</button><button type="button" class="icon-button" data-replay-step="1" aria-label="下一帧" title="下一帧">›</button></div>
+            <div class="timeline"><input type="range" min="0" max="0" value="0" data-replay-range aria-label="回放时间轴"><div><span data-timeline-start>--:--</span><strong data-timeline-current>--:--</strong><span data-timeline-end>--:--</span></div></div>
+            <label class="speed-control"><span>速度</span><select data-replay-speed><option value="1">1×</option><option value="8">8×</option><option value="32">32×</option></select></label>
+        </footer>
+        <div class="screen-error" data-screen-error hidden></div>
+    </main>
+    <script src="/assets/vendor/maplibre/maplibre-gl.js"></script>
+    <script src="/assets/vendor/supermap-iclient/iclient-maplibregl.min.js"></script>
+    <script type="module" src="/assets/js/pages/screen.js"></script>
+</body>
+</html>
