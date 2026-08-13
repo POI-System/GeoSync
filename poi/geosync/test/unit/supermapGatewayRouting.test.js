@@ -91,6 +91,8 @@ function routeResponse(overrides = {}) {
         },
         segments: [{
             edgeId: 'EDGE_1',
+            fromNodeId: 'NODE_START',
+            toNodeId: 'NODE_END',
             distanceM: 842,
             durationSec: 662,
             sourceRef: { datasetName: WALK_EDGE_DATASET, smId: 1 }
@@ -228,6 +230,8 @@ test('findPathWithBarriers requires barriers and sends sorted unique normalized 
                 return routeResponse({
                     segments: [{
                         edgeId: 'EDGE_3',
+                        fromNodeId: 'NODE_START',
+                        toNodeId: 'NODE_END',
                         distanceM: 842,
                         durationSec: 662,
                         sourceRef: { datasetName: WALK_EDGE_DATASET, smId: 3 }
@@ -303,6 +307,8 @@ test('barrier routes also reject matching canonical source references and missin
                 findPathWithBarriers: routeResponse({
                     segments: [{
                         edgeId: 'EDGE_DIFFERENT',
+                        fromNodeId: 'NODE_START',
+                        toNodeId: 'NODE_END',
                         distanceM: 842,
                         durationSec: 662,
                         sourceRef: barrier.sourceRef
@@ -328,6 +334,163 @@ test('barrier routes also reject matching canonical source references and missin
             error => error.code === 8205 && error.category === 'contract'
         );
         assert.equal(gateway.getDiagnostics().routeCacheSize, 0);
+    });
+});
+
+test('all non-zero routes require canonical topology provenance even without barriers', async t => {
+    await t.test('empty provenance', async () => {
+        const { gateway } = createHarness({
+            fixtures: { findPath: routeResponse({ segments: [] }) }
+        });
+        await assert.rejects(
+            gateway.findPath(routeInput()),
+            error => error.code === 8205 && error.category === 'contract'
+        );
+        assert.equal(gateway.getDiagnostics().routeCacheSize, 0);
+    });
+
+    await t.test('two-point straight line with an unbound authoritative marker', async () => {
+        const { gateway } = createHarness({
+            fixtures: {
+                findPath: routeResponse({
+                    geometry: { type: 'LineString', coordinates: [START, END] },
+                    segments: [],
+                    authoritative: true,
+                    routeKind: 'topology',
+                    topology: true
+                })
+            }
+        });
+        await assert.rejects(
+            gateway.findPath(routeInput()),
+            error => error.code === 8205 && error.category === 'contract'
+        );
+    });
+
+    await t.test('discontinuous canonical segment chain', async () => {
+        const { gateway } = createHarness({
+            fixtures: {
+                findPath: routeResponse({
+                    segments: [
+                        {
+                            edgeId: 'EDGE_1',
+                            fromNodeId: 'NODE_START',
+                            toNodeId: 'NODE_MIDDLE',
+                            distanceM: 400,
+                            durationSec: 300,
+                            sourceRef: { datasetName: WALK_EDGE_DATASET, smId: 1 }
+                        },
+                        {
+                            edgeId: 'EDGE_2',
+                            fromNodeId: 'NODE_OTHER',
+                            toNodeId: 'NODE_END',
+                            distanceM: 442,
+                            durationSec: 362,
+                            sourceRef: { datasetName: WALK_EDGE_DATASET, smId: 2 }
+                        }
+                    ]
+                })
+            }
+        });
+        await assert.rejects(
+            gateway.findPath(routeInput()),
+            error => error.code === 8205 && error.category === 'contract'
+        );
+    });
+
+    await t.test('segment totals outside tolerance', async () => {
+        const { gateway } = createHarness({
+            fixtures: {
+                findPath: routeResponse({
+                    segments: [{
+                        edgeId: 'EDGE_1',
+                        fromNodeId: 'NODE_START',
+                        toNodeId: 'NODE_END',
+                        distanceM: 1,
+                        durationSec: 1,
+                        sourceRef: { datasetName: WALK_EDGE_DATASET, smId: 1 }
+                    }]
+                })
+            }
+        });
+        await assert.rejects(
+            gateway.findPath(routeInput()),
+            error => error.code === 8205 && error.category === 'contract'
+        );
+    });
+});
+
+test('canonical topology routes expose a digest-bound proof', async () => {
+    const { gateway } = createHarness({ fixtures: { findPath: routeResponse() } });
+    const result = await gateway.findPath(routeInput());
+
+    assert.equal(result.authoritative, true);
+    assert.equal(result.routeFound, true);
+    assert.equal(result.routeKind, 'topology');
+    assert.equal(result.topology, true);
+    assert.equal(result.gis.topology, true);
+    assert.deepEqual(result.nodeIds, ['NODE_START', 'NODE_END']);
+    assert.deepEqual(result.edgeIds, ['EDGE_1']);
+    assert.equal(result.topologyProof.schema, 'geosync.topology/v1');
+    assert.equal(result.topologyProof.segmentCount, 1);
+    assert.match(result.topologyProof.geometryDigest, /^sha256:[a-f0-9]{64}$/);
+    assert.match(result.topologyProof.digest, /^sha256:[a-f0-9]{64}$/);
+});
+
+test('a valid topology proof cannot be replayed over different route geometry', async () => {
+    const { gateway: issuer } = createHarness({ fixtures: { findPath: routeResponse() } });
+    const issued = await issuer.findPath(routeInput());
+    const { gateway } = createHarness({
+        fixtures: {
+            findPath: routeResponse({
+                geometry: {
+                    type: 'LineString',
+                    coordinates: [START, [120.002, 30.008], END]
+                },
+                topologyProof: issued.topologyProof,
+                nodeIds: issued.nodeIds,
+                edgeIds: issued.edgeIds
+            })
+        }
+    });
+
+    await assert.rejects(
+        gateway.findPath(routeInput()),
+        error => error.code === 8205 && error.category === 'contract'
+    );
+});
+
+test('same-node zero legs use the narrow no-segment provenance exception', async t => {
+    const point = [120, 30];
+    const zeroResponse = routeResponse({
+        distanceM: 0,
+        durationSec: 0,
+        geometry: { type: 'LineString', coordinates: [point, point] },
+        segments: [],
+        snap: {
+            startDistanceM: 0,
+            endDistanceM: 0,
+            startNodeId: 'NODE_ZERO',
+            endNodeId: 'NODE_ZERO'
+        },
+        nodeIds: ['NODE_ZERO']
+    });
+    const { gateway } = createHarness({ fixtures: { findPath: zeroResponse } });
+    const result = await gateway.findPath(routeInput({ start: point, end: point }));
+
+    assert.equal(result.distanceM, 0);
+    assert.equal(result.durationSec, 0);
+    assert.deepEqual(result.segments, []);
+    assert.deepEqual(result.nodeIds, ['NODE_ZERO']);
+    assert.equal(result.topologyProof.kind, 'same-node-zero-leg');
+
+    await t.test('different request coordinates cannot claim a zero leg', async () => {
+        const { gateway: invalidGateway } = createHarness({ fixtures: { findPath: zeroResponse } });
+        await assert.rejects(
+            invalidGateway.findPath(routeInput()),
+            error => [8205, 8206].includes(error.code)
+                && ['contract', 'geometry'].includes(error.category)
+        );
     });
 });
 

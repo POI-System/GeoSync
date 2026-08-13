@@ -19,6 +19,7 @@ const {
     buildRouteRequestSignature
 } = require('./routeCache');
 const { encodePolyline } = require('../../lib/geo');
+const { validateRouteTopology } = require('../../lib/routeTopologyProvenance');
 
 const STATUS_VALUES = new Set(['online', 'degraded', 'offline']);
 const REQUIRED_STATUS_SERVICES = ['map', 'data', 'network'];
@@ -231,6 +232,39 @@ function normalizeRouteCoordinate(value, field, manifest, bufferDeg, context) {
     return coordinate;
 }
 
+function normalizeZeroLegGeometry(value, coordinate, context) {
+    const rawCoordinates = Array.isArray(value)
+        ? value
+        : isPlainObject(value) && value.type === 'LineString'
+            ? value.coordinates
+            : null;
+    if (!Array.isArray(rawCoordinates) || rawCoordinates.length < 2 || rawCoordinates.length > 100_000) {
+        throw contractError('同节点零腿几何必须是至少两个相同点的 LineString', {
+            ...context,
+            category: 'contract'
+        });
+    }
+    const normalized = rawCoordinates.map((position, index) => {
+        if (!Array.isArray(position) || position.length !== 2 || !position.every(Number.isFinite)) {
+            throw contractError(`同节点零腿 geometry.coordinates[${index}] 无效`, {
+                ...context,
+                category: 'contract'
+            });
+        }
+        return [position[0], position[1]];
+    });
+    if (normalized.some(position => position[0] !== coordinate[0] || position[1] !== coordinate[1])) {
+        throw contractError('同节点零腿几何只能包含请求起终点的同一坐标', {
+            ...context,
+            category: 'contract'
+        });
+    }
+    return {
+        geometry: { type: 'LineString', coordinates: [[...coordinate], [...coordinate]] },
+        reversed: false
+    };
+}
+
 function normalizeNodeId(value, field, context) {
     if (value === undefined || value === null || value === '') return null;
     const nodeId = String(value).trim();
@@ -341,12 +375,30 @@ function normalizeRouteSegments(value, manifest, context, options = {}) {
         }
         return {
             edgeId,
+            ...(segment.physicalEdgeId !== undefined && segment.physicalEdgeId !== null
+                ? { physicalEdgeId: normalizeNodeId(
+                    segment.physicalEdgeId,
+                    `segments[${index}].physicalEdgeId`,
+                    context
+                ) }
+                : {}),
+            ...(segment.fromNodeId !== undefined && segment.fromNodeId !== null
+                ? { fromNodeId: normalizeNodeId(segment.fromNodeId, `segments[${index}].fromNodeId`, context) }
+                : {}),
+            ...(segment.toNodeId !== undefined && segment.toNodeId !== null
+                ? { toNodeId: normalizeNodeId(segment.toNodeId, `segments[${index}].toNodeId`, context) }
+                : {}),
             distanceM: nonNegativeNumber(segment.distanceM, `segments[${index}].distanceM`, context),
             durationSec: nonNegativeNumber(segment.durationSec, `segments[${index}].durationSec`, context),
             ...(sourceRef ? { sourceRef } : {})
         };
     });
-    return options.reversed ? normalized.reverse() : normalized;
+    if (!options.reversed) return normalized;
+    return normalized.reverse().map(segment => ({
+        ...segment,
+        ...(segment.toNodeId ? { fromNodeId: segment.toNodeId } : {}),
+        ...(segment.fromNodeId ? { toNodeId: segment.fromNodeId } : {})
+    }));
 }
 
 function normalizeRouteSnap(value, input, context, maxSnapDistanceM) {
@@ -384,7 +436,13 @@ function normalizeRoutePayload(payload, input, manifest, context, options = {}) 
     if (declaredVersion !== manifest.dataVersion) {
         throw contractError('iServer 路径数据版本与 manifest 不一致', { ...context, category: 'contract' });
     }
-    const geometryMeta = normalizeRouteGeometryWithMeta
+    const sameCoordinateRequest = input.start[0] === input.end[0] && input.start[1] === input.end[1];
+    const zeroLegPayload = payload.distanceM === 0
+        && payload.durationSec === 0
+        && sameCoordinateRequest;
+    const geometryMeta = zeroLegPayload
+        ? normalizeZeroLegGeometry(payload.geometry, input.start, context)
+        : normalizeRouteGeometryWithMeta
         ? normalizeRouteGeometryWithMeta(payload.geometry, {
             start: input.start,
             end: input.end,
@@ -407,6 +465,12 @@ function normalizeRoutePayload(payload, input, manifest, context, options = {}) 
         allowMissingSourceRef: options.source === 'local-fallback',
         reversed: Boolean(geometryMeta.reversed)
     });
+    const nodeIds = Array.isArray(payload.nodeIds)
+        ? (geometryMeta.reversed ? [...payload.nodeIds].reverse() : [...payload.nodeIds])
+        : payload.nodeIds;
+    const edgeIds = Array.isArray(payload.edgeIds)
+        ? (geometryMeta.reversed ? [...payload.edgeIds].reverse() : [...payload.edgeIds])
+        : payload.edgeIds;
     if (input.barriers.length) {
         if (!segments.length) {
             throw contractError('障碍路径响应缺少可验证的路段来源', {
@@ -432,18 +496,57 @@ function normalizeRoutePayload(payload, input, manifest, context, options = {}) 
     const distanceM = nonNegativeNumber(payload.distanceM, 'distanceM', context);
     const durationSec = nonNegativeNumber(payload.durationSec, 'durationSec', context);
     const geometry = geometryMeta.geometry;
+    const topology = validateRouteTopology({
+        geometry,
+        distanceM,
+        durationSec,
+        segments,
+        nodeIds,
+        edgeIds,
+        edgeDataVersions: payload.edgeDataVersions,
+        topologyProof: payload.topologyProof,
+        snap: {
+            ...snap.public,
+            startNodeId: snap.startNodeId,
+            endNodeId: snap.endNodeId
+        },
+        gis: { dataVersion: declaredVersion }
+    }, {
+        authority: options.source === 'local-fallback'
+            ? 'local-walk-graph'
+            : 'iserver-network-analysis',
+        expectedDataVersion: manifest.dataVersion,
+        startNodeId: snap.startNodeId,
+        endNodeId: snap.endNodeId,
+        startCoordinate: input.start,
+        endCoordinate: input.end
+    });
+    if (!topology.valid) {
+        throw contractError(`路径响应缺少可验证的拓扑来源: ${topology.reason}`, {
+            ...context,
+            category: 'contract'
+        });
+    }
     const verifiedAccessible = payload.verifiedAccessible === true || payload.accessibleVerified === true;
     return {
         route: {
             distanceM,
             durationSec,
             geometry,
-            segments,
+            segments: topology.segments,
+            nodeIds: topology.nodeIds,
+            edgeIds: topology.segments.map(segment => segment.edgeId),
+            topologyProof: topology.proof,
             snap: snap.public,
             pathGeometry: encodePolyline(geometry.coordinates),
             walkSec: durationSec,
             coords: geometry.coordinates,
             fallback: options.source === 'local-fallback',
+            available: true,
+            authoritative: true,
+            routeFound: true,
+            routeKind: 'topology',
+            topology: true,
             verifiedAccessible,
             accessibleVerified: verifiedAccessible
         },
@@ -461,6 +564,9 @@ function withRouteGis(route, metadata) {
             ...segment,
             ...(segment.sourceRef ? { sourceRef: { ...segment.sourceRef } } : {})
         })),
+        nodeIds: Array.isArray(route.nodeIds) ? [...route.nodeIds] : [],
+        edgeIds: Array.isArray(route.edgeIds) ? [...route.edgeIds] : [],
+        topologyProof: route.topologyProof ? structuredClone(route.topologyProof) : null,
         snap: { ...route.snap },
         coords: route.geometry.coordinates.map(point => [...point]),
         walkSec: route.durationSec,
@@ -471,7 +577,8 @@ function withRouteGis(route, metadata) {
             degraded: metadata.source !== 'iserver',
             requestId: metadata.requestId,
             durationMs: metadata.durationMs,
-            dataVersion: metadata.dataVersion
+            dataVersion: metadata.dataVersion,
+            topology: true
         }
     };
 }
@@ -1204,6 +1311,10 @@ class SuperMapGateway {
             ...(result?.publicConfig ? result.publicConfig : {}),
             ...(!result?.ok && result?.error ? { error: { ...result.error } } : {})
         };
+    }
+
+    getDataVersion() {
+        return this._loadManifest(false)?.manifest?.dataVersion || null;
     }
 
     getDiagnostics() {

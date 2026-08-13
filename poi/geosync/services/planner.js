@@ -4,15 +4,30 @@
 const { CONFIG } = require('../config');
 const { getModels } = require('../models');
 const { BizError } = require('../lib/respond');
-const { NoRouteError } = require('../integrations/supermap/errors');
+const { NoRouteError, ContractMismatchError } = require('../integrations/supermap/errors');
 const forecast = require('./forecastService');
 const sunlight = require('./sunlight');
 const { encodePolyline, haversine } = require('../lib/geo');
+const { createTopologyProof, validateRouteTopology } = require('../lib/routeTopologyProvenance');
 
 const PACE_FACTOR = { relaxed: 1.3, normal: 1.0, tight: 0.8 };
 const WALK_SPEED_MPS = 1.4;
 const PLANNER_OPTIMIZATION_BUDGET_MS = 3000;
+const MAX_ESTIMATE_CACHE_ENTRIES = 4096;
 const scenicClockFormatters = new Map();
+
+function finiteNonNegative(value) {
+    if (value === null || value === undefined) return null;
+    if (typeof value === 'string' && value.trim() === '') return null;
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function suggestedStayMinutes(poi) {
+    return finiteNonNegative(poi?.visitMeta?.suggestedStayMin)
+        ?? finiteNonNegative(poi?.visitMeta?.dwellMin)
+        ?? 20;
+}
 
 function scenicClockFormatter(timeZone = CONFIG.scenicTimeZone) {
     if (!scenicClockFormatters.has(timeZone)) {
@@ -72,6 +87,7 @@ async function plan({
     const estimateBetween = deps.estimateBetween || defaultEstimateBetween;
     const routeBetween = deps.routeBetween;
     const budgetNow = deps.budgetNow || Date.now;
+    const routeContext = normalizePlanningRouteContext(deps.routeContext);
     if (typeof estimateBetween !== 'function') {
         throw new TypeError('planner estimateBetween must be a function');
     }
@@ -83,6 +99,11 @@ async function plan({
     }
     const { ExternalPoi, PhotoSpot, Checkin, Campaign } = getModels();
     const mode = accessible ? 'accessible' : shadeFirst ? 'shade' : 'normal';
+    const estimateRoute = createMemoizedEstimator(estimateBetween, {
+        mode,
+        routeContext: { ...routeContext, requestId },
+        maxEntries: deps.maxEstimateCacheEntries
+    });
     const t0 = startAt ? new Date(startAt) : new Date(Date.now() + 10 * 60000);
     if (!Number.isFinite(t0.getTime())) {
         throw new BizError(1102, 'startAt 必须是有效日期时间');
@@ -143,10 +164,10 @@ async function plan({
         for (const id of remaining) {
             const poi = poiById.get(id);
             if (!withinOpenHours(poi, t)) continue;
-            const route = syncEstimate(estimateBetween, cursor, poi, mode);
+            const route = estimateRoute(cursor, poi);
             if (!routeUsable(route, mode)) continue;
             const walkMin = route.walkSec / 60;
-            const stayMin = (poi.visitMeta?.suggestedStayMin || 20) * paceF;
+            const stayMin = suggestedStayMinutes(poi) * paceF;
             const eta = new Date(t.getTime() + walkMin * 60000);
             const ciPred = forecast.predictAtEta(poi._id, eta) ?? 0.3;
             const queueMin = queueMinutes(ciPred);
@@ -173,11 +194,22 @@ async function plan({
         cursor = best.poi;
         t = new Date(best.eta.getTime() + (best.stayMin + best.queueMin) * 60000);
     }
-    if (!chosen.length) throw new BizError(1202, '预算内无可安排的POI');
+    if (!chosen.length) {
+        const diagnostics = estimateRoute.diagnostics;
+        if (diagnostics.usableCount === 0 && diagnostics.noRouteCount > 0) {
+            throw new NoRouteError(undefined, {
+                operation: 'findPath',
+                requestId,
+                category: 'no-route',
+                retryable: false
+            });
+        }
+        throw new BizError(1202, '预算内无可安排的POI');
+    }
 
     // 3. 2-opt：交换降低总步行时间（≤200 次）
     let order = chosen.map(c => c.poi);
-    let bestWalk = totalWalkSec(order, startLocation, mode, estimateBetween);
+    let bestWalk = totalWalkSec(order, startLocation, mode, estimateRoute);
     let iter = 0;
     outer:
     for (let round = 0; round < 20 && budgetNow() < deadline; round++) {
@@ -187,7 +219,7 @@ async function plan({
                 if (++iter > 200) break outer;
                 const cand = [...order];
                 [cand[i], cand[j]] = [cand[j], cand[i]];
-                const w = totalWalkSec(cand, startLocation, mode, estimateBetween);
+                const w = totalWalkSec(cand, startLocation, mode, estimateRoute);
                 if (w < bestWalk) { order = cand; bestWalk = w; improved = true; }
             }
         }
@@ -195,7 +227,7 @@ async function plan({
     }
 
     // 4. 黄金窗口对齐：摄影站偏窗 >30min → 尝试相邻交换
-    const timeline = buildTimeline(order, startLocation, t0, paceF, mode, estimateBetween);
+    const timeline = buildTimeline(order, startLocation, t0, paceF, mode, estimateRoute);
     for (let i = 0; i < order.length; i++) {
         const wins = windowsOf(order[i]);
         if (!wins?.length) continue;
@@ -204,7 +236,7 @@ async function plan({
             if (j < 0 || j >= order.length) continue;
             const cand = [...order];
             [cand[i], cand[j]] = [cand[j], cand[i]];
-            const tl2 = buildTimeline(cand, startLocation, t0, paceF, mode, estimateBetween);
+            const tl2 = buildTimeline(cand, startLocation, t0, paceF, mode, estimateRoute);
             const iNew = cand.indexOf(order[i]);
             if (offWindowMin(wins, tl2[iNew].plannedArrive) < offWindowMin(wins, timeline[i].plannedArrive)) {
                 order = cand;
@@ -220,7 +252,7 @@ async function plan({
         t0,
         paceF,
         mode,
-        { routeBetween, openId, requestId, budgetMin }
+        { routeBetween, openId, requestId, budgetMin, routeContext }
     );
     if (!authoritative.timeline.length) {
         throw new BizError(1202, '权威路径超出行程预算');
@@ -240,6 +272,9 @@ async function plan({
         durationSec: finalTl[i].durationSec,
         gis: finalTl[i].gis,
         segments: finalTl[i].segments,
+        nodeIds: finalTl[i].nodeIds,
+        edgeIds: finalTl[i].edgeIds,
+        topologyProof: finalTl[i].topologyProof,
         snap: finalTl[i].snap,
         verifiedAccessible: finalTl[i].verifiedAccessible,
         pathGeometry: finalTl[i].pathGeometry
@@ -309,7 +344,7 @@ function buildTimeline(order, startLocation, t0, paceF, mode, estimateBetween = 
         }
         const walkMin = r.walkSec / 60;
         const arrive = new Date(t.getTime() + walkMin * 60000);
-        const stayMin = (poi.visitMeta?.suggestedStayMin || 20) * paceF;
+        const stayMin = suggestedStayMinutes(poi) * paceF;
         const queueMin = queueMinutes(forecast.predictAtEta(poi._id, arrive) ?? 0.3);
         const leave = new Date(arrive.getTime() + (stayMin + queueMin) * 60000);
         out.push({
@@ -324,12 +359,184 @@ function buildTimeline(order, startLocation, t0, paceF, mode, estimateBetween = 
 }
 
 function routeUsable(route, mode) {
-    return Boolean(route)
-        && Number.isFinite(route.walkSec)
-        && route.walkSec >= 0
-        && !(mode === 'accessible' && (
-            route.fallback === true || route.gis?.source === 'local-fallback'
-        ));
+    return classifyEstimateRoute(route, mode, {}, {
+        requireDataVersion: false,
+        requireMode: false
+    }).kind === 'usable';
+}
+
+function normalizePlanningRouteContext(value) {
+    if (value === undefined || value === null) return Object.freeze({});
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new TypeError('planner routeContext must be an object');
+    }
+    if (Object.isFrozen(value) && (!Array.isArray(value.barriers) || Object.isFrozen(value.barriers))) {
+        return value;
+    }
+    const context = { ...value };
+    if (Object.prototype.hasOwnProperty.call(context, 'barriers')) {
+        if (!Array.isArray(context.barriers)) {
+            throw new TypeError('planner routeContext.barriers must be an array');
+        }
+        context.barriers = Object.freeze(context.barriers.map(barrier => {
+            if (!barrier || typeof barrier !== 'object' || Array.isArray(barrier)) return barrier;
+            return Object.freeze({
+                ...barrier,
+                ...(barrier.sourceRef && typeof barrier.sourceRef === 'object'
+                    ? { sourceRef: Object.freeze({ ...barrier.sourceRef }) }
+                    : {})
+            });
+        }));
+    }
+    return Object.freeze(context);
+}
+
+function endpointKey(value) {
+    if (value?._id !== undefined && value?._id !== null) return `poi:${String(value._id)}`;
+    const gateNodeId = value?.gateNodeId === undefined || value?.gateNodeId === null
+        ? ''
+        : String(value.gateNodeId).trim();
+    if (gateNodeId) return `node:${gateNodeId}`;
+    const coordinates = coordinatesOf(value);
+    return coordinates ? `coord:${coordinates[0]},${coordinates[1]}` : 'invalid';
+}
+
+function createMemoizedEstimator(estimateBetween, {
+    mode = 'normal',
+    routeContext = {},
+    maxEntries = MAX_ESTIMATE_CACHE_ENTRIES
+} = {}) {
+    if (typeof estimateBetween !== 'function') {
+        throw new TypeError('planner estimateBetween must be a function');
+    }
+    if (maxEntries !== undefined && (!Number.isInteger(maxEntries) || maxEntries <= 0)) {
+        throw new TypeError('planner maxEstimateCacheEntries must be a positive integer');
+    }
+    const limit = maxEntries ?? MAX_ESTIMATE_CACHE_ENTRIES;
+    const cache = new Map();
+    const diagnostics = {
+        usableCount: 0,
+        noRouteCount: 0
+    };
+    const snapshotKey = [
+        mode,
+        routeContext.barrierFingerprint || '',
+        routeContext.dataVersion || ''
+    ].join('|');
+
+    function estimate(fromPoi, toPoi) {
+        const key = `${snapshotKey}|${endpointKey(fromPoi)}>${endpointKey(toPoi)}`;
+        if (cache.has(key)) return cache.get(key);
+        const rawRoute = syncEstimate(estimateBetween, fromPoi, toPoi, mode, routeContext);
+        const classification = classifyEstimateRoute(rawRoute, mode, routeContext);
+        if (classification.kind === 'contract-mismatch') {
+            throw new ContractMismatchError(
+                `planner estimate does not match the routing snapshot: ${classification.reason}`,
+                {
+                    operation: 'findPath',
+                    requestId: routeContext.requestId,
+                    category: 'contract',
+                    retryable: false
+                }
+            );
+        }
+        const route = classification.kind === 'usable' ? classification.route : null;
+        diagnostics[`${classification.kind === 'usable' ? 'usable' : 'noRoute'}Count`]++;
+        if (cache.size < limit) cache.set(key, route);
+        return route;
+    }
+    Object.defineProperty(estimate, 'diagnostics', {
+        enumerable: true,
+        value: diagnostics
+    });
+    return estimate;
+}
+
+function classifyEstimateRoute(route, mode, routeContext = {}, {
+    requireDataVersion = true,
+    requireMode = true
+} = {}) {
+    if (!route) return { kind: 'no-route', reason: 'route result is empty' };
+    const topologyMarker = route.routeKind === 'graph'
+        || route.routeKind === 'topology'
+        || route.topology === true
+        || route.gis?.topology === true;
+    const localFallback = route.fallback === true || route.gis?.source === 'local-fallback';
+    const verifiedAccessible = route.verifiedAccessible === true || route.accessibleVerified === true;
+    if (route.available === false
+        || route.routeFound !== true
+        || route.authoritative !== true
+        || route.routeKind === 'direct-estimate'
+        || route.gis?.source === 'direct-estimate'
+        || !topologyMarker
+        || (normalizeRouteMode(mode) === 'accessible' && localFallback && !verifiedAccessible)) {
+        return { kind: 'no-route', reason: 'route is not an authoritative topology result' };
+    }
+    const walkSec = route.walkSec === undefined ? route.durationSec : route.walkSec;
+    if (!Number.isFinite(walkSec) || walkSec < 0) {
+        return { kind: 'contract-mismatch', reason: 'route walkSec is invalid' };
+    }
+
+    const routeMode = typeof route.gis?.mode === 'string'
+        ? route.gis.mode.trim().toLowerCase()
+        : '';
+    const expectedMode = normalizeRouteMode(mode);
+    if ((requireMode && !routeMode) || (routeMode && normalizeRouteMode(routeMode) !== expectedMode)) {
+        return { kind: 'contract-mismatch', reason: 'route mode does not match the planning mode' };
+    }
+
+    const expectedVersion = typeof routeContext.dataVersion === 'string'
+        ? routeContext.dataVersion.trim()
+        : '';
+    const actualVersion = typeof route.gis?.dataVersion === 'string'
+        ? route.gis.dataVersion.trim()
+        : typeof route.dataVersion === 'string'
+            ? route.dataVersion.trim()
+            : '';
+    const edgeVersions = Array.isArray(route.edgeDataVersions)
+        ? route.edgeDataVersions.map(version => String(version || '').trim())
+        : [];
+    const edgeIds = Array.isArray(route.edgeIds) ? route.edgeIds : [];
+    const zeroLeg = walkSec === 0 && Number(route.distanceM) === 0 && edgeIds.length === 0;
+    if (expectedVersion) {
+        if (!actualVersion || actualVersion !== expectedVersion) {
+            return { kind: 'contract-mismatch', reason: 'route dataVersion does not match the planning snapshot' };
+        }
+        if (!zeroLeg && (
+            edgeIds.length === 0
+            || edgeIds.length !== edgeVersions.length
+            || edgeVersions.some(version => version !== expectedVersion)
+        )) {
+            return { kind: 'contract-mismatch', reason: 'route edge data versions do not match the planning snapshot' };
+        }
+    } else if (requireDataVersion && !actualVersion) {
+        return { kind: 'contract-mismatch', reason: 'route dataVersion is missing' };
+    }
+
+    const topology = validateRouteTopology({ ...route, walkSec }, {
+        expectedDataVersion: expectedVersion || actualVersion || undefined,
+        requireDataVersion,
+        authority: localFallback ? 'local-walk-graph' : 'iserver-network-analysis'
+    });
+    if (!topology.valid) {
+        return { kind: 'contract-mismatch', reason: topology.reason };
+    }
+    return {
+        kind: 'usable',
+        route: {
+            ...route,
+            walkSec,
+            segments: topology.segments,
+            nodeIds: topology.nodeIds,
+            edgeIds: topology.segments.map(segment => segment.edgeId),
+            topologyProof: topology.proof
+        }
+    };
+}
+
+function normalizeRouteMode(mode) {
+    const value = typeof mode === 'string' ? mode.trim().toLowerCase() : '';
+    return value === 'standard' ? 'normal' : value;
 }
 
 function coordinatesOf(value) {
@@ -362,12 +569,17 @@ function defaultEstimateBetween(fromPoi, toPoi) {
         walkSec: Math.round(distanceM / WALK_SPEED_MPS),
         distanceM,
         coords: [start, end],
-        fallback: false
+        fallback: true,
+        available: false,
+        authoritative: false,
+        routeFound: false,
+        routeKind: 'direct-estimate',
+        estimated: true
     };
 }
 
-function syncEstimate(estimateBetween, fromPoi, toPoi, mode) {
-    const route = estimateBetween(fromPoi, toPoi, mode);
+function syncEstimate(estimateBetween, fromPoi, toPoi, mode, routeContext) {
+    const route = estimateBetween(fromPoi, toPoi, mode, routeContext);
     if (route && typeof route.then === 'function') {
         throw new TypeError('planner estimateBetween must be synchronous');
     }
@@ -390,7 +602,7 @@ async function buildAuthoritativeTimeline(
     t0,
     paceF,
     mode,
-    { routeBetween, openId, requestId, budgetMin } = {}
+    { routeBetween, openId, requestId, budgetMin, routeContext } = {}
 ) {
     if (typeof routeBetween !== 'function') {
         throw new TypeError('planner routeBetween must be an async function');
@@ -402,14 +614,26 @@ async function buildAuthoritativeTimeline(
         cursor = poi;
         return leg;
     });
+    const normalizedRouteContext = normalizePlanningRouteContext(routeContext);
     const rawRoutes = await Promise.all(legs.map(leg => routeBetween(
         leg.fromPoi,
         leg.toPoi,
         mode,
-        { legIndex: leg.legIndex, openId, requestId }
+        {
+            ...normalizedRouteContext,
+            legIndex: leg.legIndex,
+            openId,
+            requestId
+        }
     )));
     const routes = rawRoutes.map((route, legIndex) =>
-        normalizeAuthoritativeRoute(route, mode, { legIndex, requestId }));
+        normalizeAuthoritativeRoute(route, mode, {
+            legIndex,
+            requestId,
+            dataVersion: normalizedRouteContext.dataVersion,
+            fromPoi: legs[legIndex].fromPoi,
+            toPoi: legs[legIndex].toPoi
+        }));
 
     let cursorAt = new Date(t0);
     const budgetDeadline = Number.isFinite(budgetMin) && budgetMin > 0
@@ -421,7 +645,7 @@ async function buildAuthoritativeTimeline(
         const route = routes[index];
         const poi = order[index];
         const arrive = new Date(cursorAt.getTime() + route.durationSec * 1000);
-        const stayMin = (poi.visitMeta?.suggestedStayMin || 20) * paceF;
+        const stayMin = suggestedStayMinutes(poi) * paceF;
         const queueMin = queueMinutes(forecast.predictAtEta(poi._id, arrive) ?? 0.3);
         const leave = new Date(arrive.getTime() + (stayMin + queueMin) * 60000);
         if (budgetDeadline && leave > budgetDeadline) break;
@@ -436,6 +660,9 @@ async function buildAuthoritativeTimeline(
             durationSec: route.durationSec,
             gis: route.gis,
             segments: route.segments,
+            nodeIds: route.nodeIds,
+            edgeIds: route.edgeIds,
+            topologyProof: route.topologyProof,
             snap: route.snap,
             verifiedAccessible: route.verifiedAccessible,
             pathGeometry: route.pathGeometry,
@@ -456,6 +683,31 @@ function queueMinutes(ciPrediction) {
 function normalizeAuthoritativeRoute(route, mode, context = {}) {
     const localFallback = route?.fallback === true || route?.gis?.source === 'local-fallback';
     const verifiedAccessible = route?.verifiedAccessible === true || route?.accessibleVerified === true;
+    const actualDataVersion = typeof route?.gis?.dataVersion === 'string'
+        ? route.gis.dataVersion.trim()
+        : '';
+    const expectedDataVersion = typeof context.dataVersion === 'string'
+        ? context.dataVersion.trim()
+        : '';
+    const topologyMarker = route?.routeKind === 'graph'
+        || route?.routeKind === 'topology'
+        || route?.topology === true
+        || route?.gis?.topology === true;
+    if (
+        route?.available === false
+        || route?.routeFound !== true
+        || route?.authoritative !== true
+        || !topologyMarker
+        || route?.routeKind === 'direct-estimate'
+        || route?.gis?.source === 'direct-estimate'
+    ) {
+        throw new NoRouteError(undefined, {
+            operation: 'findPath',
+            requestId: context.requestId,
+            category: 'no-route',
+            retryable: false
+        });
+    }
     if (mode === 'accessible' && localFallback && !verifiedAccessible) {
         throw new NoRouteError(undefined, {
             operation: 'findPath',
@@ -470,21 +722,50 @@ function normalizeAuthoritativeRoute(route, mode, context = {}) {
     if (!Number.isFinite(route.distanceM) || route.distanceM < 0) {
         throw new BizError(1201, 'authoritative route distanceM must be a non-negative number');
     }
+    if (expectedDataVersion && actualDataVersion !== expectedDataVersion) {
+        throw new BizError(8205, 'authoritative route dataVersion does not match planning snapshot', 409);
+    }
 
     const geometry = normalizeLineString(route.geometry);
+    const startCoordinate = coordinatesOf(context.fromPoi);
+    const endCoordinate = coordinatesOf(context.toPoi);
+    const startNodeId = routeEndpointNodeId(context.fromPoi);
+    const endNodeId = routeEndpointNodeId(context.toPoi);
+    const topology = validateRouteTopology({ ...route, geometry }, {
+        expectedDataVersion: expectedDataVersion || actualDataVersion,
+        authority: localFallback ? 'local-walk-graph' : 'iserver-network-analysis',
+        startNodeId,
+        endNodeId,
+        ...(startCoordinate && endCoordinate ? { startCoordinate, endCoordinate } : {})
+    });
+    if (!topology.valid) {
+        throw new BizError(8205, `authoritative route lacks verifiable topology provenance: ${topology.reason}`, 409);
+    }
     const pathGeometry = encodePolyline(geometry.coordinates);
     return {
         geometry,
         distanceM: route.distanceM,
         durationSec: route.durationSec,
         gis: route.gis && typeof route.gis === 'object' ? { ...route.gis } : null,
-        segments: Array.isArray(route.segments)
-            ? route.segments.map(segment => ({ ...segment }))
-            : [],
-        snap: route.snap && typeof route.snap === 'object' ? { ...route.snap } : null,
+        segments: topology.segments,
+        nodeIds: topology.nodeIds,
+        edgeIds: topology.segments.map(segment => segment.edgeId),
+        topologyProof: topology.proof,
+        snap: route.snap && typeof route.snap === 'object' ? {
+            ...route.snap,
+            startNodeId: topology.nodeIds[0],
+            endNodeId: topology.nodeIds[topology.nodeIds.length - 1]
+        } : null,
         verifiedAccessible,
         pathGeometry
     };
+}
+
+function routeEndpointNodeId(value) {
+    const nodeId = value?.gateNodeId === undefined || value?.gateNodeId === null
+        ? ''
+        : String(value.gateNodeId).trim();
+    return nodeId || null;
 }
 
 function normalizeLineString(geometry) {
@@ -506,33 +787,58 @@ function normalizeLineString(geometry) {
 function aggregateAuthoritativeRoutes(routes, mode) {
     const coordinates = [];
     const segments = [];
+    const nodeIds = [];
     let distanceM = 0;
     let durationSec = 0;
     for (const route of routes) {
         distanceM += route.distanceM;
         durationSec += route.durationSec;
         segments.push(...route.segments.map(segment => ({ ...segment })));
+        for (const nodeId of route.nodeIds || []) {
+            if (!nodeIds.length || nodeIds[nodeIds.length - 1] !== nodeId) nodeIds.push(nodeId);
+        }
         for (const position of route.geometry.coordinates) {
             if (!coordinates.length || !samePosition(coordinates[coordinates.length - 1], position)) {
                 coordinates.push([...position]);
             }
         }
     }
+    if (coordinates.length === 1) coordinates.push([...coordinates[0]]);
 
     const geometry = { type: 'LineString', coordinates };
     const firstSnap = routes[0]?.snap;
     const lastSnap = routes[routes.length - 1]?.snap;
     const snap = firstSnap || lastSnap ? {
+        ...(firstSnap?.startNodeId ? { startNodeId: firstSnap.startNodeId } : {}),
+        ...(lastSnap?.endNodeId ? { endNodeId: lastSnap.endNodeId } : {}),
         startDistanceM: firstSnap?.startDistanceM ?? null,
         endDistanceM: lastSnap?.endDistanceM ?? null
     } : null;
+    const gis = aggregateGis(routes, mode);
+    const topologyProof = routes.length ? createTopologyProof({
+        authority: 'planner-aggregate',
+        dataVersion: gis?.dataVersion,
+        nodeIds,
+        segments,
+        distanceM,
+        durationSec,
+        geometry
+    }) : null;
     return {
         geometry,
         distanceM,
         durationSec,
-        gis: aggregateGis(routes, mode),
+        gis,
         segments,
+        nodeIds,
+        edgeIds: segments.map(segment => segment.edgeId),
+        topologyProof,
         snap,
+        available: routes.length > 0,
+        authoritative: routes.length > 0,
+        routeFound: routes.length > 0,
+        routeKind: routes.length > 0 ? 'topology' : null,
+        topology: routes.length > 0,
         verifiedAccessible: routes.length > 0 && routes.every(route => route.verifiedAccessible === true),
         pathGeometry: coordinates.length ? encodePolyline(coordinates) : ''
     };
@@ -587,6 +893,9 @@ module.exports = {
     defaultEstimateBetween,
     aggregateAuthoritativeRoutes,
     routeUsable,
+    createMemoizedEstimator,
+    normalizePlanningRouteContext,
+    suggestedStayMinutes,
     scenicMinuteOfDay,
     scenicDateStr
 };

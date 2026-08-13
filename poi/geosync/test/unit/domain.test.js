@@ -205,8 +205,45 @@ test('windowFit 契合度', () => {
 });
 
 test('accessible planner rejects graph fallback routes', () => {
-    assert.strictEqual(planner.routeUsable({ walkSec: 60, fallback: false }, 'accessible'), true);
-    assert.strictEqual(planner.routeUsable({ walkSec: 60, fallback: true }, 'accessible'), false);
-    assert.strictEqual(planner.routeUsable({ walkSec: 60, fallback: true }, 'standard'), true);
+    const graphRoute = {
+        walkSec: 60,
+        durationSec: 60,
+        distanceM: 80,
+        geometry: { type: 'LineString', coordinates: [[0, 0], [0.001, 0]] },
+        nodeIds: ['A', 'B'],
+        edgeIds: ['AB'],
+        segments: [{
+            edgeId: 'AB',
+            fromNodeId: 'A',
+            toNodeId: 'B',
+            distanceM: 80,
+            durationSec: 60,
+            sourceRef: { datasetName: 'WalkEdge@Test', smId: 1 }
+        }],
+        gis: { source: 'iserver', dataVersion: 'v1' },
+        fallback: false,
+        routeFound: true,
+        authoritative: true,
+        routeKind: 'graph'
+    };
+    assert.strictEqual(planner.routeUsable(graphRoute, 'accessible'), true);
+    assert.strictEqual(planner.routeUsable({ ...graphRoute, fallback: true }, 'accessible'), false);
+    assert.strictEqual(planner.routeUsable({ ...graphRoute, fallback: true }, 'standard'), true);
+    assert.strictEqual(planner.routeUsable({ walkSec: 60, fallback: false }, 'normal'), false);
     assert.strictEqual(planner.routeUsable(null, 'standard'), false);
+});
+
+test('planner rejects explicit unavailable and non-authoritative estimates in every mode', () => {
+    const rejected = [
+        { walkSec: 60, available: false },
+        { walkSec: 60, routeFound: false },
+        { walkSec: 60, authoritative: false },
+        { walkSec: 60, routeKind: 'direct-estimate' },
+        { walkSec: 60, gis: { source: 'direct-estimate' } }
+    ];
+    for (const mode of ['normal', 'shade', 'accessible']) {
+        for (const route of rejected) {
+            assert.strictEqual(planner.routeUsable(route, mode), false, `${mode} must reject ${JSON.stringify(route)}`);
+        }
+    }
 });

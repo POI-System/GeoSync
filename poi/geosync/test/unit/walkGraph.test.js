@@ -26,6 +26,7 @@ function node(nodeId, coordinates) {
 function edge(edgeId, from, to, options = {}) {
     return {
         edgeId,
+        physicalEdgeId: options.physicalEdgeId || edgeId,
         from,
         to,
         walkSec: options.walkSec ?? 60,
@@ -74,7 +75,7 @@ test('nearest-node routing includes both connector segments and marks long snaps
     }), null);
 });
 
-test('small connector snaps remain graph routes but explicitly fail accessible verification', async () => {
+test('same-node connector-only paths remain non-authoritative and fail accessible verification', async () => {
     await loadGraph([node('gate', [0, 0])], []);
     const route = walkGraph.walkSecBetween(
         point([0.00002, 0]),
@@ -84,7 +85,7 @@ test('small connector snaps remain graph routes but explicitly fail accessible v
 
     assert.ok(route.walkSec > 0);
     assert.strictEqual(route.fallback, false);
-    assert.strictEqual(route.authoritative, true);
+    assert.strictEqual(route.authoritative, false);
     assert.strictEqual(route.verifiedAccessible, false);
     assert.deepStrictEqual(route.accessibility, {
         requested: true,
@@ -158,11 +159,11 @@ test('barriers select an alternate graph route with canonical segments, sources,
     });
     assert.deepStrictEqual(alternate.segments, [
         {
-            edgeId: 'AC', distanceM: 80, durationSec: 70,
+            edgeId: 'AC', physicalEdgeId: 'AC', fromNodeId: 'A', toNodeId: 'C', distanceM: 80, durationSec: 70,
             sourceRef: { datasetName: 'WalkEdge@Test', smId: 2 }
         },
         {
-            edgeId: 'CB', distanceM: 80, durationSec: 70,
+            edgeId: 'CB', physicalEdgeId: 'CB', fromNodeId: 'C', toNodeId: 'B', distanceM: 80, durationSec: 70,
             sourceRef: { datasetName: 'WalkEdge@Test', smId: 3 }
         }
     ]);
@@ -196,6 +197,204 @@ test('barriers select an alternate graph route with canonical segments, sources,
         barriers: blockedAll,
         dataVersion: 'graph-v1'
     }), null);
+});
+
+test('endpoint snapping preserves a valid target gate when the start has no gate', async () => {
+    await loadGraph([
+        node('A', [0, 0]),
+        node('B', [0.001, 0]),
+        node('C', [0.00091, 0])
+    ], [
+        edge('AB', 'A', 'B', {
+            walkSec: 80,
+            distanceM: 111,
+            geometry: [[0, 0], [0.001, 0]],
+            sourceRef: { datasetName: 'WalkEdge@Test', smId: 1, dataVersion: 'graph-v1' }
+        }),
+        edge('AC', 'A', 'C', {
+            walkSec: 10,
+            distanceM: 101,
+            geometry: [[0, 0], [0.00091, 0]],
+            sourceRef: { datasetName: 'WalkEdge@Test', smId: 2, dataVersion: 'graph-v1' }
+        })
+    ]);
+
+    const route = walkGraph.walkSecBetween(
+        point([0, 0]),
+        point([0.00091, 0], 'B'),
+        'normal'
+    );
+
+    assert.deepStrictEqual(route.edgeIds, ['AB']);
+    assert.equal(route.snap.startNodeId, 'A');
+    assert.equal(route.snap.endNodeId, 'B');
+});
+
+test('explicit target gates fail closed instead of silently snapping to a nearby reachable node', async () => {
+    await loadGraph([
+        node('A', [0, 0]),
+        node('B', [0.001, 0]),
+        node('C', [0.00091, 0])
+    ], [
+        edge('AC', 'A', 'C', {
+            walkSec: 10,
+            distanceM: 101,
+            geometry: [[0, 0], [0.00091, 0]]
+        })
+    ]);
+
+    for (const targetGate of ['B', 'missing-gate']) {
+        const route = walkGraph.walkSecBetween(
+            point([0, 0]),
+            point([0.00091, 0], targetGate),
+            'normal'
+        );
+        assert.equal(route.routeFound, false);
+        assert.equal(route.authoritative, false);
+        assert.equal(route.routeKind, 'direct-estimate');
+    }
+});
+
+test('blocked or reverse-only target gate paths never fall through to a nearby node', async () => {
+    await loadGraph([
+        node('A', [0, 0]),
+        node('B', [0.001, 0]),
+        node('C', [0.00091, 0])
+    ], [
+        edge('BA', 'B', 'A', { walkSec: 80, distanceM: 111 }),
+        edge('AC', 'A', 'C', { walkSec: 10, distanceM: 101 })
+    ]);
+    const reverseOnly = walkGraph.walkSecBetween(
+        point([0, 0]),
+        point([0.00091, 0], 'B'),
+        'normal'
+    );
+    assert.equal(reverseOnly.routeFound, false);
+
+    await loadGraph([
+        node('A', [0, 0]),
+        node('B', [0.001, 0]),
+        node('C', [0.00091, 0])
+    ], [
+        edge('AB', 'A', 'B', { walkSec: 80, distanceM: 111 }),
+        edge('AC', 'A', 'C', { walkSec: 10, distanceM: 101 })
+    ]);
+    const blocked = walkGraph.walkSecBetween(
+        point([0, 0]),
+        point([0.00091, 0], 'B'),
+        'normal',
+        { barriers: [{ edgeId: 'AB' }] }
+    );
+    assert.equal(blocked.routeFound, false);
+    assert.equal(blocked.authoritative, false);
+});
+
+test('directed graph edges permit forward travel but never imply a reverse edge', async () => {
+    await loadGraph([
+        node('A', [0, 0]),
+        node('B', [0.001, 0])
+    ], [
+        edge('AB', 'A', 'B', {
+            walkSec: 80,
+            distanceM: 111,
+            geometry: [[0, 0], [0.001, 0]]
+        })
+    ]);
+
+    assert.deepStrictEqual(walkGraph.astar('A', 'B', 'standard').edgeIds, ['AB']);
+    assert.strictEqual(walkGraph.astar('B', 'A', 'standard'), null);
+});
+
+test('a physical-road barrier blocks both derived directions without changing one-way semantics', async () => {
+    await loadGraph([
+        node('A', [0, 0]),
+        node('B', [0.001, 0])
+    ], [
+        edge('road', 'A', 'B', {
+            physicalEdgeId: 'road',
+            walkSec: 80,
+            distanceM: 111,
+            geometry: [[0, 0], [0.001, 0]]
+        }),
+        edge('road_r', 'B', 'A', {
+            physicalEdgeId: 'road',
+            walkSec: 80,
+            distanceM: 111,
+            geometry: [[0.001, 0], [0, 0]]
+        })
+    ]);
+
+    assert.deepStrictEqual(walkGraph.astar('A', 'B', 'standard').edgeIds, ['road']);
+    assert.deepStrictEqual(walkGraph.astar('B', 'A', 'standard').edgeIds, ['road_r']);
+    assert.strictEqual(walkGraph.astar('A', 'B', 'standard', {
+        barriers: [{ edgeId: 'road' }]
+    }), null);
+    assert.strictEqual(walkGraph.astar('B', 'A', 'standard', {
+        barriers: [{ edgeId: 'road' }]
+    }), null);
+
+    await loadGraph([
+        node('A', [0, 0]),
+        node('B', [0.001, 0])
+    ], [edge('oneway_r', 'B', 'A', {
+        physicalEdgeId: 'oneway_r',
+        walkSec: 80,
+        distanceM: 111
+    })]);
+    assert.strictEqual(walkGraph.astar('A', 'B', 'standard'), null);
+    assert.deepStrictEqual(walkGraph.astar('B', 'A', 'standard').edgeIds, ['oneway_r']);
+});
+
+test('crossing geometries remain disconnected until the intersection is represented by a shared node', async () => {
+    const endpoints = [
+        node('A', [0, 0]),
+        node('B', [0.001, 0.001]),
+        node('C', [0, 0.001]),
+        node('D', [0.001, 0])
+    ];
+    await loadGraph(endpoints, [
+        edge('AB', 'A', 'B', {
+            walkSec: 112,
+            distanceM: 157,
+            geometry: [[0, 0], [0.001, 0.001]]
+        }),
+        edge('CD', 'C', 'D', {
+            walkSec: 112,
+            distanceM: 157,
+            geometry: [[0, 0.001], [0.001, 0]]
+        })
+    ]);
+
+    assert.strictEqual(
+        walkGraph.astar('A', 'D', 'standard'),
+        null,
+        'a visual line intersection is not a topological junction'
+    );
+
+    await loadGraph([...endpoints, node('X', [0.0005, 0.0005])], [
+        edge('AX', 'A', 'X', {
+            walkSec: 56,
+            distanceM: 79,
+            geometry: [[0, 0], [0.0005, 0.0005]]
+        }),
+        edge('XB', 'X', 'B', {
+            walkSec: 56,
+            distanceM: 79,
+            geometry: [[0.0005, 0.0005], [0.001, 0.001]]
+        }),
+        edge('CX', 'C', 'X', {
+            walkSec: 56,
+            distanceM: 79,
+            geometry: [[0, 0.001], [0.0005, 0.0005]]
+        }),
+        edge('XD', 'X', 'D', {
+            walkSec: 56,
+            distanceM: 79,
+            geometry: [[0.0005, 0.0005], [0.001, 0]]
+        })
+    ]);
+
+    assert.deepStrictEqual(walkGraph.astar('A', 'D', 'standard').edgeIds, ['AX', 'XD']);
 });
 
 test('shade routing uses the true minimum weighted path when the old heuristic would overestimate', async () => {
@@ -419,5 +618,32 @@ test('disconnected straight-line estimates remain non-authoritative and are excl
         startNodeId: 'A',
         endNodeId: 'B',
         mode: 'normal'
+    }), null);
+});
+
+test('local fallback accepts only an exact same-node zero leg without traversed edges', async () => {
+    await loadGraph([node('A', [0, 0])], []);
+
+    const exact = walkGraph.findLocalPath({
+        start: [0, 0],
+        end: [0, 0],
+        startNodeId: 'A',
+        endNodeId: 'A',
+        mode: 'normal',
+        dataVersion: 'graph-v1'
+    });
+    assert.ok(exact);
+    assert.deepStrictEqual(exact.geometry.coordinates, [[0, 0], [0, 0]]);
+    assert.deepStrictEqual(exact.nodeIds, ['A']);
+    assert.deepStrictEqual(exact.edgeIds, []);
+    assert.deepStrictEqual(exact.segments, []);
+
+    assert.strictEqual(walkGraph.findLocalPath({
+        start: [0.00001, 0],
+        end: [-0.00001, 0],
+        startNodeId: 'A',
+        endNodeId: 'A',
+        mode: 'normal',
+        dataVersion: 'graph-v1'
     }), null);
 });

@@ -1,8 +1,13 @@
 'use strict';
 
 const { getModels } = require('../models');
-const { NoRouteError, SuperMapError } = require('../integrations/supermap/errors');
+const {
+    NoRouteError,
+    ContractMismatchError,
+    SuperMapError
+} = require('../integrations/supermap/errors');
 const { encodePolyline } = require('../lib/geo');
+const { validateRouteTopology } = require('../lib/routeTopologyProvenance');
 const walkGraph = require('./walkGraph');
 
 const RECENT_POSITION_MAX_AGE_MS = 5 * 60000;
@@ -76,6 +81,9 @@ async function rebuildTimeline({
         stop.distanceM = route.distanceM;
         stop.geometry = route.geometry;
         stop.segments = route.segments;
+        stop.nodeIds = route.nodeIds;
+        stop.edgeIds = route.edgeIds;
+        stop.topologyProof = route.topologyProof;
         stop.snap = route.snap;
         stop.gis = route.gis;
         stop.verifiedAccessible = route.verifiedAccessible;
@@ -127,49 +135,112 @@ async function resolveRoute(routeBetween, fromPoi, toPoi, mode, stop, routeConte
         });
     }
 
-    const legacyFallback = route?.fallback == null &&
-        Array.isArray(route?.nodeIds) && route.nodeIds.length === 0 &&
-        Number(route?.distanceM) > 0;
-    if (!route) {
-        const code = mode === 'accessible' ? 'ACCESSIBLE_ROUTE_UNAVAILABLE' : 'ROUTE_UNAVAILABLE';
-        throw new TimelineRebuildError(code, `route unavailable for stop ${idOf(stop._id || stop.stopId)}`, {
-            stopId: idOf(stop._id || stop.stopId), mode
-        });
-    }
-    const localFallback = route.fallback === true
-        || legacyFallback
-        || route.gis?.source === 'local-fallback';
-    const verifiedAccessible = route.verifiedAccessible === true || route.accessibleVerified === true;
-    if (mode === 'accessible' && localFallback && !verifiedAccessible) {
+    const stopId = idOf(stop._id || stop.stopId);
+    const topologyMarker = route?.routeKind === 'graph'
+        || route?.routeKind === 'topology'
+        || route?.topology === true
+        || route?.gis?.topology === true;
+    const localFallback = route?.gis?.source === 'local-fallback';
+    const verifiedAccessible = route?.verifiedAccessible === true || route?.accessibleVerified === true;
+    if (!route
+        || route.available === false
+        || route.routeFound !== true
+        || route.authoritative !== true
+        || route.routeKind === 'direct-estimate'
+        || route.gis?.source === 'direct-estimate'
+        || !topologyMarker
+        || (normalizeRouteMode(mode) === 'accessible' && localFallback && !verifiedAccessible)) {
         throw new NoRouteError(undefined, {
             operation: 'findPath',
-            requestId: route.gis?.requestId,
+            requestId: route?.gis?.requestId || routeContext?.requestId,
             category: 'no-route',
             retryable: false
         });
     }
 
-    const stopId = idOf(stop._id || stop.stopId);
+    const expectedDataVersion = normalizedDataVersion(routeContext?.dataVersion);
+    const actualDataVersion = normalizedDataVersion(route?.gis?.dataVersion || route?.dataVersion);
+    const routeMode = normalizeRouteMode(route?.gis?.mode);
+    const expectedMode = normalizeRouteMode(mode);
+    if (!routeMode || routeMode !== expectedMode) {
+        throw contractMismatch(
+            `route mode does not match the rebuild mode for stop ${stopId}`,
+            route,
+            routeContext
+        );
+    }
+    if (!actualDataVersion) {
+        throw contractMismatch(
+            `route dataVersion is missing for stop ${stopId}`,
+            route,
+            routeContext
+        );
+    }
+    if (Object.prototype.hasOwnProperty.call(routeContext || {}, 'dataVersion')) {
+        if (!expectedDataVersion || actualDataVersion !== expectedDataVersion) {
+            throw contractMismatch(
+                `route dataVersion does not match the rebuild snapshot for stop ${idOf(stop._id || stop.stopId)}`,
+                route,
+                routeContext
+            );
+        }
+    }
+
     const durationSec = durationSecOf(route, stopId);
     const distanceM = distanceMOf(route, stopId);
     const geometry = geometryOf(route, stopId);
-    const pathGeometry = typeof route.pathGeometry === 'string'
-        ? route.pathGeometry
-        : typeof route.polyline === 'string'
-            ? route.polyline
-            : geometry ? encodePolyline(geometry.coordinates) : '';
+    const topology = validateRouteTopology({
+        ...route,
+        durationSec,
+        distanceM,
+        geometry
+    }, {
+        expectedDataVersion: expectedDataVersion || actualDataVersion,
+        authority: localFallback ? 'local-walk-graph' : 'iserver-network-analysis'
+    });
+    if (!topology.valid) {
+        throw contractMismatch(
+            `route topology does not match the rebuild snapshot for stop ${stopId}: ${topology.reason}`,
+            route,
+            routeContext
+        );
+    }
+    const pathGeometry = encodePolyline(geometry.coordinates);
     return {
         durationSec,
         distanceM,
         geometry,
-        segments: Array.isArray(route.segments)
-            ? route.segments.map(segment => ({ ...segment }))
-            : [],
-        snap: route.snap && typeof route.snap === 'object' ? { ...route.snap } : null,
+        segments: topology.segments,
+        nodeIds: topology.nodeIds,
+        edgeIds: topology.segments.map(segment => segment.edgeId),
+        topologyProof: topology.proof,
+        snap: route.snap && typeof route.snap === 'object' ? {
+            ...route.snap,
+            startNodeId: topology.nodeIds[0],
+            endNodeId: topology.nodeIds[topology.nodeIds.length - 1]
+        } : null,
         gis: route.gis && typeof route.gis === 'object' ? { ...route.gis } : null,
         verifiedAccessible,
         pathGeometry
     };
+}
+
+function normalizedDataVersion(value) {
+    return typeof value === 'string' && value.trim() ? value.trim() : '';
+}
+
+function normalizeRouteMode(value) {
+    const mode = typeof value === 'string' ? value.trim().toLowerCase() : '';
+    return mode === 'standard' ? 'normal' : mode;
+}
+
+function contractMismatch(message, route, routeContext) {
+    return new ContractMismatchError(message, {
+        operation: 'findPath',
+        requestId: route?.gis?.requestId || routeContext?.requestId,
+        category: 'contract',
+        retryable: false
+    });
 }
 
 function durationSecOf(route, stopId) {

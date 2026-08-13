@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const { decodePolyline } = require('../../lib/geo');
+const { createTopologyProof, validateRouteTopology } = require('../../lib/routeTopologyProvenance');
 const {
     IServerTimeoutError,
     SuperMapError
@@ -41,6 +42,95 @@ function loader(pois) {
     return async ids => ids.map(id => byId.get(String(id))).filter(Boolean);
 }
 
+let routeSequence = 0;
+
+function topologyRoute(from, to, mode = 'standard', options = {}) {
+    const source = options.source || 'iserver';
+    const normalizedMode = mode === 'standard' ? 'normal' : mode;
+    const fromCoordinates = options.coordinates?.[0] || from.geo.coordinates;
+    const toCoordinates = options.coordinates?.[1] || to.geo.coordinates;
+    const coordinatesMatch = fromCoordinates[0] === toCoordinates[0]
+        && fromCoordinates[1] === toCoordinates[1];
+    const distanceM = options.distanceM ?? (coordinatesMatch ? 0 : 80);
+    const durationSec = options.durationSec ?? options.walkSec ?? (coordinatesMatch ? 0 : 60);
+    const sameNode = distanceM === 0 && durationSec === 0 && coordinatesMatch;
+    const suffix = ++routeSequence;
+    const fromNodeId = options.fromNodeId || `timeline-node-${suffix}-from`;
+    const toNodeId = sameNode
+        ? fromNodeId
+        : options.toNodeId || `timeline-node-${suffix}-to`;
+    const edgeId = options.edgeId || `timeline-edge-${suffix}`;
+    const segments = sameNode ? [] : [{
+        edgeId,
+        fromNodeId,
+        toNodeId,
+        distanceM,
+        durationSec,
+        sourceRef: { datasetName: 'WalkEdge@Test', smId: suffix }
+    }];
+    const nodeIds = sameNode ? [fromNodeId] : [fromNodeId, toNodeId];
+    const geometry = {
+        type: 'LineString',
+        coordinates: sameNode
+            ? [[...fromCoordinates], [...fromCoordinates]]
+            : [[...fromCoordinates], [...toCoordinates]]
+    };
+    const dataVersion = Object.prototype.hasOwnProperty.call(options, 'dataVersion')
+        ? options.dataVersion
+        : 'v1';
+    const route = {
+        available: true,
+        authoritative: true,
+        routeFound: true,
+        routeKind: 'topology',
+        topology: true,
+        durationSec,
+        walkSec: durationSec,
+        distanceM,
+        geometry,
+        nodeIds,
+        edgeIds: segments.map(segment => segment.edgeId),
+        edgeDataVersions: segments.map(() => dataVersion),
+        segments,
+        snap: {
+            startNodeId: nodeIds[0],
+            endNodeId: nodeIds[nodeIds.length - 1],
+            startDistanceM: 0,
+            endDistanceM: 0
+        },
+        gis: {
+            source,
+            mode: normalizedMode,
+            degraded: source !== 'iserver',
+            requestId: options.requestId || `timeline-route-${suffix}`,
+            durationMs: 1,
+            dataVersion
+        },
+        ...(options.verifiedAccessible === undefined ? {} : {
+            verifiedAccessible: options.verifiedAccessible,
+            accessibleVerified: options.verifiedAccessible
+        })
+    };
+    const topologyProof = typeof dataVersion === 'string' && dataVersion.trim()
+        ? createTopologyProof({
+            authority: source === 'local-fallback'
+                ? 'local-walk-graph'
+                : 'iserver-network-analysis',
+            dataVersion,
+            geometry,
+            nodeIds,
+            segments,
+            distanceM,
+            durationSec
+        })
+        : null;
+    return {
+        ...route,
+        topologyProof,
+        ...(options.overrides || {})
+    };
+}
+
 test('recent lastPosition wins and immutable states keep their timeline and geometry', async () => {
     const immutable = [
         stop('done', 'done-poi', 'done', '2026-07-21T07:00:00.000Z', 20, 'done-path'),
@@ -66,7 +156,7 @@ test('recent lastPosition wins and immutable states keep their timeline and geom
         ]),
         routeBetween: async (from, to, mode) => {
             calls.push({ from, to, mode });
-            return { walkSec: 60, pathGeometry: 'fresh-path', fallback: false };
+            return topologyRoute(from, to, mode, { durationSec: 60, distanceM: 80 });
         }
     });
 
@@ -74,7 +164,10 @@ test('recent lastPosition wins and immutable states keep their timeline and geom
     assert.strictEqual(calls[0].from._timelineAnchor, 'lastPosition');
     assert.strictEqual(calls[0].mode, 'standard');
     assert.strictEqual(rebuilt[4].plannedArrive.toISOString(), '2026-07-21T09:11:00.000Z');
-    assert.strictEqual(rebuilt[4].pathGeometry, 'fresh-path');
+    assert.deepStrictEqual(
+        decodePolyline(rebuilt[4].pathGeometry),
+        [[118.5, 32.5], [118, 32]]
+    );
     for (let i = 0; i < immutable.length; i++) {
         assert.strictEqual(rebuilt[i].plannedArrive.getTime(), immutable[i].plannedArrive.getTime());
         assert.strictEqual(rebuilt[i].plannedLeave.getTime(), immutable[i].plannedLeave.getTime());
@@ -86,9 +179,9 @@ test('recent lastPosition wins and immutable states keep their timeline and geom
 test('anchor falls back from stale position to arrived, last done, then startLocation', async () => {
     const allPois = [poi('arrived-poi'), poi('done-poi'), poi('next-poi')];
     const seen = [];
-    const routeBetween = async from => {
+    const routeBetween = async (from, to, mode) => {
         seen.push(from._id || from._timelineAnchor);
-        return { walkSec: 0, pathGeometry: '', fallback: false };
+        return topologyRoute(from, to, mode);
     };
     const stalePosition = {
         lng: 120,
@@ -125,38 +218,6 @@ test('anchor falls back from stale position to arrived, last done, then startLoc
 });
 
 test('rebuilds every mutable segment with route ETA, geometry, and original stay duration', async () => {
-    const routes = [
-        {
-            durationSec: 120,
-            walkSec: 9999,
-            distanceM: 140,
-            geometry: {
-                type: 'LineString',
-                coordinates: [[118, 32], [118.001, 32.001]]
-            },
-            segments: [{ edgeId: 'edge-a', distanceM: 140, durationSec: 120 }],
-            snap: { startDistanceM: 1, endDistanceM: 2 },
-            gis: {
-                source: 'iserver', mode: 'shade', degraded: false,
-                requestId: 'gis-a', durationMs: 10, dataVersion: 'v1'
-            }
-        },
-        {
-            durationSec: 180,
-            walkSec: 9999,
-            distanceM: 220,
-            geometry: {
-                type: 'LineString',
-                coordinates: [[118.001, 32.001], [118.002, 32.002]]
-            },
-            segments: [{ edgeId: 'edge-b', distanceM: 220, durationSec: 180 }],
-            snap: { startDistanceM: 3, endDistanceM: 4 },
-            gis: {
-                source: 'cache', mode: 'shade', degraded: true,
-                requestId: 'gis-b', durationMs: 5, dataVersion: 'v1'
-            }
-        }
-    ];
     const calls = [];
     const rebuilt = await rebuildTimeline({
         itinerary: { startLocation: [118, 32], preferences: { shadeFirst: true } },
@@ -165,10 +226,15 @@ test('rebuilds every mutable segment with route ETA, geometry, and original stay
             stop('b', 'poi-b', 'approaching', '2026-07-21T13:00:00.000Z', 20)
         ],
         now: NOW,
-        loadPois: loader([poi('poi-a'), poi('poi-b')]),
+        loadPois: loader([
+            poi('poi-a', [118.001, 32.001]),
+            poi('poi-b', [118.002, 32.002])
+        ]),
         routeBetween: async (from, to, mode) => {
             calls.push({ from: from._id || from._timelineAnchor, to: to._id, mode });
-            return routes.shift();
+            return topologyRoute(from, to, mode, to._id === 'poi-a'
+                ? { durationSec: 120, distanceM: 140, edgeId: 'edge-a', requestId: 'gis-a' }
+                : { durationSec: 180, distanceM: 220, edgeId: 'edge-b', source: 'cache', requestId: 'gis-b' });
         }
     });
 
@@ -184,13 +250,78 @@ test('rebuilds every mutable segment with route ETA, geometry, and original stay
     assert.deepStrictEqual(rebuilt.map(item => item.distanceM), [140, 220]);
     assert.deepStrictEqual(rebuilt[0].geometry.coordinates, [[118, 32], [118.001, 32.001]]);
     assert.deepStrictEqual(rebuilt.map(item => item.segments[0].edgeId), ['edge-a', 'edge-b']);
-    assert.deepStrictEqual(rebuilt[0].snap, { startDistanceM: 1, endDistanceM: 2 });
+    assert.equal(rebuilt[0].snap.startDistanceM, 0);
+    assert.equal(rebuilt[0].snap.endDistanceM, 0);
     assert.strictEqual(rebuilt[1].gis.source, 'cache');
     assert.deepStrictEqual(
         decodePolyline(rebuilt[0].pathGeometry),
         [[118, 32], [118.001, 32.001]]
     );
     assert.deepStrictEqual(rebuilt.map(item => item.state), ['approaching', 'pending']);
+});
+
+test('timeline rebuild preserves canonical topology proof, nodes, physical edge, and snap nodes', async () => {
+    const geometry = {
+        type: 'LineString',
+        coordinates: [[118, 32], [118.001, 32.001]]
+    };
+    const segments = [{
+        edgeId: 'AB',
+        physicalEdgeId: 'physical-AB',
+        fromNodeId: 'A',
+        toNodeId: 'B',
+        distanceM: 80,
+        durationSec: 60,
+        sourceRef: { datasetName: 'WalkEdge@Test', smId: 1 }
+    }];
+    const nodeIds = ['A', 'B'];
+    const topologyProof = createTopologyProof({
+        authority: 'iserver-network-analysis',
+        dataVersion: 'v1',
+        geometry,
+        nodeIds,
+        segments,
+        distanceM: 80,
+        durationSec: 60
+    });
+    const rebuilt = await rebuildTimeline({
+        itinerary: { startLocation: [118, 32], preferences: {} },
+        proposedStops: [stop('a', 'poi-a')],
+        now: NOW,
+        loadPois: loader([poi('poi-a', [118.001, 32.001])]),
+        routeBetween: async () => ({
+            available: true,
+            authoritative: true,
+            routeFound: true,
+            routeKind: 'topology',
+            topology: true,
+            durationSec: 60,
+            distanceM: 80,
+            geometry,
+            segments,
+            nodeIds,
+            edgeIds: ['AB'],
+            topologyProof,
+            snap: {
+                startNodeId: 'A', endNodeId: 'B',
+                startDistanceM: 0, endDistanceM: 0
+            },
+            gis: {
+                source: 'iserver', mode: 'normal', degraded: false,
+                requestId: 'timeline-proof', durationMs: 1, dataVersion: 'v1'
+            }
+        })
+    });
+
+    assert.equal(rebuilt[0].segments[0].physicalEdgeId, 'physical-AB');
+    assert.deepStrictEqual(rebuilt[0].nodeIds, ['A', 'B']);
+    assert.deepStrictEqual(rebuilt[0].edgeIds, ['AB']);
+    assert.deepStrictEqual(rebuilt[0].snap, {
+        startNodeId: 'A', endNodeId: 'B', startDistanceM: 0, endDistanceM: 0
+    });
+    assert.equal(validateRouteTopology(rebuilt[0], {
+        authority: 'iserver-network-analysis', expectedDataVersion: 'v1'
+    }).valid, true);
 });
 
 test('forwards the exact route context to every mutable route leg', async () => {
@@ -219,7 +350,7 @@ test('forwards the exact route context to every mutable route leg', async () => 
         routeContext,
         routeBetween: async (from, to, mode, context) => {
             contexts.push(context);
-            return { walkSec: 60, pathGeometry: `${from._id || from._timelineAnchor}-${to._id}`, fallback: false };
+            return topologyRoute(from, to, mode);
         }
     });
 
@@ -236,6 +367,35 @@ test('forwards the exact route context to every mutable route leg', async () => 
     });
 });
 
+test('versioned timeline rebuild rejects a missing or mixed leg data version', async () => {
+    const base = {
+        itinerary: { startLocation: [118, 32], preferences: {} },
+        proposedStops: [stop('a', 'poi-a')],
+        now: NOW,
+        loadPois: loader([poi('poi-a', [118.001, 32.001])]),
+        routeContext: {
+            barriers: [],
+            barrierFingerprint: 'sha256:empty',
+            dataVersion: 'v1'
+        }
+    };
+
+    for (const actualDataVersion of [null, '', 'v2']) {
+        await assert.rejects(
+            rebuildTimeline({
+                ...base,
+                routeBetween: async (from, to, mode) => topologyRoute(from, to, mode, {
+                    dataVersion: actualDataVersion,
+                    requestId: 'versioned-rebuild'
+                })
+            }),
+            error => error instanceof SuperMapError
+                && error.code === 8205
+                && error.httpStatus === 409
+        );
+    }
+});
+
 test('an arrived stop owns current progress while all future stops remain pending', async () => {
     const rebuilt = await rebuildTimeline({
         itinerary: { startLocation: [118, 32], preferences: {} },
@@ -245,8 +405,12 @@ test('an arrived stop owns current progress while all future stops remain pendin
             stop('b', 'poi-b', 'pending')
         ],
         now: NOW,
-        loadPois: loader([poi('poi-current'), poi('poi-a'), poi('poi-b')]),
-        routeBetween: async () => ({ walkSec: 60, pathGeometry: 'route', fallback: false })
+        loadPois: loader([
+            poi('poi-current', [118, 32]),
+            poi('poi-a', [118.001, 32.001]),
+            poi('poi-b', [118.002, 32.002])
+        ]),
+        routeBetween: async (from, to, mode) => topologyRoute(from, to, mode)
     });
 
     assert.deepStrictEqual(rebuilt.map(item => item.state), ['arrived', 'pending', 'pending']);
@@ -262,8 +426,14 @@ test('delay proposal adds one wait even when proposedStops already contain shift
         ],
         proposal: { type: 'delay', payload: { stopId: 'target', delayMin: 25 } },
         now: NOW,
-        loadPois: loader([poi('poi-a'), poi('poi-b')]),
-        routeBetween: async () => ({ walkSec: 5 * 60, pathGeometry: 'route', fallback: false })
+        loadPois: loader([
+            poi('poi-a', [118.001, 32.001]),
+            poi('poi-b', [118.002, 32.002])
+        ]),
+        routeBetween: async (from, to, mode) => topologyRoute(from, to, mode, {
+            durationSec: 5 * 60,
+            distanceM: 300
+        })
     });
 
     assert.strictEqual(rebuilt[0].plannedArrive.toISOString(), '2026-07-21T09:30:00.000Z');
@@ -278,42 +448,63 @@ test('replace uses the new POI suggested stay with itinerary pace', async () => 
         proposal: { type: 'replace', payload: { stopId: 'target', newPoiId: 'new-poi' } },
         now: NOW,
         loadPois: loader([poi('new-poi', [118.1, 32.1], 30)]),
-        routeBetween: async () => ({ walkSec: 60, pathGeometry: 'new-route', fallback: false })
+        routeBetween: async (from, to, mode) => topologyRoute(from, to, mode)
     });
 
     assert.strictEqual(rebuilt[0].plannedArrive.toISOString(), '2026-07-21T09:01:00.000Z');
     assert.strictEqual(rebuilt[0].plannedLeave.toISOString(), '2026-07-21T09:40:00.000Z');
 });
 
-test('accessible mode rejects unavailable and unverified fallback routes', async () => {
+test('all route modes reject unavailable, direct, non-authoritative, and unmarked routes with 8204', async () => {
     const base = {
-        itinerary: { startLocation: [118, 32], preferences: { accessible: true } },
+        itinerary: { startLocation: [118, 32], preferences: {} },
         proposedStops: [stop('a', 'poi-a')],
         now: NOW,
-        loadPois: loader([poi('poi-a')])
+        loadPois: loader([poi('poi-a', [118.001, 32.001])])
     };
 
-    await assert.rejects(
-        rebuildTimeline({ ...base, routeBetween: async () => null }),
-        error => error instanceof TimelineRebuildError && error.code === 'ACCESSIBLE_ROUTE_UNAVAILABLE'
-    );
-
-    for (const result of [
-        { walkSec: 60, pathGeometry: 'direct', fallback: true },
+    const cases = [
+        null,
+        { routeFound: false },
+        { routeFound: true, available: false },
+        { routeFound: true, available: true, authoritative: false },
         {
+            routeFound: true,
+            available: true,
+            authoritative: true,
+            routeKind: 'direct-estimate',
+            gis: { source: 'direct-estimate' }
+        },
+        {
+            routeFound: true,
+            available: true,
+            authoritative: true,
             durationSec: 60,
             distanceM: 80,
             geometry: { type: 'LineString', coordinates: [[118, 32], [118.001, 32.001]] },
-            gis: { source: 'local-fallback', requestId: 'accessible-request' }
+            gis: { source: 'iserver', mode: 'normal', dataVersion: 'v1' }
         }
+    ];
+
+    for (const [preferences, mode] of [
+        [{}, 'normal'],
+        [{ shadeFirst: true }, 'shade'],
+        [{ accessible: true }, 'accessible']
     ]) {
-        await assert.rejects(
-            rebuildTimeline({ ...base, routeBetween: async () => result }),
-            error => error instanceof SuperMapError
-                && error.code === 8204
-                && error.httpStatus === 422
-                && error.retryable === false
-        );
+        for (const result of cases) {
+            await assert.rejects(
+                rebuildTimeline({
+                    ...base,
+                    itinerary: { ...base.itinerary, preferences },
+                    routeBetween: async () => result
+                }),
+                error => error instanceof SuperMapError
+                    && error.code === 8204
+                    && error.httpStatus === 422
+                    && error.retryable === false,
+                `${mode} must reject ${JSON.stringify(result)}`
+            );
+        }
     }
 });
 
@@ -323,21 +514,11 @@ test('accessible mode preserves a verified local fallback route', async () => {
         proposedStops: [stop('a', 'poi-a')],
         now: NOW,
         loadPois: loader([poi('poi-a', [118.001, 32.001])]),
-        routeBetween: async () => ({
-            durationSec: 60,
-            distanceM: 80,
-            geometry: {
-                type: 'LineString',
-                coordinates: [[118, 32], [118.001, 32.001]]
-            },
-            segments: [{ edgeId: 'verified-accessible-edge', distanceM: 80, durationSec: 60 }],
-            snap: { startDistanceM: 0, endDistanceM: 0 },
-            gis: {
-                source: 'local-fallback', mode: 'accessible', degraded: true,
-                requestId: 'accessible-verified', durationMs: 5, dataVersion: 'v1'
-            },
-            verifiedAccessible: true,
-            accessibleVerified: true
+        routeBetween: async (from, to, mode) => topologyRoute(from, to, mode, {
+            source: 'local-fallback',
+            edgeId: 'verified-accessible-edge',
+            requestId: 'accessible-verified',
+            verifiedAccessible: true
         })
     });
 
@@ -367,15 +548,72 @@ test('typed SuperMap route failures are preserved without TimelineRebuildError w
     );
 });
 
-test('standard mode accepts an explicit fallback route', async () => {
-    const rebuilt = await rebuildTimeline({
+test('accessible mode rejects an unverified topological local fallback with 8204', async () => {
+    await assert.rejects(rebuildTimeline({
+        itinerary: { startLocation: [118, 32], preferences: { accessible: true } },
+        proposedStops: [stop('a', 'poi-a')],
+        now: NOW,
+        loadPois: loader([poi('poi-a', [118.001, 32.001])]),
+        routeBetween: async (from, to, mode) => topologyRoute(from, to, mode, {
+            source: 'local-fallback',
+            verifiedAccessible: false
+        })
+    }), error => error instanceof SuperMapError
+        && error.code === 8204
+        && error.httpStatus === 422);
+});
+
+test('normal and shade preserve a valid topological local fallback', async () => {
+    for (const preferences of [{}, { shadeFirst: true }]) {
+        const rebuilt = await rebuildTimeline({
+            itinerary: { startLocation: [118, 32], preferences },
+            proposedStops: [stop('a', 'poi-a')],
+            now: NOW,
+            loadPois: loader([poi('poi-a', [118.001, 32.001])]),
+            routeBetween: async (from, to, mode) => topologyRoute(from, to, mode, {
+                source: 'local-fallback'
+            })
+        });
+
+        assert.strictEqual(rebuilt[0].gis.source, 'local-fallback');
+        assert.equal(validateRouteTopology(rebuilt[0], {
+            authority: 'local-walk-graph', expectedDataVersion: 'v1'
+        }).valid, true);
+    }
+});
+
+test('timeline returns 8205 for mode, canonical chain, proof, and authority mismatches', async () => {
+    const base = {
         itinerary: { startLocation: [118, 32], preferences: {} },
         proposedStops: [stop('a', 'poi-a')],
         now: NOW,
-        loadPois: loader([poi('poi-a')]),
-        routeBetween: async () => ({ walkSec: 90, pathGeometry: 'direct', fallback: true })
-    });
+        loadPois: loader([poi('poi-a', [118.001, 32.001])])
+    };
+    const valid = topologyRoute(
+        { geo: { coordinates: [118, 32] } },
+        { geo: { coordinates: [118.001, 32.001] } },
+        'standard'
+    );
+    const cases = [
+        { ...valid, gis: { ...valid.gis, mode: 'shade' } },
+        {
+            ...valid,
+            segments: [{ ...valid.segments[0], toNodeId: 'broken-node' }],
+            topologyProof: null
+        },
+        { ...valid, topologyProof: { ...valid.topologyProof, digest: 'sha256:broken' } },
+        {
+            ...valid,
+            gis: { ...valid.gis, source: 'local-fallback' }
+        }
+    ];
 
-    assert.strictEqual(rebuilt[0].plannedArrive.toISOString(), '2026-07-21T09:01:30.000Z');
-    assert.strictEqual(rebuilt[0].pathGeometry, 'direct');
+    for (const result of cases) {
+        await assert.rejects(
+            rebuildTimeline({ ...base, routeBetween: async () => result }),
+            error => error instanceof SuperMapError
+                && error.code === 8205
+                && error.httpStatus === 409
+        );
+    }
 });

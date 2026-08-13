@@ -405,6 +405,11 @@ function attach({
                 scenicId
             }))
     });
+    const estimateBetween = options.estimateBetween || ((from, to, mode, context = {}) =>
+        walkGraph.walkSecBetween(from, to, mode, {
+            barriers: Array.isArray(context.barriers) ? context.barriers : []
+        }));
+    const dataVersion = options.dataVersion || (() => superMapGateway.getDataVersion());
     const barrierReroute = createBarrierRerouteCoordinator({
         models: registeredModels,
         gateway: superMapGateway,
@@ -412,6 +417,7 @@ function attach({
         rebuildTimeline,
         aggregateRouteFromStops,
         routeBetween,
+        dataVersion,
         releaseProposalTokens: (tokenIds, itineraryId) =>
             antiHerding.releaseTokens(tokenIds, itineraryId),
         itineraryConcurrency: options.barrierRerouteConcurrency ?? CONFIG.barrierRerouteConcurrency,
@@ -423,6 +429,8 @@ function attach({
         ...(app.locals.geosync || {}),
         superMapGateway,
         routeBetween,
+        estimateBetween,
+        dataVersion,
         barrierReroute
     };
 
@@ -572,6 +580,7 @@ function attach({
             backgroundStarted: startBackground,
             superMapGateway,
             routeBetween,
+            estimateBetween,
             barrierReroute,
             runtimeReadiness,
             readiness,

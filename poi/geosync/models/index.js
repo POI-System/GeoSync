@@ -39,14 +39,35 @@ const walkEdgeSourceRefSchema = new Schema({
 
 const routeSegmentSchema = new Schema({
     edgeId: String,
+    physicalEdgeId: String,
+    fromNodeId: String,
+    toNodeId: String,
     distanceM: { type: Number, min: 0 },
     durationSec: { type: Number, min: 0 },
     sourceRef: { type: routeSourceRefSchema, default: null }
 }, { _id: false });
 
 const routeSnapSchema = new Schema({
+    startNodeId: String,
+    endNodeId: String,
     startDistanceM: { type: Number, min: 0 },
     endDistanceM: { type: Number, min: 0 }
+}, { _id: false });
+
+const routeTopologyProofSchema = new Schema({
+    schema: String,
+    authority: String,
+    dataVersion: String,
+    kind: String,
+    geometryDigest: String,
+    nodeIds: { type: [String], default: [] },
+    edgeIds: { type: [String], default: [] },
+    sourceRefs: { type: [routeSourceRefSchema], default: [] },
+    segmentCount: { type: Number, min: 0 },
+    distanceM: { type: Number, min: 0 },
+    durationSec: { type: Number, min: 0 },
+    segments: { type: [routeSegmentSchema], default: [] },
+    digest: String
 }, { _id: false });
 
 const routeGisSchema = new Schema({
@@ -64,6 +85,9 @@ const routeSchema = new Schema({
     durationSec: { type: Number, min: 0, default: null },
     gis: { type: routeGisSchema, default: null },
     segments: { type: [routeSegmentSchema], default: [] },
+    nodeIds: { type: [String], default: [] },
+    edgeIds: { type: [String], default: [] },
+    topologyProof: { type: routeTopologyProofSchema, default: null },
     snap: { type: routeSnapSchema, default: null },
     verifiedAccessible: { type: Boolean, default: null },
     pathGeometry: { type: String, default: '' }
@@ -170,6 +194,9 @@ function registerModels(mongoose, injectedModels = {}) {
         durationSec: { type: Number, min: 0, default: null },
         gis: { type: routeGisSchema, default: null },
         segments: { type: [routeSegmentSchema], default: [] },
+        nodeIds: { type: [String], default: [] },
+        edgeIds: { type: [String], default: [] },
+        topologyProof: { type: routeTopologyProofSchema, default: null },
         snap: { type: routeSnapSchema, default: null },
         verifiedAccessible: { type: Boolean, default: null },
         pathGeometry: { type: String, default: '' }
@@ -193,6 +220,15 @@ function registerModels(mongoose, injectedModels = {}) {
         }
     }, { _id: false });
 
+    const planningSnapshotSchema = new Schema({
+        barrierFingerprint: { type: String, required: true },
+        barrierEdgeIds: { type: [String], default: [] },
+        dataVersion: { type: String, required: true },
+        capturedAt: { type: Date, required: true },
+        invalidatedAt: { type: Date, default: null },
+        invalidationReason: { type: String, default: null }
+    }, { _id: false });
+
     const itinerarySchema = new Schema({
         scenicId: { type: String, default: 'default' },
         openId: { type: String, required: true, index: true },
@@ -209,6 +245,7 @@ function registerModels(mongoose, injectedModels = {}) {
         },
         stops: [stopSchema],
         route: { type: routeSchema, default: null },
+        planningSnapshot: { type: planningSnapshotSchema, default: null },
         startLocation: { type: pointSchema, default: null },
         version: { type: Number, default: 1 },
         state: {
@@ -378,6 +415,12 @@ function registerModels(mongoose, injectedModels = {}) {
     const walkEdgeSchema = new Schema({
         scenicId: { type: String, default: 'default' },
         edgeId: { type: String, required: true, unique: true },
+        physicalEdgeId: {
+            type: String,
+            required: true,
+            default: function defaultPhysicalEdgeId() { return this.edgeId; }
+        },
+        traversalDirection: { type: String, enum: ['forward', 'reverse'], default: 'forward' },
         from: { type: String, required: true },
         to: { type: String, required: true },
         geometry: { type: [[Number]], default: [] },
@@ -426,6 +469,7 @@ function registerModels(mongoose, injectedModels = {}) {
     walkEdgeSchema.index({ from: 1 });
     walkEdgeSchema.index({ status: 1 });
     walkEdgeSchema.index({ scenicId: 1, status: 1 });
+    walkEdgeSchema.index({ scenicId: 1, physicalEdgeId: 1 });
 
     const accessibleEvidenceSchema = new Schema({
         edgeId: String, userIdHash: String, date: String,

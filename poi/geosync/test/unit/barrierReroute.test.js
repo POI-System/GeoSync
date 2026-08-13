@@ -10,6 +10,7 @@ const {
     remainingRouteUsesEdge,
     createBarrierRerouteCoordinator
 } = require('../../services/barrierReroute');
+const { rebuildTimeline } = require('../../services/itineraryTimeline');
 
 const NOW = new Date('2026-08-02T06:00:00.000Z');
 
@@ -69,11 +70,12 @@ function createBarrierEventModel(records = new Map()) {
     };
 }
 
-function edge(edgeId, datasetName = 'walk_edges_test', smId = 1) {
+function edge(edgeId, datasetName = 'walk_edges_test', smId = 1, physicalEdgeId = edgeId) {
     return {
         scenicId: 'scenic-test',
         status: 'closed',
         edgeId,
+        physicalEdgeId,
         sourceRef: { datasetName, smId }
     };
 }
@@ -100,7 +102,8 @@ function makeHarness(options = {}) {
         released: [],
         walkEdgeFilters: [],
         itineraryFilters: [],
-        updates: []
+        updates: [],
+        dataVersionReads: []
     };
     const edges = options.edges || [];
     const itineraries = options.itineraries || [];
@@ -126,6 +129,9 @@ function makeHarness(options = {}) {
         BarrierEventRecord: barrierEventModel
     };
     const routeBetween = options.routeBetween || (async () => null);
+    const dataVersionSource = options.dataVersion === undefined
+        ? () => 'graph-v1'
+        : options.dataVersion;
     const coordinator = createBarrierRerouteCoordinator({
         models,
         gateway: {
@@ -143,6 +149,13 @@ function makeHarness(options = {}) {
         },
         rebuildTimeline: options.rebuildTimeline || (async ({ proposedStops }) => proposedStops),
         routeBetween,
+        dataVersion: async () => {
+            const value = typeof dataVersionSource === 'function'
+                ? await dataVersionSource()
+                : dataVersionSource;
+            state.dataVersionReads.push(value);
+            return value;
+        },
         aggregateRouteFromStops: options.aggregateRouteFromStops,
         emitRerouteProposed: async payload => {
             state.published.push(payload);
@@ -192,11 +205,48 @@ test('closed barrier snapshot queries the scenic set, validates, deduplicates, a
     assert.deepEqual(filters, [{ scenicId: 'scenic-test', status: 'closed' }]);
     assert.deepEqual(snapshot.edgeIds, ['edge-a', 'edge-m', 'edge-z']);
     assert.deepEqual(snapshot.barriers, [
-        { edgeId: 'edge-a', sourceRef: { datasetName: 'walk_edges_test', smId: 2 } },
-        { edgeId: 'edge-m', sourceRef: { datasetName: 'walk_edges_secondary', smId: 4 } },
-        { edgeId: 'edge-z', sourceRef: { datasetName: 'walk_edges_test', smId: 9 } }
+        {
+            edgeId: 'edge-a', physicalEdgeId: 'edge-a',
+            sourceRef: { datasetName: 'walk_edges_test', smId: 2 }
+        },
+        {
+            edgeId: 'edge-m', physicalEdgeId: 'edge-m',
+            sourceRef: { datasetName: 'walk_edges_secondary', smId: 4 }
+        },
+        {
+            edgeId: 'edge-z', physicalEdgeId: 'edge-z',
+            sourceRef: { datasetName: 'walk_edges_test', smId: 9 }
+        }
     ]);
     assert.equal(snapshot.fingerprint, barrierFingerprint(snapshot.barriers));
+    assert.deepEqual(snapshot.physicalEdgeIds, ['edge-a', 'edge-m', 'edge-z']);
+});
+
+test('barrier snapshots and route checks treat both directions as one physical edge', async () => {
+    const snapshot = await loadClosedBarrierSnapshot({
+        WalkEdge: {
+            find: () => leanQuery([
+                edge('road', 'walk_edges_test', 10, 'road'),
+                edge('road_r', 'walk_edges_test', 11, 'road')
+            ])
+        },
+        scenicId: 'scenic-test'
+    });
+
+    assert.deepEqual(snapshot.physicalEdgeIds, ['road']);
+    assert.equal(remainingRouteUsesEdge({
+        stops: [mutableStop('reverse', 'road_r')]
+    }, {
+        edgeId: 'road',
+        physicalEdgeId: 'road',
+        edgeIds: ['road', 'road_r']
+    }), true);
+    assert.equal(routeAvoidsBarriers({
+        stops: [{
+            state: 'pending',
+            segments: [{ edgeId: 'unrelated-id', physicalEdgeId: 'road' }]
+        }]
+    }, snapshot.barriers), false);
 });
 
 test('missing, invalid, or conflicting canonical mappings fail the whole snapshot', async () => {
@@ -441,7 +491,10 @@ test('coordinator rebuilds with the complete barrier context, rejects unsafe can
         type: 'graph:edgeClosed'
     });
 
-    assert.deepEqual(harness.state.itineraryFilters, [{ scenicId: 'scenic-test', state: 'active' }]);
+    assert.deepEqual(harness.state.itineraryFilters, [{
+        scenicId: 'scenic-test',
+        state: { $in: ['draft', 'active', 'paused'] }
+    }]);
     assert.equal(harness.state.invalidations, 1);
     assert.equal(harness.state.reloads, 1);
     assert.equal(harness.state.updates.length, 2);
@@ -473,8 +526,10 @@ test('coordinator rebuilds with the complete barrier context, rejects unsafe can
         assert.equal(context.requestId, 'event-partial');
         assert.equal(context.eventId, 'event-partial');
         assert.equal(context.barrierFingerprint, result.barrierFingerprint);
+        assert.equal(context.dataVersion, 'graph-v1');
         assert.deepEqual(context.barriers.map(item => item.edgeId), ['edge-closed', 'edge-z']);
     }
+    assert.equal(proposal.payload.dataVersion, 'graph-v1');
 
     assert.equal(harness.state.published.length, 1);
     assert.strictEqual(harness.state.published[0].proposal, proposal);
@@ -508,6 +563,262 @@ test('coordinator rebuilds with the complete barrier context, rejects unsafe can
             ['it-cas', 'failed', 'ITINERARY_CAS_CONFLICT']
         ]
     );
+});
+
+test('paused itineraries receive barrier proposals without being resumed', async () => {
+    const paused = {
+        _id: 'it-paused',
+        openId: 'user-paused',
+        version: 2,
+        state: 'paused',
+        pendingProposal: null,
+        preferences: { pace: 'normal' },
+        route: { segments: [{ edgeId: 'edge-closed' }] },
+        stops: [mutableStop('paused', 'edge-closed')]
+    };
+    const harness = makeHarness({
+        edges: [edge('edge-closed', 'walk_edges_test', 7)],
+        itineraries: [paused],
+        rebuildTimeline: async () => [mutableStop('paused-new', 'edge-open')],
+        aggregateRouteFromStops: stops => ({
+            segments: stops.flatMap(stop => stop.segments || []),
+            durationSec: 90
+        }),
+        updateImpl: (filter, update) => ({
+            ...paused,
+            ...update.$set,
+            version: paused.version + 1
+        })
+    });
+
+    const result = await harness.coordinator.processGraphEvent({
+        eventId: 'event-paused-close',
+        scenicId: 'scenic-test',
+        edgeId: 'edge-closed',
+        operation: 'close'
+    });
+
+    assert.equal(result.proposedCount, 1);
+    assert.equal(harness.state.updates.length, 1);
+    assert.deepEqual(harness.state.updates[0].filter, {
+        _id: 'it-paused',
+        version: 2,
+        state: 'paused',
+        pendingProposal: null
+    });
+    assert.equal(harness.state.published.length, 1);
+    assert.equal(harness.state.published[0].itinerary.state, 'paused');
+    assert.equal(harness.state.published[0].proposal.type, 'barrierReroute');
+});
+
+test('barrier reroutes pin one dataVersion for every leg and aggregate the same version', async () => {
+    const aggregateCalls = [];
+    const routeContexts = [];
+    const harness = makeHarness({
+        itineraries: [{
+            _id: 'it-versioned', version: 2, state: 'active', pendingProposal: null,
+            stops: [mutableStop('versioned', 'edge-old')]
+        }],
+        rebuildTimeline: async input => {
+            routeContexts.push(input.routeContext);
+            return [mutableStop('versioned-safe', 'edge-safe')];
+        },
+        aggregateRouteFromStops: (stops, preferences, fallback, options) => {
+            aggregateCalls.push(options);
+            return {
+                segments: stops.flatMap(stop => stop.segments || []),
+                durationSec: 60,
+                gis: { dataVersion: options.expectedDataVersion }
+            };
+        }
+    });
+
+    const result = await harness.coordinator.processGraphEvent({
+        eventId: 'event-version-pin',
+        scenicId: 'scenic-test',
+        edgeId: 'edge-old',
+        operation: 'open'
+    });
+
+    assert.equal(result.dataVersion, 'graph-v1');
+    assert.deepEqual(routeContexts.map(context => context.dataVersion), ['graph-v1']);
+    assert.ok(aggregateCalls.length >= 1);
+    assert.ok(aggregateCalls.every(options => options.expectedDataVersion === 'graph-v1'));
+    assert.equal(harness.state.updates[0].update.$set.pendingProposal.payload.dataVersion, 'graph-v1');
+    assert.deepEqual(harness.state.dataVersionReads, ['graph-v1', 'graph-v1']);
+});
+
+test('a dataVersion change before proposal persistence fails closed without publishing', async () => {
+    const versions = ['graph-v1', 'graph-v2'];
+    const harness = makeHarness({
+        dataVersion: () => versions.shift(),
+        itineraries: [{
+            _id: 'it-version-race', version: 1, state: 'active', pendingProposal: null,
+            stops: [mutableStop('version-race', 'edge-closed')]
+        }],
+        rebuildTimeline: async input => {
+            assert.equal(input.routeContext.dataVersion, 'graph-v1');
+            return [mutableStop('version-race-safe', 'edge-safe')];
+        }
+    });
+
+    const result = await harness.coordinator.processGraphEvent({
+        eventId: 'event-version-race',
+        scenicId: 'scenic-test',
+        edgeId: 'edge-closed',
+        operation: 'close'
+    });
+
+    assert.equal(result.failedCount, 1);
+    assert.equal(result.outcomes[0].code, 'BARRIER_ROUTING_SNAPSHOT_CHANGED');
+    assert.equal(harness.state.updates.length, 0);
+    assert.equal(harness.state.published.length, 0);
+    assert.deepEqual(harness.state.dataVersionReads, ['graph-v1', 'graph-v2']);
+});
+
+test('mixed route leg versions are rejected before aggregation or persistence', async () => {
+    const itinerary = {
+        _id: 'it-mixed-version', version: 1, state: 'active', pendingProposal: null,
+        startLocation: { type: 'Point', coordinates: [114.35, 30.54] },
+        preferences: {},
+        stops: [mutableStop('mixed-version', 'edge-closed')]
+    };
+    const routeBetween = async () => ({
+        durationSec: 60,
+        distanceM: 80,
+        available: true,
+        routeFound: true,
+        authoritative: true,
+        routeKind: 'topology',
+        topology: true,
+        geometry: { type: 'LineString', coordinates: [[114.35, 30.54], [114.351, 30.541]] },
+        segments: [{ edgeId: 'edge-safe' }],
+        gis: { source: 'iserver', mode: 'normal', topology: true, dataVersion: 'graph-v2' }
+    });
+    const harness = makeHarness({
+        itineraries: [itinerary],
+        routeBetween,
+        rebuildTimeline: input => rebuildTimeline({
+            ...input,
+            loadPois: async poiIds => poiIds.map(id => ({
+                _id: id,
+                geo: { type: 'Point', coordinates: [114.351, 30.541] },
+                visitMeta: { suggestedStayMin: 20 }
+            }))
+        })
+    });
+
+    const result = await harness.coordinator.processGraphEvent({
+        eventId: 'event-mixed-version',
+        scenicId: 'scenic-test',
+        edgeId: 'edge-closed',
+        operation: 'close'
+    });
+
+    assert.equal(result.failedCount, 1);
+    assert.equal(result.outcomes[0].code, 8205);
+    assert.equal(harness.state.updates.length, 0);
+    assert.equal(harness.state.published.length, 0);
+});
+
+test('draft itineraries are atomically abandoned before deduplicated token release', async () => {
+    const draft = {
+        _id: 'draft-stale', version: 4, state: 'draft', activeOwner: 'user-draft',
+        planningSnapshot: {
+            barrierFingerprint: 'sha256:old',
+            barrierEdgeIds: ['edge-old'],
+            dataVersion: 'graph-v0',
+            capturedAt: new Date('2026-08-01T00:00:00.000Z'),
+            invalidatedAt: null,
+            invalidationReason: null
+        },
+        pendingProposal: { proposalId: 'proposal-old', tokenIds: ['token-b', 'token-a'] },
+        stops: [
+            { ...mutableStop('draft-a'), capacityTokenId: 'token-a' },
+            { ...mutableStop('draft-c'), capacityTokenId: 'token-c' }
+        ]
+    };
+    let casCompleted = false;
+    const harness = makeHarness({
+        itineraries: [draft],
+        updateImpl(filter, update) {
+            assert.deepEqual(filter, { _id: 'draft-stale', version: 4, state: 'draft' });
+            assert.equal(update.$set.state, 'abandoned');
+            assert.equal(update.$set.pendingProposal, null);
+            assert.ok(update.$set.stops.every(stop => stop.capacityTokenId === null));
+            assert.equal(update.$set.planningSnapshot.dataVersion, 'graph-v0');
+            assert.equal(update.$set.planningSnapshot.invalidatedAt.toISOString(), NOW.toISOString());
+            assert.equal(update.$unset.activeOwner, 1);
+            casCompleted = true;
+            return { _id: filter._id, version: 5, state: 'abandoned' };
+        },
+        onRelease(tokenIds, itineraryId) {
+            assert.equal(casCompleted, true);
+            assert.equal(itineraryId, 'draft-stale');
+            assert.deepEqual(tokenIds, ['token-b', 'token-a', 'token-c']);
+        }
+    });
+
+    const result = await harness.coordinator.processGraphEvent({
+        eventId: 'event-draft-invalidate',
+        scenicId: 'scenic-test',
+        edgeId: 'edge-closed',
+        operation: 'close'
+    });
+
+    assert.equal(result.invalidatedDraftCount, 1);
+    assert.equal(result.failedCount, 0);
+    assert.equal(result.proposedCount, 0);
+    assert.equal(result.outcomes[0].status, 'invalidated');
+    assert.equal(harness.state.released.length, 1);
+});
+
+test('draft CAS loss never releases tokens', async () => {
+    const harness = makeHarness({
+        itineraries: [{
+            _id: 'draft-cas-loss', version: 3, state: 'draft',
+            pendingProposal: { tokenIds: ['token-proposal'] },
+            stops: [{ ...mutableStop('draft-cas'), capacityTokenId: 'token-stop' }]
+        }],
+        updateImpl: () => null
+    });
+
+    const result = await harness.coordinator.processGraphEvent({
+        eventId: 'event-draft-cas-loss',
+        scenicId: 'scenic-test',
+        edgeId: 'edge-closed',
+        operation: 'close'
+    });
+
+    assert.equal(result.failedCount, 1);
+    assert.equal(result.outcomes[0].code, 'ITINERARY_CAS_CONFLICT');
+    assert.equal(harness.state.released.length, 0);
+});
+
+test('draft token release failures remain observable after successful abandonment', async () => {
+    const harness = makeHarness({
+        itineraries: [{
+            _id: 'draft-release-failure', version: 1, state: 'draft',
+            pendingProposal: { tokenIds: ['token-release'] },
+            stops: []
+        }],
+        updateImpl: filter => ({ _id: filter._id, version: 2, state: 'abandoned' }),
+        onRelease: () => { throw new Error('token store unavailable'); }
+    });
+
+    const result = await harness.coordinator.processGraphEvent({
+        eventId: 'event-draft-release-failure',
+        scenicId: 'scenic-test',
+        edgeId: 'edge-closed',
+        operation: 'close'
+    });
+
+    assert.equal(result.invalidatedDraftCount, 1);
+    assert.equal(result.failedCount, 0);
+    assert.equal(result.operationalFailureCount, 1);
+    assert.equal(result.outcomes[0].operationalFailureCount, 1);
+    assert.equal(result.failures[0].scope, 'invalidated-draft-token-release');
+    assert.equal(result.proposedCount, 0);
 });
 
 test('close events atomically supersede pending proposals before cleanup and publication', async () => {

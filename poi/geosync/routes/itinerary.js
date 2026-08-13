@@ -17,6 +17,7 @@ const guideService = require('../services/guideService');
 const { createItineraryRuntime } = require('../services/itineraryRuntime');
 const { rebuildTimeline, TimelineRebuildError } = require('../services/itineraryTimeline');
 const {
+    RouteDataVersionError,
     serializedRouteFields,
     aggregateRouteFromStops
 } = require('../services/itineraryRouteData');
@@ -96,6 +97,246 @@ function routeBetweenOf(req) {
     return routeBetween;
 }
 
+function estimateBetweenOf(req) {
+    const estimateBetween = req?.app?.locals?.geosync?.estimateBetween;
+    if (typeof estimateBetween !== 'function') {
+        throw new BizError(8201, 'GIS topology estimator is unavailable', 503);
+    }
+    return estimateBetween;
+}
+
+function dataVersionOf(req) {
+    const value = req?.app?.locals?.geosync?.dataVersion;
+    return typeof value === 'function' ? value() : value;
+}
+
+function normalizedDataVersion(value) {
+    return typeof value === 'string' && value.trim() ? value.trim() : '';
+}
+
+async function loadRoutingSnapshot(req, WalkEdge, scenicId = CONFIG.scenicId) {
+    let barrierSnapshot;
+    try {
+        barrierSnapshot = await loadClosedBarrierSnapshot({ WalkEdge, scenicId });
+    } catch {
+        throw new BizError(8205, '当前封路状态不可验证，路径操作已安全停止', 409);
+    }
+    const dataVersion = normalizedDataVersion(await dataVersionOf(req));
+    if (!dataVersion) {
+        throw new BizError(8205, '当前 GIS 数据版本不可验证，路径操作已安全停止', 409);
+    }
+    return {
+        barriers: barrierSnapshot.barriers,
+        edgeIds: [...barrierSnapshot.edgeIds],
+        fingerprint: barrierSnapshot.fingerprint,
+        dataVersion,
+        capturedAt: new Date()
+    };
+}
+
+function persistedPlanningSnapshot(snapshot) {
+    return {
+        barrierFingerprint: snapshot.fingerprint,
+        barrierEdgeIds: [...snapshot.edgeIds],
+        dataVersion: snapshot.dataVersion,
+        capturedAt: snapshot.capturedAt || new Date(),
+        invalidatedAt: null,
+        invalidationReason: null
+    };
+}
+
+function storedPlanningSnapshot(itinerary) {
+    const snapshot = itinerary?.planningSnapshot?.toObject
+        ? itinerary.planningSnapshot.toObject()
+        : itinerary?.planningSnapshot;
+    const barrierFingerprint = typeof snapshot?.barrierFingerprint === 'string'
+        ? snapshot.barrierFingerprint.trim()
+        : '';
+    const dataVersion = normalizedDataVersion(snapshot?.dataVersion);
+    if (!barrierFingerprint || !dataVersion || snapshot?.invalidatedAt) return null;
+    return { barrierFingerprint, dataVersion };
+}
+
+function routingSnapshotMatchesStored(current, stored) {
+    return Boolean(
+        current
+        && stored
+        && current.fingerprint === stored.barrierFingerprint
+        && current.dataVersion === stored.dataVersion
+    );
+}
+
+function routingSnapshotsEqual(left, right) {
+    return Boolean(
+        left
+        && right
+        && left.fingerprint === right.fingerprint
+        && left.dataVersion === right.dataVersion
+    );
+}
+
+function planningSnapshotCasFilter(snapshot) {
+    return {
+        'planningSnapshot.barrierFingerprint': snapshot.barrierFingerprint,
+        'planningSnapshot.dataVersion': snapshot.dataVersion,
+        'planningSnapshot.invalidatedAt': null
+    };
+}
+
+function stopsWithoutCapacityTokens(stops) {
+    return (stops || []).map(stop => ({
+        ...(stop?.toObject ? stop.toObject() : stop),
+        capacityTokenId: null
+    }));
+}
+
+async function invalidateStaleItinerary({
+    Itinerary,
+    itinerary,
+    openId,
+    reason,
+    allowMissingSnapshot = false,
+    extraTokenIds = []
+}) {
+    const expectedSnapshot = storedPlanningSnapshot(itinerary);
+    if (!expectedSnapshot && !allowMissingSnapshot) return null;
+    const tokenIds = new Set((extraTokenIds || []).map(String));
+    let candidate = itinerary;
+    const mutableStates = ['draft', 'active', 'paused'];
+    const snapshotFilter = expectedSnapshot
+        ? planningSnapshotCasFilter(expectedSnapshot)
+        : { planningSnapshot: null };
+
+    function invalidationUpdate(source) {
+        const invalidatedAt = new Date();
+        return {
+            $set: {
+                state: 'abandoned',
+                stops: stopsWithoutCapacityTokens(source.stops),
+                pendingProposal: null,
+                ...(expectedSnapshot ? {
+                    'planningSnapshot.invalidatedAt': invalidatedAt,
+                    'planningSnapshot.invalidationReason': reason
+                } : {
+                    planningSnapshot: null
+                })
+            },
+            $unset: { activeOwner: 1 },
+            $inc: { version: 1 }
+        };
+    }
+
+    function finalInvalidationUpdate() {
+        const invalidatedAt = new Date();
+        return {
+            $set: {
+                state: 'abandoned',
+                pendingProposal: null,
+                'stops.$[].capacityTokenId': null,
+                ...(expectedSnapshot ? {
+                    'planningSnapshot.invalidatedAt': invalidatedAt,
+                    'planningSnapshot.invalidationReason': reason
+                } : {
+                    planningSnapshot: null
+                })
+            },
+            $unset: { activeOwner: 1 },
+            $inc: { version: 1 }
+        };
+    }
+
+    async function releaseInvalidatedTokens(source) {
+        for (const tokenId of tokenIdsOf(source)) tokenIds.add(String(tokenId));
+        if (tokenIds.size) {
+            await bestEffort('stale itinerary token release failed', () =>
+                antiHerding.releaseTokens([...tokenIds], source._id));
+        }
+    }
+
+    for (let attempt = 0; attempt < 3 && candidate; attempt++) {
+        for (const tokenId of tokenIdsOf(candidate)) tokenIds.add(String(tokenId));
+        const invalidated = await Itinerary.findOneAndUpdate(
+            {
+                _id: candidate._id,
+                openId,
+                state: { $in: mutableStates },
+                version: Number(candidate.version),
+                ...snapshotFilter
+            },
+            invalidationUpdate(candidate),
+            { new: true }
+        );
+        if (invalidated) {
+            await releaseInvalidatedTokens(candidate);
+            return invalidated;
+        }
+        if (typeof Itinerary.findOne !== 'function') break;
+
+        const latest = await Itinerary.findOne({
+            _id: candidate._id,
+            openId,
+            state: { $in: mutableStates }
+        });
+        if (!latest) return candidate;
+        const latestSnapshot = storedPlanningSnapshot(latest);
+        if (expectedSnapshot) {
+            if (!latestSnapshot
+                || latestSnapshot.barrierFingerprint !== expectedSnapshot.barrierFingerprint
+                || latestSnapshot.dataVersion !== expectedSnapshot.dataVersion) {
+                throw new BizError(
+                    8205,
+                    '行程在失效处理期间发生并发变化，无法确认旧路线已安全停用',
+                    409
+                );
+            }
+        } else if (latestSnapshot) {
+            throw new BizError(
+                8205,
+                '行程在失效处理期间获得了未知规划快照，无法确认旧路线已安全停用',
+                409
+            );
+        }
+        candidate = latest;
+    }
+
+    // A final snapshot-guarded update removes the version race. It can only
+    // abandon an itinerary that still carries the exact stale snapshot.
+    const invalidated = await Itinerary.findOneAndUpdate(
+        {
+            _id: itinerary._id,
+            openId,
+            state: { $in: mutableStates },
+            ...snapshotFilter
+        },
+        finalInvalidationUpdate(),
+        { new: false }
+    );
+    if (invalidated) {
+        await releaseInvalidatedTokens(invalidated);
+        return invalidated;
+    }
+
+    if (typeof Itinerary.findOne === 'function') {
+        const remaining = await Itinerary.findOne({
+            _id: itinerary._id,
+            openId,
+            state: { $in: mutableStates },
+            ...snapshotFilter
+        });
+        if (!remaining) return candidate || itinerary;
+    }
+    throw new BizError(8205, '旧路线无法被安全停用，请立即刷新行程状态', 409);
+}
+
+function routeContextFromSnapshot(snapshot, extra = {}) {
+    return {
+        barriers: snapshot.barriers,
+        barrierFingerprint: snapshot.fingerprint,
+        dataVersion: snapshot.dataVersion,
+        ...extra
+    };
+}
+
 function tokenIdsOf(itinerary) {
     return [...new Set([
         ...(itinerary.pendingProposal?.tokenIds || []),
@@ -132,7 +373,8 @@ function proposalWithBarrierSnapshot(proposal, snapshot) {
         payload: {
             ...(plain?.payload || {}),
             barrierFingerprint: snapshot.fingerprint,
-            barrierEdgeIds: [...snapshot.edgeIds]
+            barrierEdgeIds: [...snapshot.edgeIds],
+            dataVersion: snapshot.dataVersion
         }
     };
 }
@@ -163,6 +405,31 @@ function emitProposalDecision(itinerary, proposal, status, at) {
         at: at.toISOString(),
         eventId: proposalEventId(proposal)
     });
+}
+
+function publicBarrierProposalPreview(publicRoute, proposal) {
+    const source = proposal?.toObject ? proposal.toObject() : proposal;
+    const payload = source?.payload?.toObject ? source.payload.toObject() : source?.payload;
+    if (source?.type !== 'barrierReroute' || !payload?.route) return {};
+
+    const beforeRoute = serializedRouteFields(publicRoute);
+    const afterRoute = serializedRouteFields(payload.route);
+    if (!beforeRoute.geometry || !afterRoute.geometry) return {};
+
+    const preview = { beforeRoute, afterRoute };
+    const beforeDistance = beforeRoute.distanceM;
+    const afterDistance = afterRoute.distanceM;
+    if (Number.isFinite(beforeDistance) && beforeDistance >= 0
+        && Number.isFinite(afterDistance) && afterDistance >= 0) {
+        preview.distanceDeltaM = afterDistance - beforeDistance;
+    }
+    const beforeDuration = beforeRoute.durationSec;
+    const afterDuration = afterRoute.durationSec;
+    if (Number.isFinite(beforeDuration) && beforeDuration >= 0
+        && Number.isFinite(afterDuration) && afterDuration >= 0) {
+        preview.durationDeltaSec = afterDuration - beforeDuration;
+    }
+    return preview;
 }
 
 // ---- 序列化 ----
@@ -202,20 +469,25 @@ async function serialize(it) {
     });
     const cur = it.stops.find(s => ['approaching', 'arrived'].includes(s.state)) ||
         it.stops.find(s => s.state === 'pending');
+    const publicRoute = it.route
+        ? serializedRouteFields(it.route)
+        : aggregateRouteFromStops(it.stops, it.preferences);
+    const pendingProposal = it.pendingProposal?.proposalId
+        ? {
+            ...engine.publicProposalView(
+                it.pendingProposal,
+                engine.proposalDiff(it, it.pendingProposal)
+            ),
+            ...publicBarrierProposalPreview(publicRoute, it.pendingProposal)
+        }
+        : null;
     return {
         itineraryId: it._id, version: it.version, state: it.state,
         date: it.date, preferences: it.preferences,
         stops,
-        route: it.route
-            ? serializedRouteFields(it.route)
-            : aggregateRouteFromStops(it.stops, it.preferences),
+        route: publicRoute,
         currentStopId: cur?._id || null,
-        pendingProposal: it.pendingProposal?.proposalId
-            ? engine.publicProposalView(
-                it.pendingProposal,
-                engine.proposalDiff(it, it.pendingProposal)
-            )
-            : null,
+        pendingProposal,
         savedMinutesTotal: it.savedMinutesTotal,
         rerouteCount: it.rerouteCount
     };
@@ -231,7 +503,7 @@ router.post('/plan', wrap(async (req, res) => {
     if (normalizedStartAt === INVALID_START_AT) {
         return fail(res, 400, 1102, 'startAt 必须是有效日期时间');
     }
-    const { Itinerary } = getModels();
+    const { Itinerary, WalkEdge } = getModels();
     const existing = await Itinerary.findOne({
         openId: req.openId, state: { $in: ['draft', 'active', 'paused'] }
     }).lean();
@@ -240,12 +512,19 @@ router.post('/plan', wrap(async (req, res) => {
     }
     const origin = startCoordinates(startLocation) || CONFIG.scenicCenter;
     const routeBetween = routeBetweenOf(req);
+    const estimateBetween = estimateBetweenOf(req);
+    const planningSnapshot = await loadRoutingSnapshot(req, WalkEdge, CONFIG.scenicId);
+    const routeContext = routeContextFromSnapshot(planningSnapshot);
     const result = await planner.plan({
         startLocation: origin, startAt: normalizedStartAt, hours: Number(hours),
         interests, pace, accessible: Boolean(accessible), shadeFirst: Boolean(shadeFirst),
         openId: req.openId,
         requestId: req.headers?.['x-request-id']
-    }, { routeBetween });
+    }, { routeBetween, estimateBetween, routeContext });
+    const commitSnapshot = await loadRoutingSnapshot(req, WalkEdge, CONFIG.scenicId);
+    if (!routingSnapshotsEqual(planningSnapshot, commitSnapshot)) {
+        throw new BizError(8205, '规划期间封路状态或 GIS 数据版本已变化，请重新规划', 409);
+    }
     let it;
     try {
         it = await Itinerary.create({
@@ -254,13 +533,36 @@ router.post('/plan', wrap(async (req, res) => {
             startLocation: origin ? { type: 'Point', coordinates: origin } : null,
             preferences: { pace: pace || 'normal', interests: interests || [], hours: Number(hours), accessible: Boolean(accessible), shadeFirst: Boolean(shadeFirst) },
             stops: result.stops,
-            route: result.route
+            route: result.route,
+            planningSnapshot: persistedPlanningSnapshot(commitSnapshot)
         });
     } catch (error) {
         if (error?.code === 11000) {
             return fail(res, 400, 1206, '存在未完成行程');
         }
         throw error;
+    }
+    const persistedSnapshot = storedPlanningSnapshot(it);
+    let postCreateSnapshot;
+    try {
+        postCreateSnapshot = await loadRoutingSnapshot(req, WalkEdge, CONFIG.scenicId);
+    } catch (error) {
+        await invalidateStaleItinerary({
+            Itinerary,
+            itinerary: it,
+            openId: req.openId,
+            reason: 'routing snapshot verification failed after plan persistence'
+        });
+        throw error;
+    }
+    if (!routingSnapshotMatchesStored(postCreateSnapshot, persistedSnapshot)) {
+        await invalidateStaleItinerary({
+            Itinerary,
+            itinerary: it,
+            openId: req.openId,
+            reason: 'routing snapshot changed during plan persistence'
+        });
+        throw new BizError(8205, '规划写入期间封路状态或 GIS 数据版本已变化，请重新规划', 409);
     }
     const data = await serialize(it);
     data.totalWalkMin = result.totalWalkMin;
@@ -277,12 +579,124 @@ router.get('/current', wrap(async (req, res) => {
     ok(res, await serialize(it));
 }));
 
+// GET /:id
+router.get('/:id', wrap(async (req, res) => {
+    const { Itinerary } = getModels();
+    let it;
+    try {
+        it = await Itinerary.findOne({ _id: req.params.id, openId: req.openId });
+    } catch (error) {
+        if (error?.name === 'CastError') return fail(res, 404, 1204, '行程不存在');
+        throw error;
+    }
+    if (!it) return fail(res, 404, 1204, '行程不存在');
+    ok(res, await serialize(it));
+}));
+
 // ---- 状态操作（乐观锁）----
 router.post('/:id/start', wrap(async (req, res) => {
+    const { Itinerary, WalkEdge } = getModels();
+    const version = Number(req.body?.version);
+    const current = await Itinerary.findOne({
+        _id: req.params.id,
+        openId: req.openId,
+        version,
+        state: { $in: ['draft', 'active'] }
+    });
+    if (!current) return fail(res, 409, 1203, '行程版本已过期，请刷新');
+    if (current.state === 'draft') {
+        const storedSnapshot = storedPlanningSnapshot(current);
+        if (!storedSnapshot) {
+            await invalidateStaleItinerary({
+                Itinerary,
+                itinerary: current,
+                openId: req.openId,
+                reason: 'draft is missing a verifiable routing snapshot',
+                allowMissingSnapshot: true
+            });
+            return fail(res, 409, 8205, '行程缺少可验证的规划快照，请重新规划');
+        }
+        let beforeStart;
+        try {
+            beforeStart = await loadRoutingSnapshot(
+                req,
+                WalkEdge,
+                String(current.scenicId || CONFIG.scenicId)
+            );
+        } catch (error) {
+            await invalidateStaleItinerary({
+                Itinerary,
+                itinerary: current,
+                openId: req.openId,
+                reason: 'routing snapshot verification failed before start'
+            });
+            if (error instanceof BizError && error.code === 8205) {
+                return fail(res, 409, 8205, error.message);
+            }
+            throw error;
+        }
+        if (!routingSnapshotMatchesStored(beforeStart, storedSnapshot)) {
+            await invalidateStaleItinerary({
+                Itinerary,
+                itinerary: current,
+                openId: req.openId,
+                reason: 'routing snapshot changed before start'
+            });
+            return fail(res, 409, 8205, '封路状态或 GIS 数据版本已变化，请重新规划');
+        }
+        const result = await itineraryRuntime().start({
+            itineraryId: req.params.id,
+            openId: req.openId,
+            version,
+            casFilter: planningSnapshotCasFilter(storedSnapshot)
+        });
+        if (result.status === 'conflict' || result.status === 'not_found') {
+            return fail(res, 409, 1203, '行程版本已过期，请刷新');
+        }
+        if (result.status === 'updated') {
+            let afterStart;
+            try {
+                afterStart = await loadRoutingSnapshot(
+                    req,
+                    WalkEdge,
+                    String(current.scenicId || CONFIG.scenicId)
+                );
+            } catch (error) {
+                await invalidateStaleItinerary({
+                    Itinerary,
+                    itinerary: result.itinerary,
+                    openId: req.openId,
+                    reason: 'routing snapshot verification failed during start'
+                });
+                if (error instanceof BizError && error.code === 8205) {
+                    return fail(res, 409, 8205, error.message);
+                }
+                throw error;
+            }
+            if (!routingSnapshotMatchesStored(afterStart, storedSnapshot)) {
+                await invalidateStaleItinerary({
+                    Itinerary,
+                    itinerary: result.itinerary,
+                    openId: req.openId,
+                    reason: 'routing snapshot changed during start'
+                });
+                return fail(res, 409, 8205, '启动期间封路状态或 GIS 数据版本已变化，请重新规划');
+            }
+        }
+        if (result.releaseError) {
+            console.error('[GeoSync] [ITINERARY] start token release failed:',
+                safeErrorCode(result.releaseError, 'TOKEN_RELEASE_FAILED'));
+        }
+        if (result.status === 'updated') {
+            await bestEffort('arrival index rebuild failed', () => forecast.rebuildArrivalIndex());
+            emitProgress(result.itinerary);
+        }
+        return ok(res, await serialize(result.itinerary));
+    }
     const result = await itineraryRuntime().start({
         itineraryId: req.params.id,
         openId: req.openId,
-        version: Number(req.body?.version)
+        version
     });
     if (result.status === 'conflict' || result.status === 'not_found') {
         return fail(res, 409, 1203, '行程版本已过期，请刷新');
@@ -300,10 +714,114 @@ router.post('/:id/start', wrap(async (req, res) => {
 
 const TRANSITIONS = {
     pause: { from: ['active'], to: 'paused' },
-    resume: { from: ['paused'], to: 'active' },
     finish: { from: ['active', 'paused'], to: 'completed' },
     abandon: { from: ['draft', 'active', 'paused'], to: 'abandoned' }
 };
+
+router.post('/:id/resume', wrap(async (req, res) => {
+    const { Itinerary, WalkEdge } = getModels();
+    const version = Number(req.body?.version);
+    const current = await Itinerary.findOne({
+        _id: req.params.id,
+        openId: req.openId,
+        version,
+        state: 'paused'
+    });
+    if (!current) return fail(res, 409, 1203, '行程版本已过期，请刷新');
+    if (current.pendingProposal?.type === 'barrierReroute') {
+        return fail(res, 409, 1205, '存在待处理的封路改道建议，请先处理后再恢复行程');
+    }
+
+    const storedSnapshot = storedPlanningSnapshot(current);
+    if (!storedSnapshot) {
+        await invalidateStaleItinerary({
+            Itinerary,
+            itinerary: current,
+            openId: req.openId,
+            reason: 'paused itinerary is missing a verifiable routing snapshot',
+            allowMissingSnapshot: true
+        });
+        return fail(res, 409, 8205, '行程缺少可验证的规划快照，请重新规划');
+    }
+
+    let beforeResume;
+    try {
+        beforeResume = await loadRoutingSnapshot(
+            req,
+            WalkEdge,
+            String(current.scenicId || CONFIG.scenicId)
+        );
+    } catch (error) {
+        await invalidateStaleItinerary({
+            Itinerary,
+            itinerary: current,
+            openId: req.openId,
+            reason: 'routing snapshot verification failed before resume'
+        });
+        if (error instanceof BizError && error.code === 8205) {
+            return fail(res, 409, 8205, error.message);
+        }
+        throw error;
+    }
+    if (!routingSnapshotMatchesStored(beforeResume, storedSnapshot)) {
+        await invalidateStaleItinerary({
+            Itinerary,
+            itinerary: current,
+            openId: req.openId,
+            reason: 'routing snapshot changed before resume'
+        });
+        return fail(res, 409, 8205, '暂停期间封路状态或 GIS 数据版本已变化，请重新规划');
+    }
+
+    const resumed = await Itinerary.findOneAndUpdate(
+        {
+            _id: current._id,
+            openId: req.openId,
+            version,
+            state: 'paused',
+            ...planningSnapshotCasFilter(storedSnapshot)
+        },
+        {
+            $set: { state: 'active', activeOwner: current.openId },
+            $inc: { version: 1 }
+        },
+        { new: true }
+    );
+    if (!resumed) return fail(res, 409, 1203, '行程版本已过期，请刷新');
+
+    let afterResume;
+    try {
+        afterResume = await loadRoutingSnapshot(
+            req,
+            WalkEdge,
+            String(current.scenicId || CONFIG.scenicId)
+        );
+    } catch (error) {
+        await invalidateStaleItinerary({
+            Itinerary,
+            itinerary: resumed,
+            openId: req.openId,
+            reason: 'routing snapshot verification failed during resume'
+        });
+        if (error instanceof BizError && error.code === 8205) {
+            return fail(res, 409, 8205, error.message);
+        }
+        throw error;
+    }
+    if (!routingSnapshotMatchesStored(afterResume, storedSnapshot)) {
+        await invalidateStaleItinerary({
+            Itinerary,
+            itinerary: resumed,
+            openId: req.openId,
+            reason: 'routing snapshot changed during resume'
+        });
+        return fail(res, 409, 8205, '恢复期间封路状态或 GIS 数据版本已变化，请重新规划');
+    }
+
+    await bestEffort('arrival index rebuild failed', () => forecast.rebuildArrivalIndex());
+    emitProgress(resumed);
+    ok(res, await serialize(resumed));
+}));
 
 for (const [action, t] of Object.entries(TRANSITIONS)) {
     router.post(`/:id/${action}`, wrap(async (req, res) => {
@@ -385,29 +903,32 @@ router.post('/:id/proposal/:proposalId/:decision(accept|reject)', wrap(async (re
         return fail(res, 400, 1204, '提案已过期');
     }
     const accepted = req.params.decision === 'accept';
+    const proposalState = ['active', 'paused'].includes(it.state) ? it.state : null;
+    if (!proposalState) return fail(res, 409, 1203, '当前行程状态无法处理路线建议');
 
     if (accepted) {
         const routeBetween = routeBetweenOf(req);
-        let barrierSnapshot = null;
-        let routeContext = {};
-        if (pp.type === 'barrierReroute') {
-            try {
-                barrierSnapshot = await loadClosedBarrierSnapshot({
-                    WalkEdge,
-                    scenicId: String(it.scenicId || CONFIG.scenicId)
-                });
-            } catch (error) {
-                return fail(res, 409, 8205, '当前封路数据缺少可验证的 GIS 映射');
+        let routingSnapshot;
+        try {
+            routingSnapshot = await loadRoutingSnapshot(
+                req,
+                WalkEdge,
+                String(it.scenicId || CONFIG.scenicId)
+            );
+        } catch (error) {
+            if (error instanceof BizError && error.code === 8205) {
+                return fail(res, 409, 8205, error.message);
             }
-            const eventId = proposalEventId(pp) || `proposal-${pp.proposalId}`;
-            routeContext = {
-                barriers: barrierSnapshot.barriers,
-                requestId: eventId,
-                eventId,
-                barrierFingerprint: barrierSnapshot.fingerprint
-            };
+            throw error;
         }
-        const lifecycleProposal = proposalWithBarrierSnapshot(pp, barrierSnapshot);
+        const eventId = proposalEventId(pp) || `proposal-${pp.proposalId}`;
+        const routeContext = routeContextFromSnapshot(routingSnapshot, {
+            requestId: eventId,
+            eventId
+        });
+        const lifecycleProposal = pp.type === 'barrierReroute'
+            ? proposalWithBarrierSnapshot(pp, routingSnapshot)
+            : pp;
         const claimId = 'c_' + crypto.randomBytes(8).toString('hex');
         const claimed = await antiHerding.claimTokens(pp.tokenIds, it._id, now, claimId);
         if (!claimed) {
@@ -432,18 +953,51 @@ router.post('/:id/proposal/:proposalId/:decision(accept|reject)', wrap(async (re
             });
         } catch (error) {
             await antiHerding.rollbackClaimedTokens(pp.tokenIds, it._id, claimId);
+            if (error instanceof TimelineRebuildError && error.code === 'DATA_VERSION_MISMATCH') {
+                return fail(res, 409, 8205, '重建路线的 GIS 数据版本与当前快照不一致');
+            }
             if (error instanceof TimelineRebuildError) {
                 return fail(res, 400, 1205, '剩余路线暂时无法重建');
             }
             throw error;
         }
-        const newRoute = aggregateRouteFromStops(newStops, it.preferences, it.route);
-        if (barrierSnapshot && !routeAvoidsBarriers(
+        let newRoute;
+        try {
+            newRoute = aggregateRouteFromStops(newStops, it.preferences, it.route, {
+                expectedDataVersion: routingSnapshot.dataVersion
+            });
+        } catch (error) {
+            await antiHerding.rollbackClaimedTokens(pp.tokenIds, it._id, claimId);
+            if (error instanceof RouteDataVersionError) {
+                return fail(res, 409, 8205, '重建路线包含缺失或混合的 GIS 数据版本');
+            }
+            throw error;
+        }
+        if (!routeAvoidsBarriers(
             { stops: newStops, route: newRoute },
-            barrierSnapshot.barriers
+            routingSnapshot.barriers
         )) {
             await antiHerding.rollbackClaimedTokens(pp.tokenIds, it._id, claimId);
             return fail(res, 409, 8205, '重建路线仍包含当前关闭路段');
+        }
+
+        let commitSnapshot;
+        try {
+            commitSnapshot = await loadRoutingSnapshot(
+                req,
+                WalkEdge,
+                String(it.scenicId || CONFIG.scenicId)
+            );
+        } catch (error) {
+            await antiHerding.rollbackClaimedTokens(pp.tokenIds, it._id, claimId);
+            if (error instanceof BizError && error.code === 8205) {
+                return fail(res, 409, 8205, error.message);
+            }
+            throw error;
+        }
+        if (!routingSnapshotsEqual(routingSnapshot, commitSnapshot)) {
+            await antiHerding.rollbackClaimedTokens(pp.tokenIds, it._id, claimId);
+            return fail(res, 409, 8205, '重建期间封路状态或 GIS 数据版本已变化，请重试');
         }
 
         const commitNow = new Date();
@@ -462,12 +1016,17 @@ router.post('/:id/proposal/:proposalId/:decision(accept|reject)', wrap(async (re
                     _id: it._id,
                     openId: req.openId,
                     version,
-                    state: 'active',
+                    state: proposalState,
                     'pendingProposal.proposalId': pp.proposalId,
                     'pendingProposal.expireAt': { $gt: commitNow }
                 },
                 {
-                    $set: { stops: newStops, route: newRoute, pendingProposal: null },
+                    $set: {
+                        stops: newStops,
+                        route: newRoute,
+                        pendingProposal: null,
+                        planningSnapshot: persistedPlanningSnapshot(commitSnapshot)
+                    },
                     $inc: { version: 1, rerouteCount: 1, savedMinutesTotal: pp.gainMin || 0 },
                     $push: {
                         rerouteLog: rerouteLogEntry(
@@ -484,6 +1043,37 @@ router.post('/:id/proposal/:proposalId/:decision(accept|reject)', wrap(async (re
         if (!updated) {
             await antiHerding.rollbackClaimedTokens(pp.tokenIds, it._id, claimId);
             return fail(res, 409, 1203, '行程版本已过期，请刷新');
+        }
+
+        let postCommitSnapshot;
+        try {
+            postCommitSnapshot = await loadRoutingSnapshot(
+                req,
+                WalkEdge,
+                String(it.scenicId || CONFIG.scenicId)
+            );
+        } catch (error) {
+            await invalidateStaleItinerary({
+                Itinerary,
+                itinerary: updated,
+                openId: req.openId,
+                reason: 'routing snapshot verification failed after proposal commit',
+                extraTokenIds: tokenIdsOf(it)
+            });
+            if (error instanceof BizError && error.code === 8205) {
+                return fail(res, 409, 8205, error.message);
+            }
+            throw error;
+        }
+        if (!routingSnapshotMatchesStored(postCommitSnapshot, storedPlanningSnapshot(updated))) {
+            await invalidateStaleItinerary({
+                Itinerary,
+                itinerary: updated,
+                openId: req.openId,
+                reason: 'routing snapshot changed during proposal persistence',
+                extraTokenIds: tokenIdsOf(it)
+            });
+            return fail(res, 409, 8205, '改道写入期间封路状态或 GIS 数据版本已变化，请重试');
         }
 
         const activeTokenIds = new Set(newStops
@@ -520,7 +1110,7 @@ router.post('/:id/proposal/:proposalId/:decision(accept|reject)', wrap(async (re
             _id: it._id,
             openId: req.openId,
             version,
-            state: 'active',
+            state: proposalState,
             'pendingProposal.proposalId': pp.proposalId,
             'pendingProposal.expireAt': { $gt: now }
         },

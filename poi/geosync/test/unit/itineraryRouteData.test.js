@@ -3,7 +3,9 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const { decodePolyline } = require('../../lib/geo');
+const { createTopologyProof, validateRouteTopology } = require('../../lib/routeTopologyProvenance');
 const {
+    RouteDataVersionError,
     routeMode,
     serializedRouteFields,
     aggregateRouteFromStops
@@ -73,6 +75,78 @@ test('route data helpers preserve canonical fields and route-mode precedence', (
     assert.equal(routeMode({ accessible: true, shadeFirst: true }), 'accessible');
     assert.equal(routeMode({ shadeFirst: true }), 'shade');
     assert.equal(routeMode({}), 'normal');
+});
+
+test('route serialization and aggregation preserve verifiable topology provenance', () => {
+    const provenLeg = ({ from, to, fromNodeId, toNodeId, edgeId, smId, distanceM, durationSec }) => {
+        const geometry = { type: 'LineString', coordinates: [from, to] };
+        const segments = [{
+            edgeId,
+            physicalEdgeId: `physical-${edgeId}`,
+            fromNodeId,
+            toNodeId,
+            distanceM,
+            durationSec,
+            sourceRef: { datasetName: 'WalkEdge@Test', smId }
+        }];
+        const nodeIds = [fromNodeId, toNodeId];
+        return {
+            state: 'pending',
+            geometry,
+            distanceM,
+            durationSec,
+            gis: {
+                source: 'iserver', mode: 'normal', degraded: false,
+                requestId: edgeId, durationMs: 1, dataVersion: 'v1'
+            },
+            segments,
+            nodeIds,
+            edgeIds: [edgeId],
+            topologyProof: createTopologyProof({
+                authority: 'iserver-network-analysis',
+                dataVersion: 'v1',
+                geometry,
+                nodeIds,
+                segments,
+                distanceM,
+                durationSec
+            }),
+            snap: {
+                startNodeId: fromNodeId,
+                endNodeId: toNodeId,
+                startDistanceM: 0,
+                endDistanceM: 0
+            }
+        };
+    };
+    const first = provenLeg({
+        from: [118, 32], to: [118.001, 32.001],
+        fromNodeId: 'A', toNodeId: 'B', edgeId: 'AB', smId: 1,
+        distanceM: 80, durationSec: 60
+    });
+    const second = provenLeg({
+        from: [118.001, 32.001], to: [118.002, 32.002],
+        fromNodeId: 'B', toNodeId: 'C', edgeId: 'BC', smId: 2,
+        distanceM: 90, durationSec: 70
+    });
+
+    const serialized = serializedRouteFields({ toObject: () => first });
+    assert.equal(serialized.segments[0].physicalEdgeId, 'physical-AB');
+    assert.deepStrictEqual(serialized.nodeIds, ['A', 'B']);
+    assert.deepStrictEqual(serialized.snap, {
+        startNodeId: 'A', endNodeId: 'B', startDistanceM: 0, endDistanceM: 0
+    });
+    assert.equal(validateRouteTopology(serialized, {
+        authority: 'iserver-network-analysis', expectedDataVersion: 'v1'
+    }).valid, true);
+
+    const aggregate = aggregateRouteFromStops([first, second], {});
+    assert.equal(aggregate.topologyProof.authority, 'planner-aggregate');
+    assert.deepStrictEqual(aggregate.nodeIds, ['A', 'B', 'C']);
+    assert.deepStrictEqual(aggregate.edgeIds, ['AB', 'BC']);
+    assert.equal(validateRouteTopology(aggregate, {
+        authority: 'planner-aggregate', expectedDataVersion: 'v1'
+    }).valid, true);
 });
 
 test('aggregate route joins mutable legs and combines route provenance', () => {
@@ -149,4 +223,58 @@ test('aggregate accessibility verification remains tri-state', () => {
     assert.equal(aggregateRouteFromStops([leg(true), leg(true)], {}).verifiedAccessible, true);
     assert.equal(aggregateRouteFromStops([leg(true), leg(undefined)], {}).verifiedAccessible, null);
     assert.equal(aggregateRouteFromStops([leg(true), leg(false)], {}).verifiedAccessible, false);
+});
+
+test('versioned aggregation rejects missing and mixed route data versions', () => {
+    const leg = dataVersion => routeLeg({
+        coordinates: [[118, 32], [118.001, 32.001]],
+        distanceM: 80,
+        durationSec: 60,
+        requestId: 'route-versioned',
+        durationMs: 1,
+        dataVersion,
+        edgeId: 'edge-versioned',
+        snap: null
+    });
+
+    for (const actualVersion of [null, '', 'v2']) {
+        assert.throws(
+            () => aggregateRouteFromStops(
+                [leg('v1'), leg(actualVersion)],
+                {},
+                null,
+                { expectedDataVersion: 'v1' }
+            ),
+            error => error instanceof RouteDataVersionError
+                && error.code === 'ROUTE_DATA_VERSION_MISMATCH'
+                && error.details.expectedDataVersion === 'v1'
+        );
+    }
+
+    const aggregate = aggregateRouteFromStops(
+        [leg('v1'), leg('v1')],
+        {},
+        null,
+        { expectedDataVersion: 'v1' }
+    );
+    assert.equal(aggregate.gis.dataVersion, 'v1');
+});
+
+test('versioned fallback aggregation also fails closed on an unknown version', () => {
+    const fallback = routeLeg({
+        coordinates: [[118, 32], [118.001, 32.001]],
+        distanceM: 80,
+        durationSec: 60,
+        requestId: 'fallback-versioned',
+        durationMs: 1,
+        dataVersion: null,
+        edgeId: 'edge-fallback',
+        snap: null
+    });
+
+    assert.throws(
+        () => aggregateRouteFromStops([], {}, fallback, { expectedDataVersion: 'v1' }),
+        error => error instanceof RouteDataVersionError
+            && error.details.actualDataVersion === null
+    );
 });

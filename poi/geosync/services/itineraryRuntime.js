@@ -203,6 +203,7 @@ async function applyRuntimeEvent({
     event,
     allowedStates,
     expectedVersion,
+    casFilter = {},
     onReleaseTokens,
     clock = () => new Date(),
     maxRetries = 1
@@ -250,7 +251,7 @@ async function applyRuntimeEvent({
         }
         if (reduced.clearPendingProposal) set.pendingProposal = null;
         const updated = await Itinerary.findOneAndUpdate(
-            { _id: current._id, version: current.version, state: current.state },
+            { ...casFilter, _id: current._id, version: current.version, state: current.state },
             { $set: set, $inc: { version: 1 } },
             { new: true }
         );
@@ -302,7 +303,8 @@ function createItineraryRuntime({ Itinerary, onReleaseTokens, clock, maxRetries 
         start(args) {
             return apply({
                 lookup: identity(args), expectedVersion: args.version,
-                allowedStates: ['draft', 'active'], event: { type: EVENT_TYPES.START }
+                allowedStates: ['draft', 'active'], event: { type: EVENT_TYPES.START },
+                casFilter: args.casFilter || {}
             });
         },
         skip(args) {

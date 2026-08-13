@@ -6,6 +6,7 @@ const {
     normalizeBoolean,
     normalizeWalkEdgeMetrics
 } = require('../lib/walkEdgeContract');
+const { physicalEdgeIdOf } = require('../lib/walkEdgeIdentity');
 const { getModels } = require('../models');
 
 const WALK_SPEED = 1.4; // m/s，连接段和直线估算使用
@@ -36,10 +37,11 @@ async function loadIntoMemory() {
         const from = typeof e.from === 'string' ? e.from.trim() : '';
         const to = typeof e.to === 'string' ? e.to.trim() : '';
         const edgeId = typeof e.edgeId === 'string' ? e.edgeId.trim() : '';
+        const physicalEdgeId = physicalEdgeIdOf(e);
         const status = typeof e.status === 'string' ? e.status.trim() : '';
         const fromNode = g.nodes.get(from);
         const toNode = g.nodes.get(to);
-        if (!fromNode || !toNode || !edgeId || !['open', 'closed'].includes(status)) {
+        if (!fromNode || !toNode || !edgeId || !physicalEdgeId || !['open', 'closed'].includes(status)) {
             skippedEdges++;
             continue;
         }
@@ -55,7 +57,7 @@ async function loadIntoMemory() {
             continue;
         }
         g.adj.get(from).push({
-            edgeId, from, to,
+            edgeId, physicalEdgeId, from, to,
             walkSec: metrics.walkSec,
             distanceM: metrics.distanceM,
             slope: metrics.slope,
@@ -141,6 +143,10 @@ function barrierEdgeIds(options = {}) {
         const edgeId = typeof value === 'string' ? value : value?.edgeId;
         if (edgeId !== undefined && edgeId !== null && String(edgeId).trim()) {
             ids.add(String(edgeId).trim());
+        }
+        const physicalEdgeId = typeof value === 'object' ? value?.physicalEdgeId : null;
+        if (physicalEdgeId !== undefined && physicalEdgeId !== null && String(physicalEdgeId).trim()) {
+            ids.add(String(physicalEdgeId).trim());
         }
     };
     const addMany = values => {
@@ -236,7 +242,7 @@ function astar(fromNodeId, toNodeId, mode = 'standard', options = {}) {
         if (closed.has(cur)) continue;
         closed.add(cur);
         for (const edge of (graph.adj.get(cur) || [])) {
-            if (blockedEdgeIds.has(edge.edgeId)) continue;
+            if (blockedEdgeIds.has(edge.edgeId) || blockedEdgeIds.has(edge.physicalEdgeId)) continue;
             const edgeCost = weightedEdgeCost(edge, mode);
             if (edgeCost === null) continue;
             const tentative = gScore.get(cur) + edgeCost;
@@ -276,6 +282,9 @@ function astar(fromNodeId, toNodeId, mode = 'standard', options = {}) {
         const sourceRef = canonicalSourceRef(edge.sourceRef);
         return {
             edgeId: edge.edgeId,
+            physicalEdgeId: edge.physicalEdgeId,
+            fromNodeId: edge.from,
+            toNodeId: edge.to,
             distanceM: edge.distanceM,
             durationSec: edge.walkSec,
             ...(sourceRef ? { sourceRef } : {})
@@ -312,13 +321,22 @@ function graphRoute(route, startCoordinate, endCoordinate, startSnap, endSnap, m
     const startNode = graph.nodes.get(startSnap.nodeId);
     const endNode = graph.nodes.get(endSnap.nodeId);
     const connectorDistanceM = startSnap.distanceM + endSnap.distanceM;
-    const coords = dedupeCoords([
+    const sameNodeZeroLeg = route.edgeIds.length === 0
+        && startSnap.nodeId === endSnap.nodeId
+        && startSnap.distanceM === 0
+        && endSnap.distanceM === 0
+        && startCoordinate[0] === endCoordinate[0]
+        && startCoordinate[1] === endCoordinate[1];
+    const dedupedCoords = dedupeCoords([
         startCoordinate,
         nodeCoordinate(startNode),
         ...(route.coords || []),
         nodeCoordinate(endNode),
         endCoordinate
     ].filter(Boolean));
+    const coords = sameNodeZeroLeg
+        ? [[...startCoordinate], [...startCoordinate]]
+        : dedupedCoords;
     const connectorsVerified = startSnap.distanceM <= VERIFIED_CONNECTOR_DISTANCE_M
         && endSnap.distanceM <= VERIFIED_CONNECTOR_DISTANCE_M;
     const verifiedAccessible = route.accessibility.graphEdgesVerified && connectorsVerified;
@@ -338,7 +356,7 @@ function graphRoute(route, startCoordinate, endCoordinate, startSnap, endSnap, m
             endDistanceM: endSnap.distanceM
         },
         fallback,
-        authoritative: !fallback && coords.length >= 2,
+        authoritative: !fallback && coords.length >= 2 && (route.edgeIds.length > 0 || sameNodeZeroLeg),
         routeFound: true,
         routeKind: 'graph',
         verifiedAccessible,
@@ -385,28 +403,33 @@ function directEstimate(startCoordinate, endCoordinate, mode) {
 
 // 两 POI 间步行秒；图不可用时保留非权威直线估算，仅供旧内部合理性判断。
 function walkSecBetween(poiA, poiB, mode = 'standard', options = {}) {
-    const gateA = poiA?.gateNodeId, gateB = poiB?.gateNodeId;
     const cA = poiCoords(poiA), cB = poiCoords(poiB);
-    if (loaded && gateA && gateB && graph.nodes.has(gateA) && graph.nodes.has(gateB)) {
-        const startNode = graph.nodes.get(gateA);
-        const endNode = graph.nodes.get(gateB);
-        const r = astar(gateA, gateB, mode, options);
-        if (r) return graphRoute(r, cA, cB, {
-            nodeId: gateA,
-            distanceM: cA ? haversine(cA, nodeCoordinate(startNode)) : 0
-        }, {
-            nodeId: gateB,
-            distanceM: cB ? haversine(cB, nodeCoordinate(endNode)) : 0
-        }, mode);
-    }
     if (loaded && cA && cB) {
-        const nA = nearestNode(cA[0], cA[1]), nB = nearestNode(cB[0], cB[1]);
-        if (nA && nB && nA.distanceM < MAX_SNAP_DISTANCE_M && nB.distanceM < MAX_SNAP_DISTANCE_M) {
+        const nA = resolveEndpointSnap(poiA, cA);
+        const nB = resolveEndpointSnap(poiB, cB);
+        if (nA && nB) {
             const r = astar(nA.nodeId, nB.nodeId, mode, options);
             if (r) return graphRoute(r, cA, cB, nA, nB, mode);
         }
     }
     return directEstimate(cA, cB, mode);
+}
+
+function resolveEndpointSnap(poi, coordinates) {
+    const rawGateNodeId = poi?.gateNodeId;
+    const gateNodeId = rawGateNodeId === undefined || rawGateNodeId === null
+        ? ''
+        : String(rawGateNodeId).trim();
+    if (gateNodeId) {
+        const gateNode = graph.nodes.get(gateNodeId);
+        if (!gateNode) return null;
+        return {
+            nodeId: gateNodeId,
+            distanceM: haversine(coordinates, nodeCoordinate(gateNode))
+        };
+    }
+    const nearest = nearestNode(coordinates[0], coordinates[1]);
+    return nearest && nearest.distanceM < MAX_SNAP_DISTANCE_M ? nearest : null;
 }
 
 function dedupeCoords(coords) {
@@ -445,10 +468,21 @@ function findLocalPath(input = {}) {
         gateNodeId: input.endNodeId,
         geo: { type: 'Point', coordinates: end }
     }, mode, { barriers: input.barriers });
+    const sameNodeZeroLeg = route?.distanceM === 0
+        && route?.walkSec === 0
+        && route?.edgeIds.length === 0
+        && route?.nodeIds.length === 1
+        && route?.snap?.startNodeId === route?.snap?.endNodeId
+        && route?.snap?.startDistanceM === 0
+        && route?.snap?.endDistanceM === 0
+        && start[0] === end[0]
+        && start[1] === end[1]
+        && route?.coords.length === 2
+        && route.coords.every(coordinate => coordinate[0] === start[0] && coordinate[1] === start[1]);
     if (!route?.authoritative
         || route.routeFound === false
         || route.coords.length < 2
-        || !route.edgeIds.length
+        || (!route.edgeIds.length && !sameNodeZeroLeg)
         || route.edgeDataVersions.length !== route.edgeIds.length
         || route.edgeDataVersions.some(version => version !== dataVersion)) {
         return null;
@@ -459,6 +493,9 @@ function findLocalPath(input = {}) {
         distanceM: route.distanceM,
         durationSec: route.walkSec,
         geometry: { type: 'LineString', coordinates: route.coords.map(coordinate => [...coordinate]) },
+        nodeIds: [...route.nodeIds],
+        edgeIds: [...route.edgeIds],
+        edgeDataVersions: [...route.edgeDataVersions],
         segments: route.segments.map(segment => ({
             ...segment,
             ...(segment.sourceRef ? { sourceRef: { ...segment.sourceRef } } : {})

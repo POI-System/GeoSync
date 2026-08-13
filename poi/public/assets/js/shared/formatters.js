@@ -29,7 +29,8 @@ export function formatRouteSource(source) {
     return ({
         iserver: 'iServer 路线',
         cache: '缓存结果',
-        'local-fallback': '离线路线'
+        'local-fallback': '离线路线',
+        'demo-topology': '演示路网路线'
     })[source] || '路线来源未知';
 }
 

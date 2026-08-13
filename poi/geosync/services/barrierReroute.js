@@ -34,6 +34,17 @@ function normalizeClosedBarrier(value) {
         });
     }
 
+    const rawPhysicalEdgeId = edge.physicalEdgeId ?? edgeId;
+    const physicalEdgeId = typeof rawPhysicalEdgeId === 'string'
+        ? rawPhysicalEdgeId.trim()
+        : '';
+    if (!SAFE_EDGE_ID.test(physicalEdgeId)) {
+        throw barrierError('INVALID_BARRIER_MAPPING', 'closed barrier physicalEdgeId is invalid', {
+            edgeId,
+            physicalEdgeId: edge.physicalEdgeId ?? null
+        });
+    }
+
     const sourceRef = toPlain(edge.sourceRef);
     const datasetName = typeof sourceRef?.datasetName === 'string'
         ? sourceRef.datasetName.trim()
@@ -49,6 +60,7 @@ function normalizeClosedBarrier(value) {
 
     return {
         edgeId,
+        physicalEdgeId,
         sourceRef: { datasetName, smId }
     };
 }
@@ -73,6 +85,7 @@ function normalizeBarrierSet(values) {
             && (
                 previous.sourceRef.datasetName !== barrier.sourceRef.datasetName
                 || previous.sourceRef.smId !== barrier.sourceRef.smId
+                || previous.physicalEdgeId !== barrier.physicalEdgeId
             )
         ) {
             throw barrierError(
@@ -89,6 +102,7 @@ function normalizeBarrierSet(values) {
 function fingerprintNormalizedBarriers(barriers) {
     const canonical = barriers.map(barrier => [
         barrier.edgeId,
+        barrier.physicalEdgeId,
         barrier.sourceRef.datasetName,
         barrier.sourceRef.smId
     ]);
@@ -148,6 +162,7 @@ async function loadClosedBarrierSnapshot({ WalkEdge, scenicId }) {
     return {
         barriers,
         edgeIds: barriers.map(barrier => barrier.edgeId),
+        physicalEdgeIds: [...new Set(barriers.map(barrier => barrier.physicalEdgeId))].sort(),
         fingerprint: fingerprintNormalizedBarriers(barriers)
     };
 }
@@ -174,7 +189,11 @@ function collectRouteSegments(value, output, seen) {
     if (seen.has(plain)) return;
     seen.add(plain);
 
-    if (plain.edgeId !== undefined || plain.sourceRef !== undefined) output.push(plain);
+    if (plain.edgeId !== undefined
+        || plain.physicalEdgeId !== undefined
+        || plain.sourceRef !== undefined) {
+        output.push(plain);
+    }
     if (Array.isArray(plain.edgeIds)) {
         for (const edgeId of plain.edgeIds) output.push({ edgeId });
     }
@@ -206,6 +225,9 @@ function routeAvoidsBarriers(candidate, barriers) {
     if (!normalizedBarriers.length) return true;
 
     const blockedEdgeIds = new Set(normalizedBarriers.map(barrier => barrier.edgeId));
+    const blockedPhysicalEdgeIds = new Set(
+        normalizedBarriers.map(barrier => barrier.physicalEdgeId)
+    );
     const blockedSourceRefs = new Set(
         normalizedBarriers.map(barrier => sourceRefKey(barrier.sourceRef))
     );
@@ -216,9 +238,17 @@ function routeAvoidsBarriers(candidate, barriers) {
         for (const value of group) {
             const segment = toPlain(value);
             const edgeId = typeof segment?.edgeId === 'string' ? segment.edgeId.trim() : '';
+            const physicalEdgeId = typeof segment?.physicalEdgeId === 'string'
+                ? segment.physicalEdgeId.trim()
+                : '';
             const sourceKey = sourceRefKey(segment?.sourceRef);
-            if (!SAFE_EDGE_ID.test(edgeId) && sourceKey === null) return false;
+            if (!SAFE_EDGE_ID.test(edgeId)
+                && !SAFE_EDGE_ID.test(physicalEdgeId)
+                && sourceKey === null) {
+                return false;
+            }
             if (edgeId && blockedEdgeIds.has(edgeId)) return false;
+            if (physicalEdgeId && blockedPhysicalEdgeIds.has(physicalEdgeId)) return false;
             if (sourceKey !== null && blockedSourceRefs.has(sourceKey)) return false;
         }
     }
@@ -234,11 +264,49 @@ function explicitSegmentEdgeIds(value) {
     return edgeIds.every(Boolean) ? edgeIds : null;
 }
 
-function remainingRouteUsesEdge(itinerary, edgeId) {
-    const normalizedEdgeId = typeof edgeId === 'string' ? edgeId.trim() : '';
-    if (!SAFE_EDGE_ID.test(normalizedEdgeId)) {
-        throw new TypeError('remainingRouteUsesEdge requires a valid edgeId');
+function targetEdgeIds(value) {
+    const target = typeof value === 'string' ? { edgeId: value } : toPlain(value);
+    if (!target || typeof target !== 'object' || Array.isArray(target)) {
+        throw new TypeError('remainingRouteUsesEdge requires a valid edge target');
     }
+    const ids = new Set();
+    for (const raw of [target.edgeId, target.physicalEdgeId, ...(target.edgeIds || [])]) {
+        if (raw === undefined || raw === null || raw === '') continue;
+        const id = typeof raw === 'string' ? raw.trim() : '';
+        if (!SAFE_EDGE_ID.test(id)) {
+            throw new TypeError('remainingRouteUsesEdge requires valid edge identifiers');
+        }
+        ids.add(id);
+    }
+    if (!ids.size) {
+        throw new TypeError('remainingRouteUsesEdge requires a valid edge target');
+    }
+    return ids;
+}
+
+function segmentUsesTarget(segment, targetIds) {
+    const plain = toPlain(segment);
+    const edgeId = typeof plain?.edgeId === 'string' ? plain.edgeId.trim() : '';
+    const physicalEdgeId = typeof plain?.physicalEdgeId === 'string'
+        ? plain.physicalEdgeId.trim()
+        : '';
+    return targetIds.has(edgeId) || targetIds.has(physicalEdgeId);
+}
+
+function explicitSegmentIdentities(value) {
+    if (!Array.isArray(value) || value.length === 0) return null;
+    const segments = value.map(segment => toPlain(segment));
+    return segments.every(segment => {
+        const edgeId = typeof segment?.edgeId === 'string' ? segment.edgeId.trim() : '';
+        const physicalEdgeId = typeof segment?.physicalEdgeId === 'string'
+            ? segment.physicalEdgeId.trim()
+            : '';
+        return SAFE_EDGE_ID.test(edgeId) || SAFE_EDGE_ID.test(physicalEdgeId);
+    }) ? segments : null;
+}
+
+function remainingRouteUsesEdge(itinerary, target) {
+    const targetIds = targetEdgeIds(target);
 
     const source = toPlain(itinerary) || {};
     const mutableStops = mutableStopsOf(source.stops);
@@ -246,17 +314,19 @@ function remainingRouteUsesEdge(itinerary, edgeId) {
 
     let everyMutableLegHasProvenance = true;
     for (const stop of mutableStops) {
-        const edgeIds = explicitSegmentEdgeIds(toPlain(stop)?.segments);
-        if (!edgeIds) {
+        const segments = explicitSegmentIdentities(toPlain(stop)?.segments);
+        if (!segments) {
             everyMutableLegHasProvenance = false;
             continue;
         }
-        if (edgeIds.includes(normalizedEdgeId)) return true;
+        if (segments.some(segment => segmentUsesTarget(segment, targetIds))) return true;
     }
     if (everyMutableLegHasProvenance) return false;
 
-    const aggregateEdgeIds = explicitSegmentEdgeIds(toPlain(source.route)?.segments);
-    if (aggregateEdgeIds) return aggregateEdgeIds.includes(normalizedEdgeId);
+    const aggregateSegments = explicitSegmentIdentities(toPlain(source.route)?.segments);
+    if (aggregateSegments) {
+        return aggregateSegments.some(segment => segmentUsesTarget(segment, targetIds));
+    }
     return null;
 }
 
@@ -383,6 +453,54 @@ function mutableStopsOf(stops) {
     return Array.isArray(stops)
         ? stops.filter(stop => MUTABLE_STATES.has(toPlain(stop)?.state))
         : [];
+}
+
+function normalizedDataVersion(value) {
+    return typeof value === 'string' && value.trim() ? value.trim() : '';
+}
+
+function capacityTokenIdsOf(itinerary) {
+    const proposal = toPlain(itinerary?.pendingProposal);
+    const values = [
+        ...(Array.isArray(proposal?.tokenIds) ? proposal.tokenIds : []),
+        ...(Array.isArray(itinerary?.stops)
+            ? itinerary.stops.map(stop => toPlain(stop)?.capacityTokenId)
+            : [])
+    ];
+    const byId = new Map();
+    for (const value of values) {
+        if (value === null || value === undefined) continue;
+        const key = String(value).trim();
+        if (key && !byId.has(key)) byId.set(key, value);
+    }
+    return [...byId.values()];
+}
+
+function stopsWithoutCapacityTokens(stops) {
+    return Array.isArray(stops)
+        ? stops.map(stop => ({ ...toPlain(stop), capacityTokenId: null }))
+        : [];
+}
+
+function invalidatedPlanningSnapshot(value, invalidatedAt, reason) {
+    const snapshot = toPlain(value);
+    const barrierFingerprint = typeof snapshot?.barrierFingerprint === 'string'
+        ? snapshot.barrierFingerprint.trim()
+        : '';
+    const dataVersion = normalizedDataVersion(snapshot?.dataVersion);
+    const capturedAt = new Date(snapshot?.capturedAt);
+    if (!barrierFingerprint || !dataVersion || !Number.isFinite(capturedAt.getTime())) return null;
+    return {
+        ...snapshot,
+        barrierFingerprint,
+        barrierEdgeIds: Array.isArray(snapshot.barrierEdgeIds)
+            ? [...snapshot.barrierEdgeIds]
+            : [],
+        dataVersion,
+        capturedAt,
+        invalidatedAt,
+        invalidationReason: reason
+    };
 }
 
 function itineraryIdOf(itinerary) {
@@ -536,6 +654,7 @@ function createBarrierRerouteCoordinator(deps = {}) {
     const aggregateRouteFromStops = typeof deps.aggregateRouteFromStops === 'function'
         ? deps.aggregateRouteFromStops
         : null;
+    const dataVersionSource = deps.dataVersion;
     const proposalTtlMs = deps.proposalTtlMs === undefined
         ? DEFAULT_PROPOSAL_TTL_MS
         : Number(deps.proposalTtlMs);
@@ -576,6 +695,88 @@ function createBarrierRerouteCoordinator(deps = {}) {
 
     const eventRecords = new Map();
     const scenicQueues = new Map();
+
+    async function readDataVersion() {
+        const value = typeof dataVersionSource === 'function'
+            ? await dataVersionSource()
+            : dataVersionSource;
+        const dataVersion = normalizedDataVersion(value);
+        if (!dataVersion) {
+            throw barrierError(
+                'BARRIER_DATA_VERSION_UNAVAILABLE',
+                'GIS dataVersion is unavailable for barrier rerouting'
+            );
+        }
+        return dataVersion;
+    }
+
+    async function assertCurrentRoutingSnapshot(snapshot, scenicId, itineraryId) {
+        let actualDataVersion = null;
+        try {
+            actualDataVersion = await readDataVersion();
+        } catch {
+            throw barrierError(
+                'BARRIER_ROUTING_SNAPSHOT_CHANGED',
+                'GIS dataVersion could not be verified before barrier proposal persistence',
+                {
+                    expectedDataVersion: snapshot.dataVersion,
+                    actualDataVersion: null,
+                    itineraryId
+                }
+            );
+        }
+        if (actualDataVersion !== snapshot.dataVersion) {
+            throw barrierError(
+                'BARRIER_ROUTING_SNAPSHOT_CHANGED',
+                'GIS dataVersion changed before barrier proposal persistence',
+                {
+                    expectedDataVersion: snapshot.dataVersion,
+                    actualDataVersion,
+                    itineraryId
+                }
+            );
+        }
+
+        let actualBarrierSnapshot;
+        try {
+            actualBarrierSnapshot = await loadClosedBarrierSnapshot({
+                WalkEdge: models.WalkEdge,
+                scenicId
+            });
+        } catch (cause) {
+            const error = barrierError(
+                'BARRIER_ROUTING_SNAPSHOT_CHANGED',
+                'closed barrier set could not be verified before barrier proposal persistence',
+                {
+                    expectedBarrierFingerprint: snapshot.fingerprint,
+                    actualBarrierFingerprint: null,
+                    itineraryId
+                }
+            );
+            error.cause = cause;
+            throw error;
+        }
+        const actualSnapshot = {
+            ...actualBarrierSnapshot,
+            dataVersion: actualDataVersion
+        };
+        if (actualSnapshot.fingerprint !== snapshot.fingerprint) {
+            const error = barrierError(
+                'BARRIER_ROUTING_SNAPSHOT_CHANGED',
+                'closed barrier set changed before barrier proposal persistence',
+                {
+                    expectedBarrierFingerprint: snapshot.fingerprint,
+                    actualBarrierFingerprint: actualSnapshot.fingerprint,
+                    expectedDataVersion: snapshot.dataVersion,
+                    actualDataVersion,
+                    itineraryId
+                }
+            );
+            error.currentRoutingSnapshot = actualSnapshot;
+            throw error;
+        }
+        return actualSnapshot;
+    }
 
     async function loadEventRecord(eventId) {
         return toPlain(await resolveLeanQuery(models.BarrierEventRecord.findOne({ eventId })));
@@ -747,7 +948,8 @@ function createBarrierRerouteCoordinator(deps = {}) {
 
     async function emitFinalImpact(impact) {
         const failed = impact.failedCount + impact.operationalFailureCount;
-        impact.partialFailure = impact.proposedCount > 0 && failed > 0;
+        impact.partialFailure = (impact.proposedCount + impact.invalidatedDraftCount) > 0
+            && failed > 0;
         impact.success = failed === 0;
         impact.outcome = impact.success
             ? 'completed'
@@ -767,10 +969,20 @@ function createBarrierRerouteCoordinator(deps = {}) {
         return impact;
     }
 
-    async function comparableMutableRoute(stops, preferences, fallbackRoute = null) {
+    async function comparableMutableRoute(
+        stops,
+        preferences,
+        fallbackRoute = null,
+        expectedDataVersion = null
+    ) {
         const mutableStops = mutableStopsOf(stops);
         if (aggregateRouteFromStops) {
-            const aggregate = await aggregateRouteFromStops(mutableStops, preferences, null);
+            const aggregate = await aggregateRouteFromStops(
+                mutableStops,
+                preferences,
+                null,
+                { expectedDataVersion }
+            );
             if (routeMaterialSignature(aggregate)) return aggregate;
         }
         const stopRoute = { stops: mutableStops };
@@ -798,7 +1010,23 @@ function createBarrierRerouteCoordinator(deps = {}) {
                     attempted
                 };
             }
-            if (event.operation === 'close' && remainingRouteUsesEdge(itinerary, event.edgeId) === false) {
+            const eventPhysicalEdgeIds = new Set([
+                event.edgeId,
+                ...(Array.isArray(event.edgeIds) ? event.edgeIds : [])
+            ]);
+            for (const barrier of snapshot.barriers) {
+                if (barrier.physicalEdgeId === event.edgeId
+                    || barrier.edgeId === event.edgeId
+                    || eventPhysicalEdgeIds.has(barrier.edgeId)) {
+                    eventPhysicalEdgeIds.add(barrier.edgeId);
+                    eventPhysicalEdgeIds.add(barrier.physicalEdgeId);
+                }
+            }
+            if (event.operation === 'close' && remainingRouteUsesEdge(itinerary, {
+                edgeId: event.edgeId,
+                physicalEdgeId: event.physicalEdgeId || event.edgeId,
+                edgeIds: [...eventPhysicalEdgeIds]
+            }) === false) {
                 return {
                     itineraryId,
                     status: 'skipped',
@@ -840,17 +1068,26 @@ function createBarrierRerouteCoordinator(deps = {}) {
                     { itineraryId }
                 );
             }
+            if (!snapshot.dataVersion) {
+                throw barrierError(
+                    'BARRIER_DATA_VERSION_UNAVAILABLE',
+                    'GIS dataVersion is unavailable for barrier rerouting',
+                    { itineraryId }
+                );
+            }
 
             attempted = true;
             assertEventOwnership();
             const routeContext = {
                 barriers: snapshot.barriers.map(barrier => ({
                     edgeId: barrier.edgeId,
+                    physicalEdgeId: barrier.physicalEdgeId,
                     sourceRef: { ...barrier.sourceRef }
                 })),
                 requestId: event.eventId,
                 eventId: event.eventId,
-                barrierFingerprint: snapshot.fingerprint
+                barrierFingerprint: snapshot.fingerprint,
+                dataVersion: snapshot.dataVersion
             };
             const rebuilt = await rebuildTimeline({
                 itinerary,
@@ -879,18 +1116,25 @@ function createBarrierRerouteCoordinator(deps = {}) {
             const route = explicitRoute !== null && explicitRoute !== undefined
                 ? explicitRoute
                 : aggregateRouteFromStops
-                    ? await aggregateRouteFromStops(candidateStops, itinerary.preferences, itinerary.route)
+                    ? await aggregateRouteFromStops(
+                        candidateStops,
+                        itinerary.preferences,
+                        itinerary.route,
+                        { expectedDataVersion: snapshot.dataVersion }
+                    )
                     : null;
             if (event.operation === 'open') {
                 const currentMutableRoute = await comparableMutableRoute(
                     proposedStops,
                     itinerary.preferences,
-                    itinerary.route
+                    itinerary.route,
+                    snapshot.dataVersion
                 );
                 const candidateMutableRoute = await comparableMutableRoute(
                     candidateStops,
                     itinerary.preferences,
-                    explicitRoute
+                    explicitRoute,
+                    snapshot.dataVersion
                 );
                 if (routesMateriallyEqual(currentMutableRoute, candidateMutableRoute)) {
                     affected = false;
@@ -921,6 +1165,7 @@ function createBarrierRerouteCoordinator(deps = {}) {
                     edgeId: event.edgeId,
                     barrierFingerprint: snapshot.fingerprint,
                     barrierEdgeIds: [...snapshot.edgeIds],
+                    dataVersion: snapshot.dataVersion,
                     barriers: routeContext.barriers,
                     stops: candidateStops,
                     ...(route !== null && route !== undefined ? { route } : {})
@@ -934,11 +1179,13 @@ function createBarrierRerouteCoordinator(deps = {}) {
             };
 
             assertEventOwnership();
+            await assertCurrentRoutingSnapshot(snapshot, event.scenicId, itineraryId);
+            assertEventOwnership();
             const updated = await models.Itinerary.findOneAndUpdate(
                 {
                     _id: itinerary._id,
                     version: itinerary.version,
-                    state: 'active',
+                    state: itinerary.state === 'paused' ? 'paused' : 'active',
                     ...(existingProposal
                         ? { 'pendingProposal.proposalId': existingProposal.proposalId }
                         : { pendingProposal: null })
@@ -1021,6 +1268,71 @@ function createBarrierRerouteCoordinator(deps = {}) {
         }
     }
 
+    async function invalidateDraftItinerary({ itinerary, event, now, assertEventOwnership }) {
+        const affected = true;
+        const attempted = false;
+        try {
+            assertEventOwnership();
+            const itineraryId = itineraryIdOf(itinerary);
+            if (!itineraryId) {
+                throw barrierError('INVALID_ITINERARY', 'draft itinerary is missing _id');
+            }
+
+            const reason = `graph ${event.operation} event ${event.eventId} invalidated draft routing snapshot`;
+            const planningSnapshot = invalidatedPlanningSnapshot(
+                itinerary.planningSnapshot,
+                now,
+                reason
+            );
+            const tokenIds = capacityTokenIdsOf(itinerary);
+            const updated = await models.Itinerary.findOneAndUpdate(
+                {
+                    _id: itinerary._id,
+                    version: itinerary.version,
+                    state: 'draft'
+                },
+                {
+                    $set: {
+                        state: 'abandoned',
+                        stops: stopsWithoutCapacityTokens(itinerary.stops),
+                        pendingProposal: null,
+                        planningSnapshot
+                    },
+                    $unset: { activeOwner: 1 },
+                    $inc: { version: 1 }
+                },
+                { new: true }
+            );
+            if (!updated) {
+                throw barrierError(
+                    'ITINERARY_CAS_CONFLICT',
+                    'draft itinerary changed before it could be invalidated',
+                    { itineraryId }
+                );
+            }
+
+            const operationalErrors = [];
+            if (tokenIds.length) {
+                try {
+                    await releaseProposalTokens(tokenIds, itinerary._id);
+                } catch (error) {
+                    operationalErrors.push({ scope: 'invalidated-draft-token-release', error });
+                }
+            }
+            return {
+                itineraryId,
+                status: 'invalidated',
+                code: 'DRAFT_INVALIDATED_BY_GRAPH_CHANGE',
+                affected,
+                attempted,
+                ...(operationalErrors.length ? { operationalErrors } : {})
+            };
+        } catch (error) {
+            error.barrierReroute = { affected, attempted };
+            throw error;
+        }
+    }
+
     async function runAcceptedEvent(event, assertEventOwnership) {
         assertEventOwnership();
         const now = validDate(clock(), 'clock');
@@ -1031,12 +1343,13 @@ function createBarrierRerouteCoordinator(deps = {}) {
             edgeId: event.edgeId,
             operation: event.operation,
             edgeStatus: event.operation === 'close' ? 'closed' : 'open',
+            dataVersion: null,
             accepted: true,
             duplicate: false,
             acceptedAt: now,
             cacheInvalidatedBeforeEnqueue: event.cacheInvalidated,
-            cacheInvalidationAttempts: event.cacheInvalidated ? 0 : 1,
-            graphReloadAttempts: 1,
+            cacheInvalidationAttempts: 0,
+            graphReloadAttempts: 0,
             barrierCount: 0,
             barrierEdgeIds: [],
             barrierFingerprint: null,
@@ -1044,6 +1357,7 @@ function createBarrierRerouteCoordinator(deps = {}) {
             affectedItineraryCount: 0,
             attemptedCount: 0,
             proposedCount: 0,
+            invalidatedDraftCount: 0,
             skippedCount: 0,
             failedCount: 0,
             operationalFailureCount: 0,
@@ -1052,7 +1366,18 @@ function createBarrierRerouteCoordinator(deps = {}) {
         };
 
         assertEventOwnership();
+        let eventDataVersion;
+        try {
+            eventDataVersion = await readDataVersion();
+            impact.dataVersion = eventDataVersion;
+        } catch (error) {
+            impact.operationalFailureCount++;
+            impact.failures.push(errorRecord('data-version-snapshot', error));
+        }
+
+        assertEventOwnership();
         if (!event.cacheInvalidated) {
+            impact.cacheInvalidationAttempts++;
             try {
                 await gateway.invalidateRouteCache(
                     `barrier-${event.operation}:${event.scenicId}:${event.eventId}`
@@ -1063,6 +1388,7 @@ function createBarrierRerouteCoordinator(deps = {}) {
             }
         }
         assertEventOwnership();
+        impact.graphReloadAttempts++;
         try {
             await reloadWalkGraph();
         } catch (error) {
@@ -1073,10 +1399,11 @@ function createBarrierRerouteCoordinator(deps = {}) {
         assertEventOwnership();
         let snapshot;
         try {
-            snapshot = await loadClosedBarrierSnapshot({
+            const barrierSnapshot = await loadClosedBarrierSnapshot({
                 WalkEdge: models.WalkEdge,
                 scenicId: event.scenicId
             });
+            snapshot = { ...barrierSnapshot, dataVersion: eventDataVersion };
             impact.barrierCount = snapshot.barriers.length;
             impact.barrierEdgeIds = [...snapshot.edgeIds];
             impact.barrierFingerprint = snapshot.fingerprint;
@@ -1091,7 +1418,7 @@ function createBarrierRerouteCoordinator(deps = {}) {
         try {
             itineraries = await resolveLeanQuery(models.Itinerary.find({
                 scenicId: event.scenicId,
-                state: 'active'
+                state: { $in: ['draft', 'active', 'paused'] }
             }));
             if (!Array.isArray(itineraries)) {
                 throw barrierError('INVALID_ITINERARY_QUERY', 'Itinerary.find must resolve to an array');
@@ -1106,13 +1433,20 @@ function createBarrierRerouteCoordinator(deps = {}) {
         const settled = await settleWithConcurrency(
             itineraries,
             itineraryConcurrency,
-            itinerary => processItinerary({
-                itinerary,
-                event,
-                snapshot,
-                now,
-                assertEventOwnership
-            })
+            itinerary => itinerary?.state === 'draft'
+                ? invalidateDraftItinerary({
+                    itinerary,
+                    event,
+                    now,
+                    assertEventOwnership
+                })
+                : processItinerary({
+                    itinerary,
+                    event,
+                    snapshot,
+                    now,
+                    assertEventOwnership
+                })
         );
         settled.forEach((result, index) => {
             const itineraryId = itineraryIdOf(itineraries[index]);
@@ -1138,6 +1472,7 @@ function createBarrierRerouteCoordinator(deps = {}) {
             if (result.value.affected) impact.affectedItineraryCount++;
             if (result.value.attempted) impact.attemptedCount++;
             if (result.value.status === 'proposed') impact.proposedCount++;
+            if (result.value.status === 'invalidated') impact.invalidatedDraftCount++;
             if (result.value.status === 'skipped') impact.skippedCount++;
             for (const operationalError of operationalErrors) {
                 impact.operationalFailureCount++;

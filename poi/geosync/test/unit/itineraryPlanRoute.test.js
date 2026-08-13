@@ -19,6 +19,7 @@ const originalPlan = planner.plan;
 
 let planCall;
 let createdPayload;
+let barrierSnapshotCalls = 0;
 
 const canonicalStop = {
     poiId: 'poi-a',
@@ -34,10 +35,19 @@ const canonicalStop = {
         requestId: 'request-plan', durationMs: 15, dataVersion: 'v1'
     },
     segments: [{
-        edgeId: 'edge-1', distanceM: 90, durationSec: 60,
+        edgeId: 'edge-1', physicalEdgeId: 'physical-edge-1',
+        fromNodeId: 'node-a', toNodeId: 'node-b',
+        distanceM: 90, durationSec: 60,
         sourceRef: { datasetName: 'WalkEdge@GeoSync', smId: 1 }
     }],
+    nodeIds: ['node-a', 'node-b'],
+    edgeIds: ['edge-1'],
     snap: { startDistanceM: 1, endDistanceM: 2 },
+    available: true,
+    authoritative: true,
+    routeFound: true,
+    routeKind: 'topology',
+    topology: true,
     verifiedAccessible: true,
     pathGeometry: 'legacy-stop-path'
 };
@@ -81,7 +91,19 @@ const ExternalPoi = {
     }
 };
 
-modelModule.getModels = () => ({ Itinerary, ExternalPoi });
+const closedBarriers = [{
+    edgeId: 'edge-closed',
+    sourceRef: { datasetName: 'WalkEdge@GeoSync', smId: 9 }
+}];
+const WalkEdgeModel = {
+    find(filter) {
+        assert.deepEqual(filter, { scenicId: 'default', status: 'closed' });
+        barrierSnapshotCalls++;
+        return { lean: async () => structuredClone(closedBarriers) };
+    }
+};
+
+modelModule.getModels = () => ({ Itinerary, ExternalPoi, WalkEdge: WalkEdgeModel });
 
 planner.plan = async (input, deps) => {
     planCall = { input, deps };
@@ -121,7 +143,7 @@ function response() {
 test('itinerary schema persists canonical stop and aggregate route fields', () => {
     for (const field of [
         'geometry', 'distanceM', 'durationSec', 'gis', 'segments', 'snap',
-        'verifiedAccessible', 'pathGeometry'
+        'nodeIds', 'edgeIds', 'topologyProof', 'verifiedAccessible', 'pathGeometry'
     ]) {
         assert.ok(stopSchema.path(field), `missing stop schema field ${field}`);
         assert.ok(aggregateRouteSchema.path(field), `missing aggregate route schema field ${field}`);
@@ -131,6 +153,15 @@ test('itinerary schema persists canonical stop and aggregate route fields', () =
         stopSchema.path('gis').schema.path('source').options.enum,
         ['iserver', 'cache', 'local-fallback']
     );
+    for (const field of ['physicalEdgeId', 'fromNodeId', 'toNodeId']) {
+        assert.ok(stopSchema.path('segments').schema.path(field), `missing segment field ${field}`);
+    }
+    for (const field of ['startNodeId', 'endNodeId']) {
+        assert.ok(stopSchema.path('snap').schema.path(field), `missing snap field ${field}`);
+    }
+    for (const field of ['geometryDigest', 'nodeIds', 'edgeIds', 'segments', 'digest']) {
+        assert.ok(stopSchema.path('topologyProof').schema.path(field), `missing proof field ${field}`);
+    }
 });
 
 test('WalkEdge schema retains complete local graph provenance', () => {
@@ -157,6 +188,8 @@ test('WalkEdge schema retains complete local graph provenance', () => {
 
 test('plan injects the request-scoped resolver and serializes canonical plus legacy route fields', async () => {
     const routeBetween = async () => canonicalStop;
+    const estimateBetween = () => null;
+    barrierSnapshotCalls = 0;
     const req = {
         method: 'POST',
         originalUrl: '/api/itinerary/plan',
@@ -171,7 +204,11 @@ test('plan injects the request-scoped resolver and serializes canonical plus leg
             accessible: false,
             shadeFirst: true
         },
-        app: { locals: { geosync: { routeBetween } } }
+        app: { locals: { geosync: {
+            routeBetween,
+            estimateBetween,
+            dataVersion: () => 'v1'
+        } } }
     };
     const res = response();
     await planHandler(req, res, () => {});
@@ -179,6 +216,14 @@ test('plan injects the request-scoped resolver and serializes canonical plus leg
     assert.equal(res.statusCode, 200);
     assert.equal(res.body.success, true);
     assert.equal(planCall.deps.routeBetween, routeBetween);
+    assert.equal(planCall.deps.estimateBetween, estimateBetween);
+    assert.equal(barrierSnapshotCalls, 3);
+    assert.deepEqual(planCall.deps.routeContext.barriers, closedBarriers.map(barrier => ({
+        ...barrier,
+        physicalEdgeId: barrier.edgeId
+    })));
+    assert.match(planCall.deps.routeContext.barrierFingerprint, /^sha256:/);
+    assert.equal(planCall.deps.routeContext.dataVersion, 'v1');
     assert.equal(planCall.input.openId, 'user-1');
     assert.equal(planCall.input.requestId, 'request-plan');
     assert.deepEqual(planCall.input.startLocation, [118, 32]);
@@ -234,4 +279,148 @@ test('plan rejects an invalid startAt before planner or persistence work', async
     assert.equal(res.body.code, 1102);
     assert.equal(planCall, null);
     assert.equal(createdPayload, null);
+});
+
+test('plan fails closed when the request-scoped GIS data version is unavailable', async () => {
+    planCall = null;
+    createdPayload = null;
+    barrierSnapshotCalls = 0;
+    const req = {
+        method: 'POST',
+        originalUrl: '/api/itinerary/plan',
+        openId: 'user-no-version',
+        headers: { 'x-request-id': 'request-no-version' },
+        body: {
+            startLocation: [118, 32],
+            startAt: '2026-08-02T01:00:00.000Z',
+            hours: 2
+        },
+        app: { locals: { geosync: {
+            routeBetween: async () => canonicalStop,
+            estimateBetween: () => null,
+            dataVersion: () => null
+        } } }
+    };
+    const res = response();
+    let nextError;
+
+    await planHandler(req, res, error => { nextError = error; });
+
+    assert.equal(nextError, undefined);
+    assert.equal(res.statusCode, 409);
+    assert.equal(res.body.code, 8205);
+    assert.equal(barrierSnapshotCalls, 1);
+    assert.equal(planCall, null);
+    assert.equal(createdPayload, null);
+});
+
+test('plan loads one barrier snapshot and forwards it through topology estimates and final routing', async () => {
+    planner.plan = originalPlan;
+    planCall = null;
+    createdPayload = null;
+    barrierSnapshotCalls = 0;
+    const estimateContexts = [];
+    const routeContexts = [];
+    const originalPlannerQueries = {
+        externalPoiFind: registeredModels.ExternalPoi.find,
+        photoSpotFind: registeredModels.PhotoSpot.find,
+        checkinAggregate: registeredModels.Checkin.aggregate,
+        campaignFind: registeredModels.Campaign.find
+    };
+    registeredModels.ExternalPoi.find = () => ({ lean: async () => [{
+        _id: 'poi-a',
+        poiName: 'POI A',
+        gateNodeId: 'node-b',
+        category: 'history',
+        geo: { type: 'Point', coordinates: [118.001, 32.001] },
+        visitMeta: { suggestedStayMin: 10, tags: ['history'] }
+    }] });
+    registeredModels.PhotoSpot.find = () => ({
+        sort() { return this; },
+        lean: async () => []
+    });
+    registeredModels.Checkin.aggregate = async () => [];
+    registeredModels.Campaign.find = () => ({ lean: async () => [] });
+    const estimateBetween = (from, to, mode, context) => {
+        estimateContexts.push({ mode, context });
+        return {
+            walkSec: 60,
+            durationSec: 60,
+            distanceM: 90,
+            coords: [from.geo.coordinates, to.geo.coordinates],
+            geometry: { type: 'LineString', coordinates: [from.geo.coordinates, to.geo.coordinates] },
+            nodeIds: ['node-a', 'node-b'],
+            edgeIds: ['edge-open'],
+            edgeDataVersions: ['v1'],
+            segments: [{
+                edgeId: 'edge-open',
+                fromNodeId: 'node-a',
+                toNodeId: 'node-b',
+                distanceM: 90,
+                durationSec: 60,
+                sourceRef: { datasetName: 'WalkEdge@GeoSync', smId: 1 }
+            }],
+            gis: { source: 'iserver', mode, dataVersion: 'v1' },
+            fallback: false,
+            available: true,
+            authoritative: true,
+            routeFound: true,
+            routeKind: 'graph'
+        };
+    };
+    const routeBetween = async (from, to, mode, context) => {
+        routeContexts.push({ mode, context });
+        return structuredClone(canonicalStop);
+    };
+    const req = {
+        method: 'POST',
+        originalUrl: '/api/itinerary/plan',
+        openId: 'user-full-snapshot',
+        headers: { 'x-request-id': 'request-full-snapshot' },
+        body: {
+            startLocation: [118, 32],
+            startAt: '2026-08-02T01:00:00.000Z',
+            hours: 1,
+            interests: ['history'],
+            shadeFirst: true
+        },
+        app: { locals: { geosync: {
+            routeBetween,
+            estimateBetween,
+            dataVersion: () => 'v1'
+        } } }
+    };
+    const res = response();
+
+    try {
+        await planHandler(req, res, () => {});
+    } finally {
+        registeredModels.ExternalPoi.find = originalPlannerQueries.externalPoiFind;
+        registeredModels.PhotoSpot.find = originalPlannerQueries.photoSpotFind;
+        registeredModels.Checkin.aggregate = originalPlannerQueries.checkinAggregate;
+        registeredModels.Campaign.find = originalPlannerQueries.campaignFind;
+        planner.plan = async (input, deps) => {
+            planCall = { input, deps };
+            return {
+                stops: [structuredClone(canonicalStop)],
+                route: structuredClone(aggregateRoute),
+                totalWalkMin: 1,
+                planNote: 'planned'
+            };
+        };
+    }
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(barrierSnapshotCalls, 3);
+    assert.ok(estimateContexts.length >= 1);
+    assert.equal(routeContexts.length, 1);
+    for (const call of [...estimateContexts, ...routeContexts]) {
+        assert.equal(call.mode, 'shade');
+        assert.equal(call.context.dataVersion, 'v1');
+        assert.match(call.context.barrierFingerprint, /^sha256:/);
+        assert.deepEqual(call.context.barriers, closedBarriers.map(barrier => ({
+            ...barrier,
+            physicalEdgeId: barrier.edgeId
+        })));
+    }
 });

@@ -20,6 +20,12 @@ const {
     normalizeWalkSec,
     polylineDistanceM
 } = require('../lib/walkEdgeContract');
+const {
+    directedEdgeId,
+    legacyReversePair,
+    physicalEdgeIdOf,
+    reverseCandidateEdgeId
+} = require('../lib/walkEdgeIdentity');
 const bus = require('../lib/eventBus');
 const crowdService = require('../services/crowdService');
 const forecastService = require('../services/forecastService');
@@ -122,6 +128,160 @@ function canonicalSourceRef(value) {
 
 function graphEventId() {
     return `closure_${crypto.randomBytes(8).toString('hex')}`;
+}
+
+function sessionOptions(session) {
+    return session ? { session } : {};
+}
+
+function transactionUnsupported(error) {
+    const candidates = [error, error?.cause, error?.errorResponse].filter(Boolean);
+    return candidates.some(candidate => {
+        const code = Number(candidate?.code);
+        const codeName = String(candidate?.codeName || '').trim();
+        const message = String(candidate?.message || '');
+        const unsupportedMessage = /transaction numbers are only allowed on a replica set member or mongos/i
+            .test(message)
+            || /transactions? (?:are|is) not supported (?:by|on|for) this (?:deployment|topology|server)/i
+                .test(message);
+        return unsupportedMessage && (code === 20 || codeName === 'IllegalOperation' || !Number.isFinite(code));
+    });
+}
+
+async function executeQuery(query, session, lean = false) {
+    let executable = query;
+    if (session && typeof executable?.session === 'function') {
+        executable = executable.session(session);
+    }
+    if (lean && typeof executable?.lean === 'function') {
+        executable = executable.lean();
+    }
+    return executable;
+}
+
+async function relatedPhysicalEdges(WalkEdge, selected, session = null) {
+    if (selected.physicalEdgeId) {
+        const physicalEdgeId = physicalEdgeIdOf(selected);
+        const edges = await executeQuery(WalkEdge.find({
+            scenicId: selected.scenicId,
+            physicalEdgeId
+        }), session, true);
+        return { edges, physicalEdgeId };
+    }
+
+    const reverseEdgeId = reverseCandidateEdgeId(selected.edgeId);
+    if (!reverseEdgeId) {
+        return { edges: [selected], physicalEdgeId: physicalEdgeIdOf(selected) };
+    }
+    const candidates = await executeQuery(WalkEdge.find({
+        scenicId: selected.scenicId,
+        edgeId: { $in: [selected.edgeId, reverseEdgeId] }
+    }), session, true);
+    const pair = candidates.find(candidate => candidate.edgeId !== selected.edgeId
+        && (legacyReversePair(selected, candidate) || legacyReversePair(candidate, selected)));
+    if (!pair) {
+        return { edges: [selected], physicalEdgeId: physicalEdgeIdOf(selected) };
+    }
+
+    const selectedId = String(selected.edgeId);
+    const pairId = String(pair.edgeId);
+    const physicalEdgeId = `${selectedId}_r` === pairId ? selectedId : pairId;
+    return { edges: [selected, pair], physicalEdgeId };
+}
+
+async function transitionPhysicalEdge(WalkEdge, requestedEdgeId, operation, metadata, session = null) {
+    const selected = await executeQuery(
+        WalkEdge.findOne({ edgeId: requestedEdgeId }),
+        session,
+        true
+    );
+    if (!selected) return { missing: true };
+
+    const targetStatus = operation === 'close' ? 'closed' : 'open';
+    const related = await relatedPhysicalEdges(WalkEdge, selected, session);
+    if (related.edges.some(edge => !['open', 'closed'].includes(edge.status))) {
+        return { conflict: true, selected };
+    }
+    const edgeIds = [...new Set(related.edges.map(edge => edge.edgeId))];
+    const changedEdgeIds = related.edges
+        .filter(edge => edge.status !== targetStatus)
+        .map(edge => edge.edgeId);
+    const identityNeedsBackfill = related.edges.some(
+        edge => edge.physicalEdgeId !== related.physicalEdgeId
+    );
+    if (!changedEdgeIds.length && !identityNeedsBackfill) {
+        return {
+            selected,
+            physicalEdgeId: related.physicalEdgeId,
+            edgeIds,
+            changedEdgeIds,
+            status: targetStatus
+        };
+    }
+
+    const update = operation === 'close'
+        ? {
+            $set: {
+                physicalEdgeId: related.physicalEdgeId,
+                status: targetStatus,
+                closedReason: metadata.reason,
+                closedAt: metadata.acceptedAt
+            }
+        }
+        : {
+            $set: { physicalEdgeId: related.physicalEdgeId, status: targetStatus },
+            $unset: { closedReason: 1, closedAt: 1 }
+        };
+    const result = await WalkEdge.updateMany(
+        {
+            scenicId: selected.scenicId,
+            $or: related.edges.map(edge => ({ edgeId: edge.edgeId, status: edge.status }))
+        },
+        update,
+        sessionOptions(session)
+    );
+    const matchedCount = Number(result?.matchedCount ?? result?.n ?? 0);
+    if (matchedCount !== edgeIds.length) return { conflict: true, selected };
+    return {
+        selected,
+        physicalEdgeId: related.physicalEdgeId,
+        edgeIds,
+        changedEdgeIds,
+        status: targetStatus
+    };
+}
+
+async function runPhysicalEdgeTransition(WalkEdge, requestedEdgeId, operation, metadata) {
+    const connection = WalkEdge.db;
+    if (!connection || typeof connection.startSession !== 'function') {
+        return transitionPhysicalEdge(WalkEdge, requestedEdgeId, operation, metadata);
+    }
+    let session;
+    let unsupported = false;
+    try {
+        session = await connection.startSession();
+        let outcome;
+        await session.withTransaction(async () => {
+            outcome = await transitionPhysicalEdge(
+                WalkEdge,
+                requestedEdgeId,
+                operation,
+                metadata,
+                session
+            );
+            if (outcome?.conflict) throw new BizError(8102, '路段已被其他请求修改，请重试', 409);
+        });
+        return outcome;
+    } catch (error) {
+        if (!transactionUnsupported(error)) throw error;
+        unsupported = true;
+    } finally {
+        if (session) await session.endSession();
+    }
+    if (unsupported) {
+        return transitionPhysicalEdge(WalkEdge, requestedEdgeId, operation, metadata);
+    }
+    throw new Error('physical-edge transition ended without an outcome');
 }
 
 // POST /gis/route-test — 管理端 GIS 冒烟，不进入游客行程流程。
@@ -295,9 +455,12 @@ router.post('/graph/edge', wrap(async (req, res) => {
     }, { geometryDistanceM: distanceM, coerce: true });
     if (!metrics) return fail(res, 400, 1101, '路段数值超出允许范围');
 
-    const mk = (a, b, geom) => ({
+    const physicalEdgeId = `e_${Date.now().toString(36)}${crypto.randomBytes(4).toString('hex')}`;
+    const mk = (a, b, geom, traversalDirection) => ({
         scenicId: CONFIG.scenicId,
-        edgeId: 'e_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+        edgeId: directedEdgeId(physicalEdgeId, traversalDirection),
+        physicalEdgeId,
+        traversalDirection,
         from: a,
         to: b,
         geometry: geom,
@@ -311,11 +474,14 @@ router.post('/graph/edge', wrap(async (req, res) => {
         status: 'open',
         source: 'manual'
     });
-    const docs = [mk(fromNodeId, toNodeId, coords)];
-    if (normalizedBidirectional) docs.push(mk(toNodeId, fromNodeId, [...coords].reverse()));
+    const docs = [mk(fromNodeId, toNodeId, coords, 'forward')];
+    if (normalizedBidirectional) {
+        docs.push(mk(toNodeId, fromNodeId, [...coords].reverse(), 'reverse'));
+    }
     const created = await WalkEdge.insertMany(docs);
     await walkGraph.loadIntoMemory();
     ok(res, {
+        physicalEdgeId,
         edgeIds: created.map(e => e.edgeId),
         distanceM: metrics.distanceM,
         walkSec: metrics.walkSec
@@ -373,21 +539,24 @@ router.post('/graph/edge/:edgeId/:op(close|open)', wrap(async (req, res) => {
 
     const acceptedAt = new Date();
     const targetStatus = closing ? 'closed' : 'open';
-    const sourceStatus = closing ? 'open' : 'closed';
-    const edge = await WalkEdge.findOneAndUpdate(
-        { edgeId: req.params.edgeId, status: sourceStatus },
-        closing
-            ? { $set: { status: targetStatus, closedReason: reason, closedAt: acceptedAt } }
-            : { $set: { status: 'open' }, $unset: { closedReason: 1, closedAt: 1 } },
-        { new: true }
+    const outcome = await runPhysicalEdgeTransition(
+        WalkEdge,
+        req.params.edgeId,
+        req.params.op,
+        { reason, acceptedAt }
     );
-    if (!edge) {
-        const current = await WalkEdge.findOne({ edgeId: req.params.edgeId });
-        if (!current) return fail(res, 404, 8101, '边不存在');
-        if (current.status === targetStatus) {
-            return ok(res, { accepted: false, edgeId: current.edgeId, status: current.status });
-        }
-        return fail(res, 409, 8102, '路段当前状态不允许该操作');
+    if (outcome?.missing) return fail(res, 404, 8101, '边不存在');
+    if (outcome?.conflict) {
+        return fail(res, 409, 8102, '路段已被其他请求修改，请重试');
+    }
+    if (!outcome.changedEdgeIds.length) {
+        return ok(res, {
+            accepted: false,
+            edgeId: outcome.physicalEdgeId,
+            physicalEdgeId: outcome.physicalEdgeId,
+            edgeIds: outcome.edgeIds,
+            status: outcome.status
+        });
     }
 
     const eventId = graphEventId();
@@ -397,7 +566,9 @@ router.post('/graph/edge/:edgeId/:op(close|open)', wrap(async (req, res) => {
         if (!gateway || typeof gateway.invalidateRouteCache !== 'function') {
             throw new Error('Gateway route-cache invalidation is unavailable');
         }
-        await gateway.invalidateRouteCache(`graph-${targetStatus}:${edge.edgeId}:${eventId}`);
+        await gateway.invalidateRouteCache(
+            `graph-${targetStatus}:${outcome.physicalEdgeId}:${eventId}`
+        );
     } catch (error) {
         cacheInvalidated = false;
         console.error('[GeoSync] [GRAPH] route-cache invalidation failed:',
@@ -406,11 +577,13 @@ router.post('/graph/edge/:edgeId/:op(close|open)', wrap(async (req, res) => {
 
     const payload = {
         eventId,
-        scenicId: String(edge.scenicId || CONFIG.scenicId),
-        edgeId: edge.edgeId,
-        status: edge.status,
+        scenicId: String(outcome.selected.scenicId || CONFIG.scenicId),
+        edgeId: outcome.physicalEdgeId,
+        physicalEdgeId: outcome.physicalEdgeId,
+        edgeIds: outcome.edgeIds,
+        status: outcome.status,
         reason,
-        sourceRef: canonicalSourceRef(edge.sourceRef),
+        sourceRef: canonicalSourceRef(outcome.selected.sourceRef),
         acceptedAt: acceptedAt.toISOString(),
         cacheInvalidated
     };

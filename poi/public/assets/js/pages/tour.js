@@ -548,9 +548,14 @@ function renderStatus(state) {
     setText(elements.rainBanner, state.rain?.text || '降雨提醒');
     const closedEdge = state.closedEdges.find(item => item.status === 'closed');
     elements.roadBanner.classList.toggle('hidden', !closedEdge);
-    setText(elements.roadBanner, closedEdge
-        ? `${closedEdge.reason || '检测到临时封路'}${closedEdge.geometry ? '' : '，路段位置暂未提供'}`
-        : '');
+    if (closedEdge) {
+        const edgeLabel = String(closedEdge.edgeId ?? '').trim();
+        setText(elements.roadBanner,
+            `${closedEdge.reason || '检测到临时封路'}${edgeLabel ? `（边 ${edgeLabel}）` : ''}`
+            + `${closedEdge.geometry ? '' : '，路段位置暂未提供'}`);
+    } else {
+        setText(elements.roadBanner, '');
+    }
 }
 
 function renderPanels(state) {
@@ -1082,6 +1087,7 @@ function initSocket(config) {
     listen(socketClient, 'proposal', event => void receiveProposal(event.detail), undefined, socketListenerCleanup);
     listen(socketClient, 'graph', event => {
         const item = event.detail;
+        api.applyGraphEvent?.(item);
         const closedEdges = store.getState().closedEdges.filter(edge => String(edge.edgeId) !== String(item.edgeId));
         if (item.status === 'closed') closedEdges.push(item);
         store.set({ closedEdges }, 'graph:update');
@@ -1095,6 +1101,7 @@ function initSocket(config) {
 async function receiveProposal(payload) {
     const notifiedProposalId = String(payload?.proposalId || payload?.proposal?.proposalId || '');
     if (notifiedProposalId && store.getState().handledProposalIds.includes(notifiedProposalId)) return;
+    if (demo && payload?.proposalId) api.setProposal?.(payload);
     const current = await refreshCurrent({ announceChange: false, showFailureToast: false });
     if (!current) {
         showToast('收到路线调整通知，服务端状态暂未同步');
@@ -1181,7 +1188,11 @@ async function submitPlan(event) {
                 elements.planMessage.classList.remove('hidden');
             }
         } else {
-            const message = error.code === 8204 ? '没有已验证的无障碍路线，请关闭无障碍模式后主动重试' : error.message;
+            const message = error.code === 8204
+                ? payload.accessible
+                    ? '没有已验证的无障碍路线，请关闭无障碍模式后主动重试'
+                    : '当前路线模式没有可达路径，请调整路线偏好后主动重试'
+                : error.message;
             setText(elements.planMessage, message);
             elements.planMessage.classList.remove('hidden');
             elements.planMessage.classList.toggle('error', true);
@@ -1253,8 +1264,7 @@ async function startTour() {
         replaceItineraryAfterMutation(updated);
         locationClient.start('tour');
         if (demo) {
-            const proposal = demoProposal(updated.version);
-            api.setProposal(proposal);
+            const proposal = await demoProposal(updated.version, api);
             socketClient.demoEvent('graph', demoClosedEdge(), 650);
             socketClient.demoProposal(proposal, 1500);
         }
